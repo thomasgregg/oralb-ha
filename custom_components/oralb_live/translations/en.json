@@ -1,0 +1,20 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "description": "Select your Oral-B toothbrush",
+        "data": { "address": "Device" }
+      },
+      "bluetooth_confirm": {
+        "description": "Set up {name}? Disable the official Oral-B integration entry for this brush first to avoid duplicate entities."
+      }
+    },
+    "abort": {
+      "not_supported": "Device is not a supported Oral-B toothbrush",
+      "no_devices_found": "No Oral-B toothbrush found. Wake the brush (press its button) and try again.",
+      "already_configured": "Device is already configured"
+    }
+  }
+}
+
