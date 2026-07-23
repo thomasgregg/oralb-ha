@@ -8,7 +8,8 @@
 Recent iO firmware stopped broadcasting live session data over Bluetooth
 advertisements. This integration retrieves it over a GATT connection
 instead, restoring the real-time brushing timer, quadrant tracking,
-pressure and mode that passive listening can no longer provide.
+pressure and mode that passive listening can no longer provide, and adds
+a persistent brushing log.
 
 ---
 
@@ -19,6 +20,7 @@ pressure and mode that passive listening can no longer provide.
 - [Entities](#entities)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Dashboard](#dashboard)
 - [Requirements](#requirements)
 - [Known limitations](#known-limitations)
 - [Protocol notes](#protocol-notes)
@@ -80,10 +82,27 @@ dashboards and toothbrush cards keep working.
 | Mode | `daily_clean`, `sensitive`, `gum_care`, `whiten`, `intense`, ... |
 | Pressure | `low` / `normal` / `high`, live while connected |
 | Battery | Percentage, read on connect |
+| Last session | Timestamp of the last completed session |
+| Last session duration | Length of that session, in seconds |
+| Sessions today | Number of sessions today, resets at midnight |
 
 The state entity also exposes `live_connection`, `rssi`, `state_raw` and
 `mode_raw` as attributes, which is useful when diagnosing whether a
 session was captured actively or passively.
+
+### Brushing log
+
+The brush does not hand over its stored history, so the integration
+builds its own. When a session ends, **Last session** records the start
+time with `duration_seconds`, `mode`, `quadrants_covered` and
+`high_pressure_events` as attributes. Because it is a proper timestamp
+sensor, Home Assistant's recorder keeps the history automatically: a
+history graph on **Last session duration** is a complete brushing log
+that accumulates from installation onwards.
+
+Session values are restored across restarts and stay readable while the
+brush is out of range. Sessions with no recorded duration (the motor
+switched straight back off) are ignored.
 
 ## Installation
 
@@ -103,11 +122,62 @@ Copy `custom_components/oralb_live` into your Home Assistant
 
 1. **Disable the official Oral-B entry** for the same brush under
    *Settings, Devices & Services*. Both integrations competing for one
-   device causes duplicate entities and failed connections.
+   device causes duplicate entities and failed connections. Remember to
+   repoint any dashboard cards at the new entity IDs afterwards.
 2. Wake the brush by pressing its button. Oral-B Live discovers it
    automatically; confirm the discovered device.
 3. Alternatively add it manually via *Settings, Devices & Services, Add
    integration, Oral-B Live*.
+
+## Dashboard
+
+The entities are named to match the official integration, so
+[toothbrush-card](https://github.com/Anrolosia/toothbrush-card) works
+without changes. Point it at the Oral-B Live device and it renders the
+live timer, quadrant ring, pressure, mode and battery:
+
+```yaml
+type: custom:toothbrush-card
+device_id: <your Oral-B Live device id>
+show_subtitle: true
+show_header: false
+```
+
+A brushing log underneath, using the session entities:
+
+```yaml
+type: grid
+cards:
+  - type: heading
+    heading: Brushing log
+    heading_style: subtitle
+    icon: mdi:calendar-check
+  - type: tile
+    entity: sensor.<your_brush>_last_session
+    name: Last session
+    icon: mdi:calendar-clock
+    grid_options:
+      columns: 6
+  - type: tile
+    entity: sensor.<your_brush>_last_session_duration
+    name: Duration
+    icon: mdi:timer-outline
+    grid_options:
+      columns: 6
+  - type: tile
+    entity: sensor.<your_brush>_sessions_today
+    name: Sessions today
+    icon: mdi:counter
+  - type: history-graph
+    title: Brushing history
+    hours_to_show: 336
+    entities:
+      - entity: sensor.<your_brush>_last_session_duration
+        name: Session duration
+```
+
+Replace `<your_brush>` with your brush's entity prefix, which is its MAC
+address with underscores (for example `58_26_3a_f6_64_d3`).
 
 ## Requirements
 
@@ -136,20 +206,19 @@ and will miss advertisements from a brush that only speaks occasionally.
 
 **Quadrant changes are paced by the brush.** The brush emits a quadrant
 notification only when the sector actually changes, typically every 30
-seconds depending on its configuration. Short sessions may show only one
-quadrant. There is also a two to five second connection establishment
-delay at the start of a session, during which early transitions can be
-missed.
+seconds depending on its configuration. The quadrant is the brush's own
+pacer telling you where to brush next, not a detection of where the
+brush actually is. Short sessions may show only one quadrant.
 
 **The phone app wins connection races.** With Bluetooth enabled and the
 Oral-B app paired, the app may claim the brush first. The integration
 then reports passive data only, which on recent firmware can mean just
 the end-of-session summary.
 
-**Session history is not implemented.** Completed sessions appear to be
-available through the `ff29` session data characteristic and the `ff21`
-control channel, with the `ff0c` cache requiring authentication. This
-integration does not yet read them.
+**Stored session history is not available.** The brush's own records are
+not exposed to unauthenticated clients; see
+[Protocol notes](#protocol-notes). The integration builds its own log
+from live sessions instead.
 
 ## Protocol notes
 
@@ -179,7 +248,7 @@ Configuration service `a0f0ff20-...`:
 | Characteristic | Access | Content |
 | --- | --- | --- |
 | `ff21` | read, write, notify | Control channel (commands) |
-| `ff22` | read, write | Real-time clock |
+| `ff22` | read, write | Real-time clock, seconds since 2000-01-01 |
 | `ff25` | read, write | Available brushing modes |
 | `ff26` | read, write | Quadrant times, seconds per sector |
 | `ff29` | read | Session data |
@@ -194,15 +263,24 @@ accepted.
 ### Pressure
 
 Pressure is delivered on `ff0b` as a single state byte: `0` low, `1`
-normal, `2` high. It notifies continuously during a session and is
-independent of the advertisement pressure flags, which remain the only
-source while no connection is held.
+normal, `2` high. It notifies continuously during a session.
 
 Note for anyone repeating this work: `ff06` is the button state, not
 pressure, despite sitting where a pressure characteristic would
 plausibly go. Reading it during hard brushing returns a constant
 `00 00 00 00`, which is easy to misinterpret as a broken pressure
 sensor.
+
+### Stored session history
+
+`ff29` holds a session record with a timestamp (seconds since
+2000-01-01) but does not update on its own: it stayed byte-identical
+across several completed sessions, so it appears to be a buffer the
+control channel fills on request. `ff0c` is annotated as requiring
+authentication, and `ff2c` (dashboard config) is absent on this
+firmware. Retrieving history therefore needs writes to the `ff21`
+control channel, whose command set also contains a factory reset, so it
+is deliberately not attempted here.
 
 ### Advertisement payload
 
@@ -230,6 +308,10 @@ recurs with the official `oralb` integration installed alongside,
 disable that entry; see
 [home-assistant/core#177039](https://github.com/home-assistant/core/issues/177039).
 
+**Dashboard warns about unknown entities.** Cards still reference the
+official integration's entity IDs. Repoint them at the Oral-B Live
+equivalents.
+
 **Unknown states or modes.** Unmapped values appear as
 `unknown_state_<n>` and `mode_<n>`. Please open an issue with the raw
 value and what the brush was doing, and it will be added.
@@ -244,6 +326,8 @@ value and what the brush was doing, and it will be added.
 - [MatrixEditor/oralb-io](https://github.com/MatrixEditor/oralb-io) —
   the most complete public map of the Oral-B BLE protocol, which
   corrected several characteristic assignments used here.
+- [Anrolosia/toothbrush-card](https://github.com/Anrolosia/toothbrush-card)
+  — the dashboard card these entities are designed to work with.
 - Ruben Faelens, for documenting the app handshake problem.
 
 ## Disclaimer
