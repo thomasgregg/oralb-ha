@@ -2,7 +2,8 @@
 
 Byte-level knowledge in this file comes from GATT reconnaissance of an
 Oral-B iO Series (model bytes 36 08 52, "IO Series") performed 2026-07,
-cross-referenced with the oralb-ble library and bkbilly/oralb_ble.
+cross-referenced with the oralb-ble library, bkbilly/oralb_ble and
+MatrixEditor/oralb-io.
 """
 
 from __future__ import annotations
@@ -16,16 +17,20 @@ CHAR_DEVICE_ID = "a0f0ff01-5047-4d53-8208-4f72616c2d42"  # MAC, reversed
 CHAR_MODEL_ID = "a0f0ff02-5047-4d53-8208-4f72616c2d42"
 CHAR_STATE = "a0f0ff04-5047-4d53-8208-4f72616c2d42"  # notify: [state, 0]
 CHAR_STATUS_BLOB = "a0f0ff05-5047-4d53-8208-4f72616c2d42"  # byte0 = battery %
-CHAR_PRESSURE_EVENT = "a0f0ff06-5047-4d53-8208-4f72616c2d42"  # notify: [0, hi, 0, 0]
+CHAR_BUTTON = "a0f0ff06-5047-4d53-8208-4f72616c2d42"  # notify: [button state]
 CHAR_MODE = "a0f0ff07-5047-4d53-8208-4f72616c2d42"  # notify: [mode]
-CHAR_BRUSH_TIME = "a0f0ff08-5047-4d53-8208-4f72616c2d42"  # notify: [hi, lo] seconds, 1 Hz
+CHAR_BRUSH_TIME = "a0f0ff08-5047-4d53-8208-4f72616c2d42"  # notify: [min, sec], 1 Hz
 CHAR_SECTOR = "a0f0ff09-5047-4d53-8208-4f72616c2d42"  # notify: [sector, ?, total]
+CHAR_PRESSURE = "a0f0ff0b-5047-4d53-8208-4f72616c2d42"  # notify: [state, ...]
+CHAR_SENSOR_DATA = "a0f0ff0d-5047-4d53-8208-4f72616c2d42"  # motion, ~30 Hz
+CHAR_CONTROL = "a0f0ff21-5047-4d53-8208-4f72616c2d42"  # command channel
 CHAR_RTC = "a0f0ff22-5047-4d53-8208-4f72616c2d42"
 CHAR_PACER = "a0f0ff26-5047-4d53-8208-4f72616c2d42"  # per-sector seconds
+CHAR_SESSION_DATA = "a0f0ff29-5047-4d53-8208-4f72616c2d42"
 
 NOTIFY_CHARS = (
     CHAR_STATE,
-    CHAR_PRESSURE_EVENT,
+    CHAR_PRESSURE,
     CHAR_MODE,
     CHAR_BRUSH_TIME,
     CHAR_SECTOR,
@@ -33,7 +38,7 @@ NOTIFY_CHARS = (
 
 # --- Advertisement payload (manufacturer data 0x00DC, 11 bytes) --------------
 # [0] protocol  [1..2] model  [3] state  [4] pressure/flags
-# [5..6] brush time seconds (big endian)  [7] mode  [8] sector
+# [5..6] brush time [minutes, seconds]  [7] mode  [8] sector
 # [9] sector flags  [10] extra
 ADV_IDX_STATE = 3
 ADV_IDX_PRESSURE = 4
@@ -79,6 +84,13 @@ MODES: dict[int, str] = {
 
 SECTOR_NO_SECTOR = 0xF0
 
+# ff0b pressure states (protocol >= 6)
+PRESSURE_STATES: dict[int, str] = {
+    0: "low",
+    1: "normal",
+    2: "high",
+}
+
 PRESSURE_FROM_ADV: dict[int, str] = {
     0x30: "normal",
     0x32: "normal",
@@ -92,3 +104,4 @@ SIGNAL_UPDATE = f"{DOMAIN}_update"
 CONNECT_RETRIES = 2
 IDLE_DISCONNECT_SECONDS = 120
 RELEASE_GRACE_SECONDS = 8
+
