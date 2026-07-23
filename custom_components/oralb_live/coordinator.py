@@ -71,9 +71,11 @@ from .const import (
     CONNECTION_MODE_LIVE,
     DOMAIN,
     MAX_SESSION_SECONDS,
+    MIN_PASSIVE_SESSION_SECONDS,
     MODES,
     NOTIFY_CHARS,
     ORALB_MANUFACTURER_ID,
+    PASSIVE_SESSION_ACTIVE_STATES,
     PERIODIC_SYNC_INTERVAL_SECONDS,
     PRESSURE_FROM_ADV,
     PRESSURE_STATES,
@@ -151,13 +153,15 @@ class OralBLiveCoordinator:
         self._session_sectors: set[int] = set()
         self._session_high_pressure = 0
         self._last_pressure: str | None = None
+        self._pending_passive_sessions: list[Any] = []
         # --- charger-priority sync state ---
         self._sync_task: asyncio.Task | None = None
         self._session_pending_sync = True  # seed on startup
         self._last_sync_attempt = 0.0
         self._last_sync_ok = 0.0
         self._last_synced_session_ts: int | None = None
-        self._session_observed = False
+        self._session_generation = 0
+        self._processed_session_generation = 0
         slug = address.replace(":", "").replace("-", "_").lower()
         self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{slug}")
 
@@ -238,12 +242,9 @@ class OralBLiveCoordinator:
                 self._schedule_connect()
         else:
             # Charger priority: never compete for the slot. Note that a
-            # session happened (so a sync is due), and sync only in
-            # quiet states -- which is also the only time the brush
-            # advertises with a free slot anyway.
-            if state_raw in SESSION_SEEN_STATES:
-                self._session_observed = True
-                self._session_pending_sync = True
+            # session happened in _apply_state(), and sync only in quiet
+            # states -- which is also the only time the brush may have a
+            # free connection slot.
             if state_raw in SYNC_STATES:
                 self._maybe_schedule_sync()
 
@@ -368,46 +369,76 @@ class OralBLiveCoordinator:
         self._sync_task = self.hass.async_create_task(self._async_sync_sequence())
 
     async def _async_sync_sequence(self) -> None:
-        """Wait for ff29 to settle, then retry stale post-session records."""
-        attempts = SYNC_RETRY_ATTEMPTS if self._session_observed else 1
-        if self._session_observed:
-            _LOGGER.debug(
-                "%s: waiting %ss for the session record to settle",
-                self.name,
-                SESSION_RECORD_SETTLE_SECONDS,
+        """Sync every session generation, including back-to-back sessions."""
+        while not self._stopping:
+            target_generation = self._session_generation
+            session_observed = (
+                target_generation > self._processed_session_generation
             )
-            await asyncio.sleep(SESSION_RECORD_SETTLE_SECONDS)
+            attempts = SYNC_RETRY_ATTEMPTS if session_observed else 1
+            result = "failed"
 
-        for attempt in range(1, attempts + 1):
-            self._last_sync_attempt = time.monotonic()
-            result = await self._async_sync_once()
-            if result == "new":
-                self._session_pending_sync = False
-                self._session_observed = False
-                return
-            if not self._session_observed:
-                # Startup and periodic probes do not imply a new session.
-                self._session_pending_sync = False
-                return
-            if attempt < attempts:
+            if session_observed:
                 _LOGGER.debug(
-                    "%s: session record %s; retrying in %ss (%s/%s)",
+                    "%s: waiting %ss for session generation %s to settle",
                     self.name,
-                    result,
-                    SYNC_RETRY_DELAY_SECONDS,
-                    attempt,
-                    attempts,
+                    SESSION_RECORD_SETTLE_SECONDS,
+                    target_generation,
                 )
-                await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
+                await asyncio.sleep(SESSION_RECORD_SETTLE_SECONDS)
 
-        _LOGGER.debug(
-            "%s: no new session record after %s attempts; giving up until "
-            "another session is observed",
-            self.name,
-            attempts,
-        )
-        self._session_pending_sync = False
-        self._session_observed = False
+            for attempt in range(1, attempts + 1):
+                # A newer brushing session can begin during the settle/retry
+                # window. Never connect until the latest advertisement is
+                # quiet again.
+                while (
+                    not self._stopping
+                    and self.data.get("state_raw") not in SYNC_STATES
+                ):
+                    await asyncio.sleep(1)
+                if self._stopping:
+                    return
+
+                self._last_sync_attempt = time.monotonic()
+                result = await self._async_sync_once()
+                if result == "new" or not session_observed:
+                    break
+                if attempt < attempts:
+                    _LOGGER.debug(
+                        "%s: generation %s session record %s; retrying "
+                        "in %ss (%s/%s)",
+                        self.name,
+                        target_generation,
+                        result,
+                        SYNC_RETRY_DELAY_SECONDS,
+                        attempt,
+                        attempts,
+                    )
+                    await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
+
+            if session_observed:
+                self._processed_session_generation = target_generation
+                if result != "new":
+                    _LOGGER.debug(
+                        "%s: no new record for session generation %s after "
+                        "%s attempts; keeping the passive session",
+                        self.name,
+                        target_generation,
+                        attempts,
+                    )
+
+            if self._session_generation > target_generation:
+                _LOGGER.debug(
+                    "%s: newer session generation %s arrived while syncing "
+                    "%s; continuing",
+                    self.name,
+                    self._session_generation,
+                    target_generation,
+                )
+                continue
+
+            self._session_pending_sync = False
+            return
 
     async def _async_sync_once(self) -> str:
         """Connect briefly, read the last-session record, disconnect.
@@ -539,11 +570,28 @@ class OralBLiveCoordinator:
 
         today = dt_util.now().date()
         previous_start = self.data.get("last_session_start")
-        reconciles_passive_session = (
-            previous_start is not None
-            and abs((start - previous_start).total_seconds())
-            <= SESSION_RECONCILE_WINDOW_SECONDS
-        )
+        matched_passive_start = None
+        if self._pending_passive_sessions:
+            matched_passive_start = min(
+                self._pending_passive_sessions,
+                key=lambda candidate: abs((start - candidate).total_seconds()),
+            )
+            if (
+                abs((start - matched_passive_start).total_seconds())
+                > SESSION_RECONCILE_WINDOW_SECONDS
+            ):
+                matched_passive_start = None
+        reconciles_passive_session = matched_passive_start is not None
+        if reconciles_passive_session:
+            self._pending_passive_sessions.remove(matched_passive_start)
+        elif previous_start is not None:
+            # After an integration reload only the most recent passive session
+            # is restored, not the in-memory queue.
+            reconciles_passive_session = (
+                abs((start - previous_start).total_seconds())
+                <= SESSION_RECONCILE_WINDOW_SECONDS
+            )
+
         if not reconciles_passive_session:
             count = self.data.get("sessions_today") or 0
             if (
@@ -552,22 +600,44 @@ class OralBLiveCoordinator:
             ):
                 count = 0
             self.data["sessions_today"] = count + 1
-        self.data["last_session_start"] = start
-        self.data["last_session_duration"] = duration
-        self.data["last_session_mode"] = MODES.get(mode_raw, f"mode_{mode_raw}")
-        # Quadrant coverage / high-pressure events are not decoded from
-        # the record yet; passive advert tracking may have filled them.
+
+        updates_latest_session = (
+            previous_start is None
+            or matched_passive_start == previous_start
+            or (
+                matched_passive_start is None
+                and reconciles_passive_session
+            )
+            or start >= previous_start
+        )
+        if updates_latest_session:
+            self.data["last_session_start"] = start
+            self.data["last_session_duration"] = duration
+            self.data["last_session_mode"] = MODES.get(
+                mode_raw, f"mode_{mode_raw}"
+            )
+            # Quadrant coverage / high-pressure events are not decoded from
+            # the record yet; passive advert tracking may have filled them.
         self._last_synced_session_ts = session_ts
         await self._store.async_save({"last_session_ts": session_ts})
         if reconciles_passive_session:
-            _LOGGER.debug(
-                "%s: reconciled passive session with brush record: "
-                "%ss, mode %s, started %s",
-                self.name,
-                duration,
-                self.data["last_session_mode"],
-                start,
-            )
+            if updates_latest_session:
+                _LOGGER.debug(
+                    "%s: reconciled passive session with brush record: "
+                    "%ss, mode %s, started %s",
+                    self.name,
+                    duration,
+                    self.data["last_session_mode"],
+                    start,
+                )
+            else:
+                _LOGGER.debug(
+                    "%s: reconciled older passive session started %s without "
+                    "replacing newer session %s",
+                    self.name,
+                    start,
+                    previous_start,
+                )
         else:
             _LOGGER.debug(
                 "%s: synced session from brush: %ss, mode %s, started %s",
@@ -583,10 +653,30 @@ class OralBLiveCoordinator:
         previous = self.data.get("state_raw")
         self.data["state_raw"] = raw
         self.data["state"] = STATES.get(raw, f"unknown_state_{raw}")
-        if raw == RUNNING_STATE and previous != RUNNING_STATE:
+
+        session_states = (
+            PASSIVE_SESSION_ACTIVE_STATES
+            if self.mode != CONNECTION_MODE_LIVE
+            else {RUNNING_STATE}
+        )
+        if raw in session_states and previous not in session_states:
             self._begin_session()
-        elif raw != RUNNING_STATE and previous == RUNNING_STATE:
+        elif raw not in session_states and previous in session_states:
             self._end_session()
+
+        if (
+            self.mode != CONNECTION_MODE_LIVE
+            and raw in SESSION_SEEN_STATES
+            and previous not in SESSION_SEEN_STATES
+        ):
+            self._session_generation += 1
+            self._session_pending_sync = True
+            _LOGGER.debug(
+                "%s: observed session generation %s in state %s",
+                self.name,
+                self._session_generation,
+                self.data["state"],
+            )
 
     # ---------------------------------------------------------- sessions
     def _begin_session(self) -> None:
@@ -627,6 +717,18 @@ class OralBLiveCoordinator:
                 duration,
             )
             return
+        if (
+            duration_source == "passive elapsed time"
+            and duration < MIN_PASSIVE_SESSION_SECONDS
+        ):
+            _LOGGER.debug(
+                "%s: %ss passive session is shorter than the %ss minimum; "
+                "ignored",
+                self.name,
+                duration,
+                MIN_PASSIVE_SESSION_SECONDS,
+            )
+            return
 
         today = dt_util.now().date()
         previous_start = self.data.get("last_session_start")
@@ -642,6 +744,8 @@ class OralBLiveCoordinator:
         self.data["last_session_mode"] = self.data.get("mode")
         self.data["last_session_sectors"] = len(self._session_sectors)
         self.data["last_session_high_pressure"] = self._session_high_pressure
+        self._pending_passive_sessions.append(self._session_start)
+        self._pending_passive_sessions = self._pending_passive_sessions[-10:]
         _LOGGER.debug(
             "%s: session ended from %s: %ss, mode %s, %s quadrants, "
             "%s high-pressure events",

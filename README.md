@@ -92,7 +92,9 @@ Home Assistant never competes for the slot during brushing. The charger
 behave exactly as they do out of the box. If the brush broadcasts
 running and quiet states, Home Assistant records the session
 immediately from those passive advertisements. Duration falls back to
-elapsed wall time when the advertised timer remains at zero.
+elapsed wall time when the advertised timer remains at zero. A guarded
+fallback also handles firmware that remains in `selection_menu` during
+a short motor session without ever advertising `running`.
 
 After the session, Home Assistant also makes short attempts to read the
 brush's own **last-session record** (see
@@ -101,6 +103,11 @@ When that succeeds, its authoritative timestamp, duration and mode
 refine the passively recorded session without counting it twice. When
 the charger continues to own the brush's only connection, the passive
 record remains available instead of losing the session.
+
+Back-to-back sessions are tracked independently. If another session
+starts while the previous brush-history read is settling or retrying,
+the newer session remains queued for its own read instead of being
+cleared with the older one.
 
 What you give up: live timer, pressure and quadrant updates depend on
 what the brush firmware exposes in advertisements. They are not

@@ -82,6 +82,11 @@ STATES: dict[int, str] = {
 }
 
 RUNNING_STATE = 3
+# Some iO firmware can advertise selection_menu for an entire short motor
+# session without ever exposing running. Treat both as active for the passive
+# charger-priority fallback; a minimum duration below filters button/menu blips.
+PASSIVE_SESSION_ACTIVE_STATES = {RUNNING_STATE, 8}
+MIN_PASSIVE_SESSION_SECONDS = 5
 
 # States in which the brush is reachable and worth connecting to in
 # LIVE mode. Charging (4) is included: docked is the most reliable
@@ -91,7 +96,9 @@ AWAKE_STATES = {1, 2, 3, 4, 5, 8, 9, 10}
 RELEASE_STATES = {114, 115}
 
 # --- Charger-priority mode ---------------------------------------------------
-# Advert states that show a session happened since our last sync.
+# Advert states that show a session happened since our last sync. A transition
+# into this group creates a new sync generation; repeated advertisements and
+# running -> summary transitions remain part of the same generation.
 SESSION_SEEN_STATES = {3, 8, 9, 10}
 # Advert states quiet enough to sync in without disturbing anyone.
 SYNC_STATES = {2, 4}
