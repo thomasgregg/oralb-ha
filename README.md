@@ -7,8 +7,8 @@
 
 Recent iO firmware stopped broadcasting live session data over Bluetooth
 advertisements. This integration retrieves it over a GATT connection
-instead, restoring the real-time brushing timer, quadrant tracking and
-mode that passive listening can no longer provide.
+instead, restoring the real-time brushing timer, quadrant tracking,
+pressure and mode that passive listening can no longer provide.
 
 ---
 
@@ -57,8 +57,8 @@ between sessions.
 the integration opens a GATT connection — through any connectable
 Bluetooth path, including ESPHome Bluetooth proxies with active
 connections enabled — and subscribes to the live notification
-characteristics. The 1 Hz brushing timer, quadrant and mode flow
-straight into the entities.
+characteristics. The 1 Hz brushing timer, pressure, quadrant and mode
+flow straight into the entities.
 
 **Polite by design.** The brush accepts a single client. If the
 connection cannot be won, typically because the Oral-B phone app or an
@@ -76,9 +76,9 @@ dashboards and toothbrush cards keep working.
 | Toothbrush state | `idle`, `running`, `charging`, `selection_menu`, `session_summary`, `post_brushing_summary`, ... |
 | Time | Session duration in seconds. Updates at 1 Hz while connected. |
 | Sector | Current quadrant (`sector_0` ... `sector_3`, or `no_sector`) |
-| Number of sectors | Read from the brush's pacer configuration |
+| Number of sectors | Read from the brush's quadrant time configuration |
 | Mode | `daily_clean`, `sensitive`, `gum_care`, `whiten`, `intense`, ... |
-| Pressure | `normal` / `high` — see [Known limitations](#known-limitations) |
+| Pressure | `low` / `normal` / `high`, live while connected |
 | Battery | Percentage, read on connect |
 
 The state entity also exposes `live_connection`, `rssi`, `state_raw` and
@@ -134,33 +134,28 @@ and will miss advertisements from a brush that only speaks occasionally.
 
 ## Known limitations
 
-**Pressure is not available during brushing.** This is a firmware
-limitation, not a bug in this integration — see
-[Protocol notes](#protocol-notes) for the evidence. Pressure updates
-from advertisements while the brush is idle or charging, but stays
-frozen during an active session.
-
 **Quadrant changes are paced by the brush.** The brush emits a quadrant
 notification only when the sector actually changes, typically every 30
-seconds depending on its pacer configuration. Short sessions may show
-only one quadrant. There is also a two to five second connection
-establishment delay at the start of a session, during which early
-transitions can be missed.
+seconds depending on its configuration. Short sessions may show only one
+quadrant. There is also a two to five second connection establishment
+delay at the start of a session, during which early transitions can be
+missed.
 
 **The phone app wins connection races.** With Bluetooth enabled and the
 Oral-B app paired, the app may claim the brush first. The integration
 then reports passive data only, which on recent firmware can mean just
 the end-of-session summary.
 
-**Session history is not implemented.** The brush stores completed
-sessions and exposes them through a command channel (`ff81`/`ff82`) that
-this integration does not yet speak.
+**Session history is not implemented.** Completed sessions appear to be
+available through the `ff29` session data characteristic and the `ff21`
+control channel, with the `ff0c` cache requiring authentication. This
+integration does not yet read them.
 
 ## Protocol notes
 
 Findings from GATT reconnaissance of an iO-series brush (model bytes
-`36 08 52`), July 2026. Documented here so others do not have to repeat
-the work.
+`36 08 52`), July 2026, cross-checked against MatrixEditor/oralb-io.
+Documented here so others do not have to repeat the work.
 
 ### Vendor service `a0f0ff00-5047-4d53-8208-4f72616c2d42`
 
@@ -170,39 +165,44 @@ the work.
 | `ff02` | read | Model identifier |
 | `ff04` | notify, read | Toothbrush state, `[state, 0]` |
 | `ff05` | notify, read | Status blob; byte 0 is battery percentage |
-| `ff06` | notify, read | Nominally pressure — see below |
+| `ff06` | notify, read | Button state (0 none, 1 power, 2 mode) |
 | `ff07` | notify, read | Brushing mode |
 | `ff08` | notify, read | Brushing time as `[minutes, seconds]`, 1 Hz while running |
 | `ff09` | notify, read | Current quadrant |
-| `ff0b`, `ff0d` | notify | Motion telemetry, roughly 30 Hz |
-| `ff26` | read, write | Pacer configuration, seconds per sector |
+| `ff0a` | notify, read | Smiley rating |
+| `ff0b` | notify, read | **Pressure** (0 low, 1 normal, 2 high) |
+| `ff0c` | read, write, notify | Cache — requires authentication |
+| `ff0d` | notify, read | Motion sensor data, roughly 30 Hz |
+
+Configuration service `a0f0ff20-...`:
+
+| Characteristic | Access | Content |
+| --- | --- | --- |
+| `ff21` | read, write, notify | Control channel (commands) |
+| `ff22` | read, write | Real-time clock |
+| `ff25` | read, write | Available brushing modes |
+| `ff26` | read, write | Quadrant times, seconds per sector |
+| `ff29` | read | Session data |
+
+Service `a0f0ff80-...` is the over-the-air firmware update channel
+(`ff81` OTA command, `ff82` OTA payload) and is not used by this
+integration.
 
 No pairing or bonding is required for these. Anonymous connections are
 accepted.
 
-### Pressure: tested and ruled out
+### Pressure
 
-Pressure could not be obtained over a connection on this firmware. The
-evidence:
+Pressure is delivered on `ff0b` as a single state byte: `0` low, `1`
+normal, `2` high. It notifies continuously during a session and is
+independent of the advertisement pressure flags, which remain the only
+source while no connection is held.
 
-- `ff06`, the characteristic that would carry it, reads a constant
-  `00 00 00 00` and never notified across multiple sessions.
-- A dedicated diagnostic polled nine candidate characteristics three
-  times per second for 45 seconds across three marked high-pressure
-  intervals: 720 samples, no byte separating high from normal pressure.
-- `ff04`, `ff07`, `ff0a`, `ff10`, `ff21` and `ff2d` were entirely
-  static.
-- `ff05` bytes 3, 10 and 14 shift on average under pressure, but their
-  distributions overlap heavily. These are motion-derived and not a
-  usable pressure signal.
-
-The Oral-B app and the iO Sense charger do display live pressure, which
-indicates the data is gated behind a handshake rather than absent.
-Earlier work by Ruben Faelens found that notifications only began after
-the command sequence used by the official app was replicated, obtained
-by decompiling it. The unused write pipes in the `a0f0ff80` service are
-the likely channel. Implementing that would require reverse-engineering
-the current app and is out of scope for now.
+Note for anyone repeating this work: `ff06` is the button state, not
+pressure, despite sitting where a pressure characteristic would
+plausibly go. Reading it during hard brushing returns a constant
+`00 00 00 00`, which is easy to misinterpret as a broken pressure
+sensor.
 
 ### Advertisement payload
 
@@ -241,6 +241,9 @@ value and what the brush was doing, and it will be added.
 - [Bluetooth-Devices/oralb-ble](https://github.com/Bluetooth-Devices/oralb-ble)
   and the official
   [oralb integration](https://www.home-assistant.io/integrations/oralb/).
+- [MatrixEditor/oralb-io](https://github.com/MatrixEditor/oralb-io) —
+  the most complete public map of the Oral-B BLE protocol, which
+  corrected several characteristic assignments used here.
 - Ruben Faelens, for documenting the app handshake problem.
 
 ## Disclaimer
