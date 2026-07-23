@@ -72,29 +72,54 @@ or sleep, the connection is released promptly so other clients can sync.
 
 ## How this differs from the official integration
 
-Home Assistant ships an `oralb` integration. It is a good fit for most
-brushes and should be preferred where it works: it is fully passive,
-costs no Bluetooth connection slots, and needs no custom component.
+Home Assistant ships an `oralb` integration. On most brushes it is the
+better choice: fully passive, no Bluetooth connection slots, no custom
+component. If your brush still broadcasts while you brush, stop here and
+use it.
 
-This integration exists for firmware where passive listening is no
-longer enough.
+On an iO Series 10 with mid-2026 firmware, it no longer does. Here is
+what the official integration actually reports during a session on this
+brush:
+
+- **The timer stays at 0.** It does not count while you brush. A second
+  or two after you switch off, it jumps straight to the final duration
+  — "you brushed for 96 seconds" — with nothing in between.
+- **Pressure is frozen.** It keeps whatever value it read before the
+  session started, however hard you press. The brush's own red ring
+  lights up; Home Assistant never hears about it.
+- **The quadrant never advances.** It holds its previous value for the
+  whole session, so no quadrant progress is visible.
+- **Whole sessions can vanish.** The end-of-session summary is a single
+  advertisement. Miss it — weak signal, a scanner that only listens 10%
+  of the time, the phone app taking the connection — and the session is
+  gone entirely, with no record that you brushed at all.
+- **Updates can stop until you reload.** The battery sensor polls over a
+  GATT connection. When those attempts fail against this firmware,
+  passive updates stall and the entities freeze at their last value
+  until the config entry is reloaded
+  ([home-assistant/core#177039](https://github.com/home-assistant/core/issues/177039)).
+
+None of that is a bug in the official integration. The brush changed:
+recent iO firmware stops broadcasting during a session and emits only a
+post-session summary. A passive listener has nothing to listen to. The
+data still exists — it moved to GATT notifications, which require a
+connection.
+
+This integration keeps the passive listening and adds that connection.
 
 | | Official `oralb` | Oral-B Live |
 | --- | --- | --- |
 | Data source | Advertisements only | Advertisements plus GATT notifications |
 | Connection | Never connects (battery uses a poll) | Connects while the brush is awake, releases on charge/sleep |
-| Live timer on recent iO firmware | Not available | 1 Hz while brushing |
-| Live pressure during a session | Not available | `low` / `normal` / `high` from `ff0b` |
-| Live quadrant during a session | Not available | Yes, as the brush paces them |
+| Live timer on recent iO firmware | Stays at 0, jumps at the end | Counts up at 1 Hz while brushing |
+| Live pressure during a session | Frozen at its pre-session value | `low` / `normal` / `high`, live from `ff0b` |
+| Live quadrant during a session | Frozen | Advances as the brush paces them |
+| A missed summary advertisement | Session lost entirely | Session still recorded from the live stream |
 | Brushing log | None | Last session, duration, sessions today, kept across restarts |
 | Number of sectors | From advertisement | Read from the brush's quadrant configuration |
-| Battery | Active poll | Read once per connection |
+| Battery | Active poll (can stall updates on this firmware) | Read once per connection |
 | Cost | None | One Bluetooth connection slot while the brush is awake |
 | Competes with the phone app | No | Yes — falls back to passive when the app wins |
-
-On older brushes that still broadcast during a session, the official
-integration already shows everything this one does, without the
-connection cost. Check there first.
 
 Practical trade-offs worth knowing before switching:
 
@@ -104,6 +129,8 @@ Practical trade-offs worth knowing before switching:
   Lower `IDLE_DISCONNECT_SECONDS` in `const.py` if that matters to you.
 - Entity IDs differ from the official integration, so dashboard cards
   need repointing after switching.
+- Everything here was worked out on one brush. On other models the
+  official integration may already be enough.
 
 ## Entities
 
@@ -288,8 +315,8 @@ from live sessions instead.
 
 Findings from GATT reconnaissance of an Oral-B iO Series 10 (model ID
 `0x36`, protocol version 8), July 2026, cross-checked against
-MatrixEditor/oralb-io.
-Documented here so others do not have to repeat the work.
+MatrixEditor/oralb-io. Documented here so others do not have to repeat
+the work.
 
 ### Vendor service `a0f0ff00-5047-4d53-8208-4f72616c2d42`
 
