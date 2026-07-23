@@ -15,6 +15,21 @@
       "no_devices_found": "No Oral-B toothbrush found. Wake the brush (press its button) and try again.",
       "already_configured": "Device is already configured"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "description": "The brush accepts a single Bluetooth connection at a time, so Home Assistant and the iO Sense charger display cannot both be active during a brushing session. Choose who wins.",
+        "data": { "connection_mode": "Connection mode" }
+      }
+    }
+  },
+  "selector": {
+    "connection_mode": {
+      "options": {
+        "charger_priority": "Charger priority — the iO Sense lights and timer work during brushing; the session syncs to Home Assistant right after it ends",
+        "live": "Live — Home Assistant streams the timer, pressure and quadrant at 1 Hz during brushing; the iO Sense display and phone app will not work"
+      }
+    }
   }
 }
-

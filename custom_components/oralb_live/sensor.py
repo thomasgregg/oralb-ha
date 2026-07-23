@@ -197,6 +197,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         if self.entity_description.key == "toothbrush_state":
             self._attr_extra_state_attributes = {
                 "live_connection": data.get("live"),
+                "connection_mode": data.get("connection_mode"),
                 "rssi": data.get("rssi"),
                 "state_raw": data.get("state_raw"),
                 "mode_raw": data.get("mode_raw"),
@@ -209,4 +210,3 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             # Session history stays readable even when the brush is away.
             return True
         return self.coordinator.available
-
