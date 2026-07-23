@@ -26,6 +26,8 @@ from homeassistant.helpers.device_registry import (
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, SIGNAL_UPDATE
 from .coordinator import OralBLiveCoordinator
@@ -36,6 +38,7 @@ class OralBSensorDescription(SensorEntityDescription):
     """Describes an Oral-B Live sensor."""
 
     data_key: str = ""
+    restore: bool = False
 
 
 SENSORS: tuple[OralBSensorDescription, ...] = (
@@ -80,6 +83,31 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     OralBSensorDescription(
+        key="last_session",
+        translation_key="last_session",
+        name="Last session",
+        data_key="last_session_start",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        restore=True,
+    ),
+    OralBSensorDescription(
+        key="last_session_duration",
+        translation_key="last_session_duration",
+        name="Last session duration",
+        data_key="last_session_duration",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        device_class=SensorDeviceClass.DURATION,
+        restore=True,
+    ),
+    OralBSensorDescription(
+        key="sessions_today",
+        translation_key="sessions_today",
+        name="Sessions today",
+        data_key="sessions_today",
+        state_class=SensorStateClass.TOTAL,
+        restore=True,
+    ),
+    OralBSensorDescription(
         key="battery",
         translation_key="battery",
         name="Battery",
@@ -103,7 +131,7 @@ async def async_setup_entry(
     )
 
 
-class OralBLiveSensor(SensorEntity):
+class OralBLiveSensor(SensorEntity, RestoreEntity):
     """A single Oral-B Live sensor."""
 
     _attr_should_poll = False
@@ -124,6 +152,23 @@ class OralBLiveSensor(SensorEntity):
         )
 
     async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self.entity_description.restore:
+            # Session results must survive restarts; the brush will not
+            # replay them.
+            if (last := await self.async_get_last_state()) is not None and last.state not in (
+                None,
+                "unknown",
+                "unavailable",
+            ):
+                if self.entity_description.device_class is SensorDeviceClass.TIMESTAMP:
+                    self._attr_native_value = dt_util.parse_datetime(last.state)
+                elif self.entity_description.device_class is SensorDeviceClass.DURATION:
+                    self._attr_native_value = int(float(last.state))
+                else:
+                    self._attr_native_value = last.state
+                if self.entity_description.key == "last_session":
+                    self._attr_extra_state_attributes = dict(last.attributes or {})
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,
@@ -135,7 +180,20 @@ class OralBLiveSensor(SensorEntity):
 
     @callback
     def _handle_update(self, data: dict[str, Any]) -> None:
-        self._attr_native_value = data.get(self.entity_description.data_key)
+        value = data.get(self.entity_description.data_key)
+        # Restored session values must not be wiped by a fresh coordinator
+        # that has not seen a session yet.
+        if value is None and self.entity_description.restore:
+            self.async_write_ha_state()
+            return
+        self._attr_native_value = value
+        if self.entity_description.key == "last_session":
+            self._attr_extra_state_attributes = {
+                "duration_seconds": data.get("last_session_duration"),
+                "mode": data.get("last_session_mode"),
+                "quadrants_covered": data.get("last_session_sectors"),
+                "high_pressure_events": data.get("last_session_high_pressure"),
+            }
         if self.entity_description.key == "toothbrush_state":
             self._attr_extra_state_attributes = {
                 "live_connection": data.get("live"),
@@ -147,5 +205,8 @@ class OralBLiveSensor(SensorEntity):
 
     @property
     def available(self) -> bool:
+        if self.entity_description.restore:
+            # Session history stays readable even when the brush is away.
+            return True
         return self.coordinator.available
 
