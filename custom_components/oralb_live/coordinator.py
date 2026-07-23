@@ -55,15 +55,16 @@ from .const import (
     CHAR_STATE,
     CHAR_STATUS_BLOB,
     CONNECT_RETRIES,
-    IDLE_DISCONNECT_SECONDS,
     MODES,
     NOTIFY_CHARS,
     ORALB_MANUFACTURER_ID,
     PRESSURE_FROM_ADV,
     PRESSURE_STATES,
+    RECONNECT_INTERVAL_SECONDS,
     RELEASE_GRACE_SECONDS,
     RELEASE_STATES,
     RUNNING_STATE,
+    STALE_CONNECTION_SECONDS,
     SECTOR_NO_SECTOR,
     SIGNAL_UPDATE,
     STATES,
@@ -108,6 +109,7 @@ class OralBLiveCoordinator:
         self._connect_lock = asyncio.Lock()
         self._connect_task: asyncio.Task | None = None
         self._disconnect_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
         self._last_activity = 0.0
         self._unsub_bluetooth: callback | None = None
         self._unsub_unavailable: callback | None = None
@@ -138,9 +140,16 @@ class OralBLiveCoordinator:
             self.hass, self.address, connectable=False
         ):
             self._parse_advertisement(service_info)
+        # The brush stops advertising while a client (for example an
+        # iO Sense charger) is attached, so advertisements alone are not
+        # a reliable trigger. Poll for a connection instead.
+        self._reconnect_task = self.hass.async_create_task(self._reconnect_loop())
 
     async def async_stop(self) -> None:
         self._stopping = True
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         if self._unsub_bluetooth:
             self._unsub_bluetooth()
             self._unsub_bluetooth = None
@@ -366,15 +375,38 @@ class OralBLiveCoordinator:
             self.data["number_of_sectors"] = total
 
     # ------------------------------------------------------------- teardown
+    async def _reconnect_loop(self) -> None:
+        """Keep trying to hold a connection.
+
+        The brush accepts more than one client, so an attached iO Sense
+        charger does not prevent us from connecting. It does stop the
+        brush advertising, which is why this loop exists rather than
+        relying on advertisement callbacks alone.
+        """
+        try:
+            while not self._stopping:
+                await asyncio.sleep(RECONNECT_INTERVAL_SECONDS)
+                if self._stopping:
+                    return
+                if self._client and self._client.is_connected:
+                    continue
+                if self.data.get("state_raw") in RELEASE_STATES:
+                    continue
+                self._schedule_connect()
+        except asyncio.CancelledError:
+            pass
+
     def _watchdog(self) -> None:
         async def _watch() -> None:
             while self._client and self._client.is_connected:
-                await asyncio.sleep(15)
+                await asyncio.sleep(30)
                 if (
                     time.monotonic() - self._last_activity
-                    > IDLE_DISCONNECT_SECONDS
+                    > STALE_CONNECTION_SECONDS
                 ):
-                    _LOGGER.debug("%s: idle, releasing connection", self.name)
+                    _LOGGER.debug(
+                        "%s: connection stale, rebuilding", self.name
+                    )
                     await self._async_disconnect()
                     return
 
