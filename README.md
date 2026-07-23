@@ -17,7 +17,9 @@ a persistent brushing log.
 
 - [The problem](#the-problem)
 - [How it works](#how-it-works)
+- [How this differs from the official integration](#how-this-differs-from-the-official-integration)
 - [Entities](#entities)
+- [Tested with](#tested-with)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Dashboard](#dashboard)
@@ -68,6 +70,41 @@ iO Sense charger holds it, the integration falls back to passive mode
 rather than fighting for the device. When the brush returns to charging
 or sleep, the connection is released promptly so other clients can sync.
 
+## How this differs from the official integration
+
+Home Assistant ships an `oralb` integration. It is a good fit for most
+brushes and should be preferred where it works: it is fully passive,
+costs no Bluetooth connection slots, and needs no custom component.
+
+This integration exists for firmware where passive listening is no
+longer enough.
+
+| | Official `oralb` | Oral-B Live |
+| --- | --- | --- |
+| Data source | Advertisements only | Advertisements plus GATT notifications |
+| Connection | Never connects (battery uses a poll) | Connects while the brush is awake, releases on charge/sleep |
+| Live timer on recent iO firmware | Not available | 1 Hz while brushing |
+| Live pressure during a session | Not available | `low` / `normal` / `high` from `ff0b` |
+| Live quadrant during a session | Not available | Yes, as the brush paces them |
+| Brushing log | None | Last session, duration, sessions today, kept across restarts |
+| Number of sectors | From advertisement | Read from the brush's quadrant configuration |
+| Battery | Active poll | Read once per connection |
+| Cost | None | One Bluetooth connection slot while the brush is awake |
+| Competes with the phone app | No | Yes — falls back to passive when the app wins |
+
+On older brushes that still broadcast during a session, the official
+integration already shows everything this one does, without the
+connection cost. Check there first.
+
+Practical trade-offs worth knowing before switching:
+
+- The brush accepts one client. While this integration is connected, the
+  Oral-B app and an iO Sense charger cannot sync.
+- Holding a connection uses more brush battery than passive listening.
+  Lower `IDLE_DISCONNECT_SECONDS` in `const.py` if that matters to you.
+- Entity IDs differ from the official integration, so dashboard cards
+  need repointing after switching.
+
 ## Entities
 
 Entity structure mirrors the official `oralb` integration, so existing
@@ -103,6 +140,25 @@ that accumulates from installation onwards.
 Session values are restored across restarts and stay readable while the
 brush is out of range. Sessions with no recorded duration (the motor
 switched straight back off) are ignored.
+
+## Tested with
+
+Developed and tested against a single device. Reports from other models
+are welcome, particularly the raw values behind any `unknown_state_<n>`
+or `mode_<n>`.
+
+| | |
+| --- | --- |
+| Brush | Oral-B iO series, advertised model bytes `36 08 52` (`0x32`) |
+| Firmware | Mid-2026; broadcasts no live data during a session |
+| Accessory | iO Sense charger present (not required) |
+| Home Assistant | 2026.7 on Home Assistant OS, Raspberry Pi |
+| Bluetooth | ESPHome proxy (M5Stack Atom) with active connections, plus the Pi's built-in adapter and a Shelly BLE scanner |
+| Protocol version | 8 (advertisement byte 0) |
+
+Older iO models and pre-2026 firmware are expected to work, but on those
+the official integration may already be sufficient — see
+[How this differs](#how-this-differs-from-the-official-integration).
 
 ## Installation
 
