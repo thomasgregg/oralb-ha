@@ -37,12 +37,15 @@ CHAR_BUTTON = "a0f0ff06-5047-4d53-8208-4f72616c2d42"  # notify: [button state]
 CHAR_MODE = "a0f0ff07-5047-4d53-8208-4f72616c2d42"  # notify: [mode]
 CHAR_BRUSH_TIME = "a0f0ff08-5047-4d53-8208-4f72616c2d42"  # notify: [min, sec], 1 Hz
 CHAR_SECTOR = "a0f0ff09-5047-4d53-8208-4f72616c2d42"  # notify: [sector, ?, total]
+CHAR_SMILEY = "a0f0ff0a-5047-4d53-8208-4f72616c2d42"  # notify/read: display face
 CHAR_PRESSURE = "a0f0ff0b-5047-4d53-8208-4f72616c2d42"  # notify: [state, ...]
 CHAR_SENSOR_DATA = "a0f0ff0d-5047-4d53-8208-4f72616c2d42"  # motion, ~30 Hz
 CHAR_CONTROL = "a0f0ff21-5047-4d53-8208-4f72616c2d42"  # command channel
 CHAR_RTC = "a0f0ff22-5047-4d53-8208-4f72616c2d42"  # seconds, brush epoch
+CHAR_AVAILABLE_MODES = "a0f0ff25-5047-4d53-8208-4f72616c2d42"
 CHAR_PACER = "a0f0ff26-5047-4d53-8208-4f72616c2d42"  # per-sector seconds
 CHAR_SESSION_DATA = "a0f0ff29-5047-4d53-8208-4f72616c2d42"  # last session
+CHAR_REFILL_REMAINDER = "a0f0ff2d-5047-4d53-8208-4f72616c2d42"
 
 NOTIFY_CHARS = (
     CHAR_STATE,
@@ -52,16 +55,26 @@ NOTIFY_CHARS = (
     CHAR_SECTOR,
 )
 
+OPTIONAL_NOTIFY_CHARS = (
+    CHAR_STATUS_BLOB,
+    CHAR_SMILEY,
+)
+
 # --- Advertisement payload (manufacturer data 0x00DC, 11 bytes) --------------
-# [0] protocol  [1..2] model  [3] state  [4] pressure/flags
+# [0] protocol  [1] model  [2] firmware  [3] state  [4] pressure/flags
 # [5..6] brush time [minutes, seconds]  [7] mode  [8] sector
-# [9] sector flags  [10] extra
+# [9] sector timer  [10] number of sectors
+ADV_IDX_PROTOCOL = 0
+ADV_IDX_MODEL = 1
+ADV_IDX_FIRMWARE = 2
 ADV_IDX_STATE = 3
 ADV_IDX_PRESSURE = 4
 ADV_IDX_TIME_HI = 5
 ADV_IDX_TIME_LO = 6
 ADV_IDX_MODE = 7
 ADV_IDX_SECTOR = 8
+ADV_IDX_SECTOR_TIMER = 9
+ADV_IDX_TOTAL_SECTORS = 10
 
 # --- Value maps --------------------------------------------------------------
 STATES: dict[int, str] = {
@@ -72,13 +85,15 @@ STATES: dict[int, str] = {
     4: "charging",
     5: "setup",
     6: "flight_menu",
-    7: "final_test",
+    7: "charge_forbidden",
     8: "selection_menu",
     9: "session_summary",
     10: "post_brushing_summary",
-    113: "pcb_test",
-    114: "sleeping",
-    115: "transport",
+    113: "final_test",
+    114: "pcb_test",
+    115: "sleeping",
+    116: "transport",
+    117: "calibration_test",
 }
 
 RUNNING_STATE = 3
@@ -93,7 +108,7 @@ MIN_PASSIVE_SESSION_SECONDS = 5
 # moment to win the free slot before a session starts.
 AWAKE_STATES = {1, 2, 3, 4, 5, 8, 9, 10}
 # States in which the brush will not hold a connection anyway.
-RELEASE_STATES = {114, 115}
+RELEASE_STATES = {115, 116}
 
 # --- Charger-priority mode ---------------------------------------------------
 # Advert states that show a session happened since our last sync. A transition
@@ -127,12 +142,75 @@ MODES: dict[int, str] = {
     2: "gum_care",
     3: "whiten",
     4: "intense",
-    6: "super_sensitive",
-    7: "tongue_clean",
+    5: "super_sensitive",
+    6: "tongue_clean",
     8: "settings",
+    9: "off",
+    11: "smart_adapt",
 }
 
 SECTOR_NO_SECTOR = 0xF0
+
+SMILEYS: dict[int, str] = {
+    0: "off",
+    1: "standard",
+    2: "special_2",
+    3: "special_3",
+    4: "special_4",
+    5: "special_5",
+    6: "special_6",
+    7: "special_7",
+}
+
+REFILL_STATES: dict[int, str] = {
+    0: "on",
+    1: "reset",
+    2: "snooze",
+    0xFE: "interval",
+    0xFF: "off",
+}
+
+# Model identifiers from the oralb-ble parser. ff02/advertisements cannot
+# distinguish the marketing model for most iO brushes, so keep the generic
+# protocol name where that is all the brush reports.
+MODEL_NAMES: dict[int, str] = {
+    0: "Triumph D36",
+    1: "Triumph D36",
+    2: "Triumph D36",
+    32: "Genius Series D701",
+    33: "Genius Series D701",
+    34: "Genius Series D701",
+    39: "Smart/Pro Series D700",
+    40: "Smart/Pro Series D700",
+    41: "Smart/Pro Series D700",
+    48: "iO Series",
+    49: "iO Series",
+    50: "iO Series",
+    52: "iO Series 4",
+    53: "iO Series 5",
+    54: "iO Series",
+    64: "Smart Series D21",
+    65: "Smart Series D21",
+    66: "Smart Series D21",
+    67: "Smart Series D21",
+    68: "Smart Series D21",
+    69: "Smart Series D21",
+    70: "Smart Series D21",
+    80: "Pro Series D601",
+    81: "Pro Series D601",
+    82: "Pro Series D601",
+    83: "Pro Series D601",
+    84: "Pro Series D601",
+    85: "Pro Series D601",
+    86: "Pro Series D601",
+    87: "Pro Series D601",
+    112: "Genius X D706",
+    113: "Genius X D706",
+    114: "Genius X D706",
+    117: "Genius X D706",
+    118: "Genius X D706",
+    119: "Genius X D706",
+}
 
 # ff0b pressure states (protocol >= 6)
 PRESSURE_STATES: dict[int, str] = {

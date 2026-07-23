@@ -1,8 +1,7 @@
 """Sensors for Oral-B Live.
 
-Entity structure mirrors the official oralb integration (state, time,
-pressure, mode, sector, number of sectors, battery) so existing
-dashboards and cards keep working after switching integrations.
+Core entities mirror the official oralb integration so existing dashboards
+keep working, with additional session, display, battery and brush diagnostics.
 """
 
 from __future__ import annotations
@@ -17,7 +16,13 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfTime
+from homeassistant.const import (
+    PERCENTAGE,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfTemperature,
+    UnitOfTime,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import (
     CONNECTION_BLUETOOTH,
@@ -76,11 +81,35 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         data_key="sector",
     ),
     OralBSensorDescription(
+        key="sector_timer",
+        translation_key="sector_timer",
+        name="Sector timer",
+        data_key="sector_timer",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    OralBSensorDescription(
         key="number_of_sectors",
         translation_key="number_of_sectors",
         name="Number of sectors",
         data_key="number_of_sectors",
         entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    OralBSensorDescription(
+        key="target_duration",
+        translation_key="target_duration",
+        name="Target duration",
+        data_key="target_duration",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        device_class=SensorDeviceClass.DURATION,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    OralBSensorDescription(
+        key="smiley",
+        translation_key="smiley",
+        name="Smiley",
+        data_key="smiley",
     ),
     OralBSensorDescription(
         key="last_session",
@@ -116,6 +145,68 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
     ),
+    OralBSensorDescription(
+        key="battery_time_remaining",
+        translation_key="battery_time_remaining",
+        name="Battery time remaining",
+        data_key="battery_time_remaining",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        device_class=SensorDeviceClass.DURATION,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    OralBSensorDescription(
+        key="battery_voltage",
+        translation_key="battery_voltage",
+        name="Battery voltage",
+        data_key="battery_voltage",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    OralBSensorDescription(
+        key="battery_current",
+        translation_key="battery_current",
+        name="Battery current",
+        data_key="battery_current",
+        native_unit_of_measurement=UnitOfElectricCurrent.MILLIAMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    OralBSensorDescription(
+        key="battery_temperature",
+        translation_key="battery_temperature",
+        name="Battery temperature",
+        data_key="battery_temperature",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    OralBSensorDescription(
+        key="refill_days",
+        translation_key="refill_days",
+        name="Brush head remaining",
+        data_key="refill_days",
+        native_unit_of_measurement=UnitOfTime.DAYS,
+        device_class=SensorDeviceClass.DURATION,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    OralBSensorDescription(
+        key="refill_brushing_time",
+        translation_key="refill_brushing_time",
+        name="Brush head brushing time remaining",
+        data_key="refill_brushing_time",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        device_class=SensorDeviceClass.DURATION,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
 )
 
 
@@ -149,6 +240,17 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             connections={(CONNECTION_BLUETOOTH, coordinator.address)},
             name=coordinator.name,
             manufacturer="Oral-B",
+            model=coordinator.data.get("model_name"),
+            sw_version=(
+                f"0x{coordinator.data['firmware_revision']:02x}"
+                if coordinator.data.get("firmware_revision") is not None
+                else None
+            ),
+            hw_version=(
+                f"BLE protocol {coordinator.data['protocol_version']}"
+                if coordinator.data.get("protocol_version") is not None
+                else None
+            ),
         )
 
     async def async_added_to_hass(self) -> None:
@@ -156,7 +258,9 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         if self.entity_description.restore:
             # Session results must survive restarts; the brush will not
             # replay them.
-            if (last := await self.async_get_last_state()) is not None and last.state not in (
+            if (
+                last := await self.async_get_last_state()
+            ) is not None and last.state not in (
                 None,
                 "unknown",
                 "unavailable",
@@ -173,10 +277,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 # Restore into the shared coordinator too. This lets a later
                 # ff29 read recognize and refine a passively recorded session
                 # after an integration reload, instead of counting it twice.
-                if (
-                    self.coordinator.data.get(self.entity_description.data_key)
-                    is None
-                ):
+                if self.coordinator.data.get(self.entity_description.data_key) is None:
                     self.coordinator.data[self.entity_description.data_key] = (
                         self._attr_native_value
                     )
@@ -195,10 +296,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                         ),
                     }
                     for key, value in restored_attributes.items():
-                        if (
-                            value is not None
-                            and self.coordinator.data.get(key) is None
-                        ):
+                        if value is not None and self.coordinator.data.get(key) is None:
                             self.coordinator.data[key] = value
         self.async_on_remove(
             async_dispatcher_connect(
@@ -232,6 +330,40 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 "rssi": data.get("rssi"),
                 "state_raw": data.get("state_raw"),
                 "mode_raw": data.get("mode_raw"),
+                "model": data.get("model_name"),
+                "model_id": data.get("model_id"),
+                "protocol_version": data.get("protocol_version"),
+                "firmware_revision": data.get("firmware_revision"),
+            }
+        elif self.entity_description.key == "mode":
+            self._attr_extra_state_attributes = {
+                "mode_raw": data.get("mode_raw"),
+                "available_modes": data.get("available_modes"),
+                "available_modes_raw": data.get("available_modes_raw"),
+            }
+        elif self.entity_description.key in (
+            "number_of_sectors",
+            "target_duration",
+        ):
+            self._attr_extra_state_attributes = {
+                "sector_times_seconds": data.get("sector_times"),
+                "target_duration_seconds": data.get("target_duration"),
+            }
+        elif self.entity_description.key == "sector":
+            self._attr_extra_state_attributes = {
+                "sector_raw": data.get("sector_raw"),
+            }
+        elif self.entity_description.key == "smiley":
+            self._attr_extra_state_attributes = {
+                "smiley_raw": data.get("smiley_raw"),
+            }
+        elif self.entity_description.key in (
+            "refill_days",
+            "refill_brushing_time",
+        ):
+            self._attr_extra_state_attributes = {
+                "refill_state": data.get("refill_state"),
+                "refill_state_raw": data.get("refill_state_raw"),
             }
         self.async_write_ha_state()
 

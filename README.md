@@ -8,8 +8,9 @@
 Recent iO firmware stopped broadcasting live session data over Bluetooth
 advertisements. This integration retrieves it over a GATT connection
 instead, restoring the real-time brushing timer, quadrant tracking,
-pressure and mode that passive listening can no longer provide, and adds
-a persistent brushing log.
+pressure, mode and display face that passive listening can no longer
+provide. It also adds a persistent brushing log and battery, pacer and
+brush-head diagnostics.
 
 ---
 
@@ -104,6 +105,9 @@ refine the passively recorded session without counting it twice. When
 the charger continues to own the brush's only connection, the passive
 record remains available instead of losing the session.
 
+The same brief sync reads the smiley/display face and any supported
+battery, pacer and brush-head diagnostics.
+
 Back-to-back sessions are tracked independently. If another session
 starts while the previous brush-history read is settling or retrying,
 the newer session remains queued for its own read instead of being
@@ -182,10 +186,12 @@ post-session sync — see [Connection modes](#connection-modes).
 | Live timer on recent iO firmware | Stays at 0, jumps at the end | Counts up at 1 Hz while brushing (live mode) |
 | Live pressure during a session | Frozen at its pre-session value | `low` / `normal` / `high`, live from `ff0b` (live mode) |
 | Live quadrant during a session | Frozen | Advances as the brush paces them (live mode) |
+| Smiley / display face | Not exposed | Read from `ff0a`; notifications are live when connected |
 | A missed summary advertisement | Session lost entirely | Session recorded from observed start/end states, live stream, or the brush's own `ff29` record |
 | Brushing log | None | Last session, duration, sessions today, kept across restarts |
 | Number of sectors | From advertisement | Read from the brush's quadrant configuration |
-| Battery | Active poll (can stall updates on this firmware) | Read on connect / each sync |
+| Battery | Active poll (can stall updates on this firmware) | Percentage and supported diagnostics read on connect / each sync |
+| Brush-head life | Not exposed | Remaining days/time read when `ff2d` is supported |
 | Cost | None | One Bluetooth connection slot (held, or briefly per sync) |
 | iO Sense charger display | Works | Works in charger-priority mode; disabled in live mode |
 | Competes with the phone app | No | Live mode: yes. Charger priority: no |
@@ -212,11 +218,17 @@ dashboards and toothbrush cards keep working.
 | --- | --- |
 | Toothbrush state | `idle`, `running`, `charging`, `selection_menu`, `session_summary`, `post_brushing_summary`, ... |
 | Time | Session duration in seconds. Updates at 1 Hz while connected (live mode). |
-| Sector | Current quadrant (`sector_0` ... `sector_3`, or `no_sector`) |
+| Sector | Current quadrant (`sector_1` ... `sector_6`, or `no_sector`) |
+| Sector timer | Current advertised sector timer |
 | Number of sectors | Read from the brush's quadrant time configuration |
-| Mode | `daily_clean`, `sensitive`, `gum_care`, `whiten`, `intense`, ... |
+| Target duration | Sum of the configured per-sector target times |
+| Mode | Includes `daily_clean`, `super_sensitive`, `tongue_clean`, `smart_adapt`, ... |
 | Pressure | `low` / `normal` / `high`, live while connected |
+| Smiley | Brush display face from `ff0a`: `off`, `standard`, or `special_2` ... `special_7` |
 | Battery | Percentage, read on connect / each sync |
+| Battery time remaining | Estimated remaining brushing time from `ff05` |
+| Battery voltage/current/temperature | Protocol 8 diagnostics; voltage, current and temperature are disabled by default |
+| Brush head remaining | Remaining days and brushing seconds from `ff2d`; disabled by default |
 | Last session | Timestamp of the last completed session |
 | Last session duration | Length of that session, in seconds |
 | Sessions today | Number of sessions today, resets at midnight |
@@ -227,8 +239,16 @@ stream at 1 Hz. See
 [Connection modes](#connection-modes).
 
 The state entity also exposes `live_connection`, `connection_mode`,
-`rssi`, `state_raw` and `mode_raw` as attributes, which is useful when
-diagnosing how a session was captured.
+`rssi`, raw values, protocol version, reported model and firmware
+revision as attributes. The mode entity lists the brushing modes
+reported by `ff25`; the target-duration entity includes the individual
+sector times.
+
+`ff0a` is documented by the protocol as the brush's display face. It is
+not yet proven to be a brushing-quality score, so this integration
+deliberately calls the entity **Smiley** rather than rating or result.
+Optional diagnostics remain `unknown` on brushes that do not implement
+their characteristic.
 
 ### Brushing log
 
@@ -438,14 +458,14 @@ Two behaviours follow that are worth knowing:
 | Characteristic | Access | Content |
 | --- | --- | --- |
 | `ff01` | read | Device MAC, byte-reversed |
-| `ff02` | read | Model identifier |
+| `ff02` | read | Model identifier, protocol version and firmware revision |
 | `ff04` | notify, read | Toothbrush state, `[state, 0]` |
-| `ff05` | notify, read | Status blob; byte 0 is battery percentage |
+| `ff05` | notify, read | Battery percentage; protocol 6+ adds remaining seconds and protocol 8 adds voltage, current and temperature |
 | `ff06` | notify, read | Button state (0 none, 1 power, 2 mode) |
 | `ff07` | notify, read | Brushing mode |
 | `ff08` | notify, read | Brushing time as `[minutes, seconds]`, 1 Hz while running |
 | `ff09` | notify, read | Current quadrant |
-| `ff0a` | notify, read | Smiley rating |
+| `ff0a` | notify, read | Smiley/display face (0 off, 1 standard, 2–7 special faces) |
 | `ff0b` | notify, read | **Pressure** (0 low, 1 normal, 2 high) |
 | `ff0c` | read, write, notify | Cache — requires authentication |
 | `ff0d` | notify, read | Motion sensor data, roughly 30 Hz |
@@ -459,6 +479,7 @@ Configuration service `a0f0ff20-...`:
 | `ff22` | read, write | Real-time clock, seconds on the brush's own epoch |
 | `ff25` | read, write | Available brushing modes |
 | `ff26` | read, write | Quadrant times, seconds per sector |
+| `ff2d` | read, write | Brush-head refill state, remaining days and brushing seconds |
 
 Service `a0f0ff80-...` is the over-the-air firmware update channel
 (`ff81` OTA command, `ff82` OTA payload) and is not used by this
@@ -527,13 +548,15 @@ Manufacturer data `0x00DC`, 11 bytes:
 | Offset | Content |
 | --- | --- |
 | 0 | Protocol version |
-| 1-2 | Model |
+| 1 | Model identifier |
+| 2 | Firmware revision |
 | 3 | State |
 | 4 | Pressure flags |
 | 5-6 | Brushing time, `[minutes, seconds]` |
 | 7 | Mode |
-| 8 | Sector |
-| 9-10 | Sector flags, reserved |
+| 8 | Sector; the low three bits contain the quadrant |
+| 9 | Sector timer |
+| 10 | Number of sectors |
 
 ## Troubleshooting
 

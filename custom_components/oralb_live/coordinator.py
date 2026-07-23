@@ -17,10 +17,10 @@ session the charger connects as designed and its lights/timer work.
 Passive running/quiet advertisements provide an immediate wall-clock
 session fallback without taking the slot. When the brush is idle or
 docked again, we also try briefly to read the brush's own last-session
-record (ff29), RTC, battery and state, then disconnect. If the charger
-still owns the slot, the passive fallback remains the session record;
-if the GATT read succeeds, it refines that same record without counting
-it twice.
+record (ff29), RTC, battery, display face and supported diagnostics, then
+disconnect. If the charger still owns the slot, the passive fallback remains
+the session record; if the GATT read succeeds, it refines that same record
+without counting it twice.
 """
 
 from __future__ import annotations
@@ -51,20 +51,29 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    ADV_IDX_FIRMWARE,
     ADV_IDX_MODE,
+    ADV_IDX_MODEL,
     ADV_IDX_PRESSURE,
+    ADV_IDX_PROTOCOL,
     ADV_IDX_SECTOR,
+    ADV_IDX_SECTOR_TIMER,
     ADV_IDX_STATE,
     ADV_IDX_TIME_HI,
     ADV_IDX_TIME_LO,
+    ADV_IDX_TOTAL_SECTORS,
     AWAKE_STATES,
+    CHAR_AVAILABLE_MODES,
     CHAR_BRUSH_TIME,
     CHAR_MODE,
+    CHAR_MODEL_ID,
     CHAR_PACER,
     CHAR_PRESSURE,
+    CHAR_REFILL_REMAINDER,
     CHAR_RTC,
     CHAR_SECTOR,
     CHAR_SESSION_DATA,
+    CHAR_SMILEY,
     CHAR_STATE,
     CHAR_STATUS_BLOB,
     CONNECT_RETRIES,
@@ -72,8 +81,10 @@ from .const import (
     DOMAIN,
     MAX_SESSION_SECONDS,
     MIN_PASSIVE_SESSION_SECONDS,
+    MODEL_NAMES,
     MODES,
     NOTIFY_CHARS,
+    OPTIONAL_NOTIFY_CHARS,
     ORALB_MANUFACTURER_ID,
     PASSIVE_SESSION_ACTIVE_STATES,
     PERIODIC_SYNC_INTERVAL_SECONDS,
@@ -83,11 +94,12 @@ from .const import (
     RELEASE_GRACE_SECONDS,
     RELEASE_STATES,
     RUNNING_STATE,
-    SECTOR_NO_SECTOR,
+    REFILL_STATES,
     SESSION_RECONCILE_WINDOW_SECONDS,
     SESSION_RECORD_SETTLE_SECONDS,
     SESSION_SEEN_STATES,
     SIGNAL_UPDATE,
+    SMILEYS,
     STALE_CONNECTION_SECONDS,
     STATES,
     STORAGE_VERSION,
@@ -95,6 +107,14 @@ from .const import (
     SYNC_RETRY_ATTEMPTS,
     SYNC_RETRY_DELAY_SECONDS,
     SYNC_STATES,
+)
+from .protocol import (
+    decode_sector,
+    parse_available_modes,
+    parse_battery_status,
+    parse_device_info,
+    parse_pacer,
+    parse_refill_remainder,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -108,9 +128,7 @@ def _decode_time(hi: int, lo: int) -> int:
 class OralBLiveCoordinator:
     """Owns all brush state and the BLE connection lifecycle."""
 
-    def __init__(
-        self, hass: HomeAssistant, address: str, name: str, mode: str
-    ) -> None:
+    def __init__(self, hass: HomeAssistant, address: str, name: str, mode: str) -> None:
         self.hass = hass
         self.address = address
         self.name = name
@@ -122,9 +140,29 @@ class OralBLiveCoordinator:
             "pressure": None,
             "mode": None,
             "mode_raw": None,
+            "available_modes": None,
+            "available_modes_raw": None,
             "sector": None,
+            "sector_raw": None,
+            "sector_timer": None,
             "number_of_sectors": None,
+            "sector_times": None,
+            "target_duration": None,
+            "smiley": None,
+            "smiley_raw": None,
             "battery": None,
+            "battery_time_remaining": None,
+            "battery_voltage": None,
+            "battery_current": None,
+            "battery_temperature": None,
+            "refill_state": None,
+            "refill_state_raw": None,
+            "refill_days": None,
+            "refill_brushing_time": None,
+            "model_id": None,
+            "model_name": None,
+            "protocol_version": None,
+            "firmware_revision": None,
             "rssi": None,
             "live": False,
             "connection_mode": mode,
@@ -187,9 +225,7 @@ class OralBLiveCoordinator:
             # The brush stops advertising while a client (for example an
             # iO Sense charger) holds its single slot, so advertisements
             # alone are not a reliable trigger. Poll for a connection.
-            self._reconnect_task = self.hass.async_create_task(
-                self._reconnect_loop()
-            )
+            self._reconnect_task = self.hass.async_create_task(self._reconnect_loop())
 
     async def async_stop(self) -> None:
         self._stopping = True
@@ -219,6 +255,11 @@ class OralBLiveCoordinator:
             return
         self.available = True
         self.data["rssi"] = service_info.rssi
+        self._apply_device_identity(
+            payload[ADV_IDX_MODEL],
+            payload[ADV_IDX_PROTOCOL],
+            payload[ADV_IDX_FIRMWARE],
+        )
         state_raw = payload[ADV_IDX_STATE]
         self._apply_state(state_raw)
         # While live notifications flow, they are fresher than adverts.
@@ -232,7 +273,15 @@ class OralBLiveCoordinator:
             self._track_session_time(self.data["time"])
             self._track_session_pressure(self.data["pressure"])
             self._apply_mode(payload[ADV_IDX_MODE])
-            self._apply_sector(payload[ADV_IDX_SECTOR], None)
+            self.data["sector_timer"] = payload[ADV_IDX_SECTOR_TIMER]
+            self._apply_sector(
+                payload[ADV_IDX_SECTOR],
+                (
+                    payload[ADV_IDX_TOTAL_SECTORS]
+                    if self.data["number_of_sectors"] is None
+                    else None
+                ),
+            )
         self._push()
 
         if self._stopping:
@@ -304,33 +353,42 @@ class OralBLiveCoordinator:
     async def _async_subscribe(self, client: BleakClientWithServiceCache) -> None:
         for char_uuid in NOTIFY_CHARS:
             await client.start_notify(char_uuid, self._on_notify)
+        for char_uuid in OPTIONAL_NOTIFY_CHARS:
+            try:
+                await client.start_notify(char_uuid, self._on_notify)
+            except (BleakError, TimeoutError) as err:
+                _LOGGER.debug(
+                    "%s: optional notification %s unavailable: %s",
+                    self.name,
+                    char_uuid[4:8],
+                    err,
+                )
 
-    async def _async_initial_reads(
-        self, client: BleakClientWithServiceCache
-    ) -> None:
-        try:
-            status = await client.read_gatt_char(CHAR_STATUS_BLOB)
-            if status and 0 <= status[0] <= 100:
-                self.data["battery"] = status[0]
-        except (BleakError, TimeoutError):
-            _LOGGER.debug("%s: battery read failed", self.name)
-        try:
-            pacer = await client.read_gatt_char(CHAR_PACER)
-            sectors = len([b for b in pacer if b])
-            if sectors:
-                self.data["number_of_sectors"] = sectors
-        except (BleakError, TimeoutError):
-            pass
-        try:
-            t = await client.read_gatt_char(CHAR_BRUSH_TIME)
-            if len(t) >= 2:
-                self.data["time"] = _decode_time(t[0], t[1])
-        except (BleakError, TimeoutError):
-            pass
+    async def _async_initial_reads(self, client: BleakClientWithServiceCache) -> None:
+        status = await self._async_sync_read(client, CHAR_STATUS_BLOB, "status")
+        model_info = await self._async_sync_read(client, CHAR_MODEL_ID, "device info")
+        pacer = await self._async_sync_read(client, CHAR_PACER, "pacer")
+        available_modes = await self._async_sync_read(
+            client, CHAR_AVAILABLE_MODES, "available modes"
+        )
+        refill = await self._async_sync_read(
+            client, CHAR_REFILL_REMAINDER, "refill remainder"
+        )
+        smiley = await self._async_sync_read(client, CHAR_SMILEY, "smiley")
+        brushing_time = await self._async_sync_read(
+            client, CHAR_BRUSH_TIME, "brushing time"
+        )
 
-    def _on_notify(
-        self, char: BleakGATTCharacteristic, payload: bytearray
-    ) -> None:
+        self._apply_battery_status(status)
+        self._apply_device_info(model_info)
+        self._apply_pacer(pacer)
+        self._apply_available_modes(available_modes)
+        self._apply_refill(refill)
+        self._apply_smiley(smiley)
+        if brushing_time is not None and len(brushing_time) >= 2:
+            self.data["time"] = _decode_time(brushing_time[0], brushing_time[1])
+
+    def _on_notify(self, char: BleakGATTCharacteristic, payload: bytearray) -> None:
         self._last_activity = time.monotonic()
         uuid = str(char.uuid)
         if uuid == CHAR_BRUSH_TIME and len(payload) >= 2:
@@ -349,6 +407,10 @@ class OralBLiveCoordinator:
                 payload[0], f"pressure_{payload[0]}"
             )
             self._track_session_pressure(self.data["pressure"])
+        elif uuid == CHAR_STATUS_BLOB:
+            self._apply_battery_status(payload)
+        elif uuid == CHAR_SMILEY:
+            self._apply_smiley(payload)
         self._push()
 
     # ------------------------------------------------- charger-priority sync
@@ -372,9 +434,7 @@ class OralBLiveCoordinator:
         """Sync every session generation, including back-to-back sessions."""
         while not self._stopping:
             target_generation = self._session_generation
-            session_observed = (
-                target_generation > self._processed_session_generation
-            )
+            session_observed = target_generation > self._processed_session_generation
             attempts = SYNC_RETRY_ATTEMPTS if session_observed else 1
             result = "failed"
 
@@ -392,8 +452,7 @@ class OralBLiveCoordinator:
                 # window. Never connect until the latest advertisement is
                 # quiet again.
                 while (
-                    not self._stopping
-                    and self.data.get("state_raw") not in SYNC_STATES
+                    not self._stopping and self.data.get("state_raw") not in SYNC_STATES
                 ):
                     await asyncio.sleep(1)
                 if self._stopping:
@@ -405,8 +464,7 @@ class OralBLiveCoordinator:
                     break
                 if attempt < attempts:
                     _LOGGER.debug(
-                        "%s: generation %s session record %s; retrying "
-                        "in %ss (%s/%s)",
+                        "%s: generation %s session record %s; retrying in %ss (%s/%s)",
                         self.name,
                         target_generation,
                         result,
@@ -449,7 +507,7 @@ class OralBLiveCoordinator:
         """
         async with self._connect_lock:
             if self._stopping:
-                return
+                return "failed"
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, self.address, connectable=True
             )
@@ -471,23 +529,59 @@ class OralBLiveCoordinator:
                     client, CHAR_SESSION_DATA, "session record"
                 )
                 rtc = await self._async_sync_read(client, CHAR_RTC, "RTC")
-                status = await self._async_sync_read(
-                    client, CHAR_STATUS_BLOB, "status"
-                )
+                status = await self._async_sync_read(client, CHAR_STATUS_BLOB, "status")
                 state = await self._async_sync_read(client, CHAR_STATE, "state")
+                smiley = await self._async_sync_read(client, CHAR_SMILEY, "smiley")
+                refill = await self._async_sync_read(
+                    client, CHAR_REFILL_REMAINDER, "refill remainder"
+                )
+                model_info = (
+                    await self._async_sync_read(client, CHAR_MODEL_ID, "device info")
+                    if self.data["model_id"] is None
+                    else None
+                )
+                pacer = (
+                    await self._async_sync_read(client, CHAR_PACER, "pacer")
+                    if self.data["sector_times"] is None
+                    else None
+                )
+                available_modes = (
+                    await self._async_sync_read(
+                        client, CHAR_AVAILABLE_MODES, "available modes"
+                    )
+                    if self.data["available_modes"] is None
+                    else None
+                )
             finally:
                 try:
                     await client.disconnect()
                 except (BleakError, TimeoutError):
                     pass
-        if status and 0 <= status[0] <= 100:
-            self.data["battery"] = status[0]
+        self._apply_battery_status(status)
+        self._apply_smiley(smiley)
+        self._apply_refill(refill)
+        self._apply_device_info(model_info)
+        self._apply_pacer(pacer)
+        self._apply_available_modes(available_modes)
         if state:
             self._apply_state(state[0])
         result = "missing"
         if record is not None:
             result = await self._async_apply_session_record(record, rtc)
-        if any(value is not None for value in (record, rtc, status, state)):
+        if any(
+            value is not None
+            for value in (
+                record,
+                rtc,
+                status,
+                state,
+                smiley,
+                refill,
+                model_info,
+                pacer,
+                available_modes,
+            )
+        ):
             self._last_sync_ok = time.monotonic()
         self._push()
         _LOGGER.debug("%s: sync complete (session record: %s)", self.name, result)
@@ -604,18 +698,13 @@ class OralBLiveCoordinator:
         updates_latest_session = (
             previous_start is None
             or matched_passive_start == previous_start
-            or (
-                matched_passive_start is None
-                and reconciles_passive_session
-            )
+            or (matched_passive_start is None and reconciles_passive_session)
             or start >= previous_start
         )
         if updates_latest_session:
             self.data["last_session_start"] = start
             self.data["last_session_duration"] = duration
-            self.data["last_session_mode"] = MODES.get(
-                mode_raw, f"mode_{mode_raw}"
-            )
+            self.data["last_session_mode"] = MODES.get(mode_raw, f"mode_{mode_raw}")
             # Quadrant coverage / high-pressure events are not decoded from
             # the record yet; passive advert tracking may have filled them.
         self._last_synced_session_ts = session_ts
@@ -722,8 +811,7 @@ class OralBLiveCoordinator:
             and duration < MIN_PASSIVE_SESSION_SECONDS
         ):
             _LOGGER.debug(
-                "%s: %ss passive session is shorter than the %ss minimum; "
-                "ignored",
+                "%s: %ss passive session is shorter than the %ss minimum; ignored",
                 self.name,
                 duration,
                 MIN_PASSIVE_SESSION_SECONDS,
@@ -775,14 +863,74 @@ class OralBLiveCoordinator:
         self.data["mode"] = MODES.get(raw, f"mode_{raw}")
 
     def _apply_sector(self, raw: int, total: int | None) -> None:
-        if self._session_active and raw != SECTOR_NO_SECTOR:
-            self._session_sectors.add(raw)
-        if raw == SECTOR_NO_SECTOR:
-            self.data["sector"] = "no_sector"
-        else:
-            self.data["sector"] = f"sector_{raw}"
-        if total:
-            self.data["number_of_sectors"] = total
+        self.data["sector_raw"] = raw
+        sector, quadrant, decoded_total = decode_sector(
+            raw,
+            total,
+            self.data.get("number_of_sectors"),
+        )
+        self.data["sector"] = sector
+        if self._session_active and quadrant is not None:
+            self._session_sectors.add(quadrant)
+        if decoded_total:
+            self.data["number_of_sectors"] = decoded_total
+
+    def _apply_battery_status(self, payload: bytes | bytearray | None) -> None:
+        if payload is not None:
+            self.data.update(parse_battery_status(payload))
+
+    def _apply_device_info(self, payload: bytes | bytearray | None) -> None:
+        if payload is None:
+            return
+        parsed = parse_device_info(payload)
+        if parsed:
+            self._apply_device_identity(
+                parsed["model_id"],
+                parsed["protocol_version"],
+                parsed["firmware_revision"],
+            )
+
+    def _apply_device_identity(
+        self, model_id: int, protocol_version: int, firmware_revision: int
+    ) -> None:
+        self.data["model_id"] = model_id
+        self.data["model_name"] = MODEL_NAMES.get(
+            model_id, f"Oral-B model 0x{model_id:02x}"
+        )
+        self.data["protocol_version"] = protocol_version
+        self.data["firmware_revision"] = firmware_revision
+
+    def _apply_pacer(self, payload: bytes | bytearray | None) -> None:
+        if payload is not None:
+            self.data.update(parse_pacer(payload))
+
+    def _apply_available_modes(self, payload: bytes | bytearray | None) -> None:
+        if payload is None:
+            return
+        raw_modes = parse_available_modes(payload)
+        if raw_modes:
+            self.data["available_modes_raw"] = raw_modes
+            self.data["available_modes"] = [
+                MODES.get(raw, f"mode_{raw}") for raw in raw_modes
+            ]
+
+    def _apply_refill(self, payload: bytes | bytearray | None) -> None:
+        if payload is None:
+            return
+        parsed = parse_refill_remainder(payload)
+        if parsed:
+            self.data.update(parsed)
+            state_raw = parsed["refill_state_raw"]
+            self.data["refill_state"] = REFILL_STATES.get(
+                state_raw, f"state_{state_raw}"
+            )
+
+    def _apply_smiley(self, payload: bytes | bytearray | None) -> None:
+        if not payload:
+            return
+        raw = payload[0]
+        self.data["smiley_raw"] = raw
+        self.data["smiley"] = SMILEYS.get(raw, f"face_{raw}")
 
     # ------------------------------------------------------------- teardown
     async def _reconnect_loop(self) -> None:
@@ -811,13 +959,8 @@ class OralBLiveCoordinator:
         async def _watch() -> None:
             while self._client and self._client.is_connected:
                 await asyncio.sleep(30)
-                if (
-                    time.monotonic() - self._last_activity
-                    > STALE_CONNECTION_SECONDS
-                ):
-                    _LOGGER.debug(
-                        "%s: connection stale, rebuilding", self.name
-                    )
+                if time.monotonic() - self._last_activity > STALE_CONNECTION_SECONDS:
+                    _LOGGER.debug("%s: connection stale, rebuilding", self.name)
                     await self._async_disconnect()
                     return
 
@@ -860,6 +1003,4 @@ class OralBLiveCoordinator:
 
     # --------------------------------------------------------------- update
     def _push(self) -> None:
-        async_dispatcher_send(
-            self.hass, f"{SIGNAL_UPDATE}_{self.address}", self.data
-        )
+        async_dispatcher_send(self.hass, f"{SIGNAL_UPDATE}_{self.address}", self.data)
