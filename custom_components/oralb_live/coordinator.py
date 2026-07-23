@@ -37,6 +37,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.components.bluetooth.match import BluetoothCallbackMatcher
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.util import dt as dt_util
 
 from .const import (
     ADV_IDX_MODE,
@@ -62,6 +63,7 @@ from .const import (
     PRESSURE_STATES,
     RELEASE_GRACE_SECONDS,
     RELEASE_STATES,
+    RUNNING_STATE,
     SECTOR_NO_SECTOR,
     SIGNAL_UPDATE,
     STATES,
@@ -94,6 +96,12 @@ class OralBLiveCoordinator:
             "battery": None,
             "rssi": None,
             "live": False,
+            "last_session_start": None,
+            "last_session_duration": None,
+            "last_session_mode": None,
+            "last_session_sectors": None,
+            "last_session_high_pressure": None,
+            "sessions_today": None,
         }
         self.available = False
         self._client: BleakClientWithServiceCache | None = None
@@ -104,6 +112,13 @@ class OralBLiveCoordinator:
         self._unsub_bluetooth: callback | None = None
         self._unsub_unavailable: callback | None = None
         self._stopping = False
+        # --- session tracking ---
+        self._session_active = False
+        self._session_start: Any = None
+        self._session_max_time = 0
+        self._session_sectors: set[int] = set()
+        self._session_high_pressure = 0
+        self._last_pressure: str | None = None
 
     # ------------------------------------------------------------------ setup
     @callback
@@ -157,6 +172,8 @@ class OralBLiveCoordinator:
             self.data["pressure"] = PRESSURE_FROM_ADV.get(
                 payload[ADV_IDX_PRESSURE], "normal"
             )
+            self._track_session_time(self.data["time"])
+            self._track_session_pressure(self.data["pressure"])
             self._apply_mode(payload[ADV_IDX_MODE])
             self._apply_sector(payload[ADV_IDX_SECTOR], None)
         self._push()
@@ -251,6 +268,7 @@ class OralBLiveCoordinator:
         uuid = str(char.uuid)
         if uuid == CHAR_BRUSH_TIME and len(payload) >= 2:
             self.data["time"] = _decode_time(payload[0], payload[1])
+            self._track_session_time(self.data["time"])
         elif uuid == CHAR_STATE and payload:
             self._apply_state(payload[0])
             if payload[0] in RELEASE_STATES:
@@ -263,18 +281,83 @@ class OralBLiveCoordinator:
             self.data["pressure"] = PRESSURE_STATES.get(
                 payload[0], f"pressure_{payload[0]}"
             )
+            self._track_session_pressure(self.data["pressure"])
         self._push()
 
     # ---------------------------------------------------------- state maps
     def _apply_state(self, raw: int) -> None:
+        previous = self.data.get("state_raw")
         self.data["state_raw"] = raw
         self.data["state"] = STATES.get(raw, f"unknown_state_{raw}")
+        if raw == RUNNING_STATE and previous != RUNNING_STATE:
+            self._begin_session()
+        elif raw != RUNNING_STATE and previous == RUNNING_STATE:
+            self._end_session()
+
+    # ---------------------------------------------------------- sessions
+    def _begin_session(self) -> None:
+        """A brushing session just started."""
+        self._session_active = True
+        self._session_start = dt_util.utcnow()
+        self._session_max_time = 0
+        self._session_sectors = set()
+        self._session_high_pressure = 0
+        self._last_pressure = None
+        _LOGGER.debug("%s: session started", self.name)
+
+    def _end_session(self) -> None:
+        """A brushing session just finished; record the result."""
+        if not self._session_active:
+            return
+        self._session_active = False
+        duration = self._session_max_time or 0
+        if duration <= 0:
+            _LOGGER.debug("%s: session ended with no duration; ignored", self.name)
+            return
+
+        today = dt_util.now().date()
+        previous_start = self.data.get("last_session_start")
+        count = self.data.get("sessions_today") or 0
+        if previous_start is not None:
+            previous_day = dt_util.as_local(previous_start).date()
+            if previous_day != today:
+                count = 0
+        self.data["sessions_today"] = count + 1
+
+        self.data["last_session_start"] = self._session_start
+        self.data["last_session_duration"] = duration
+        self.data["last_session_mode"] = self.data.get("mode")
+        self.data["last_session_sectors"] = len(self._session_sectors)
+        self.data["last_session_high_pressure"] = self._session_high_pressure
+        _LOGGER.debug(
+            "%s: session ended: %ss, mode %s, %s quadrants, %s high-pressure events",
+            self.name,
+            duration,
+            self.data.get("mode"),
+            len(self._session_sectors),
+            self._session_high_pressure,
+        )
+
+    def _track_session_time(self, seconds: int) -> None:
+        if self._session_active and seconds > self._session_max_time:
+            self._session_max_time = seconds
+
+    def _track_session_pressure(self, pressure: str) -> None:
+        if (
+            self._session_active
+            and pressure == "high"
+            and self._last_pressure != "high"
+        ):
+            self._session_high_pressure += 1
+        self._last_pressure = pressure
 
     def _apply_mode(self, raw: int) -> None:
         self.data["mode_raw"] = raw
         self.data["mode"] = MODES.get(raw, f"mode_{raw}")
 
     def _apply_sector(self, raw: int, total: int | None) -> None:
+        if self._session_active and raw != SECTOR_NO_SECTOR:
+            self._session_sectors.add(raw)
         if raw == SECTOR_NO_SECTOR:
             self.data["sector"] = "no_sector"
         else:
