@@ -149,12 +149,20 @@ or `mode_<n>`.
 
 | | |
 | --- | --- |
-| Brush | Oral-B iO series, advertised model bytes `36 08 52` (`0x32`) |
+| Brush | **Oral-B iO Series 10** |
+| Advertised identity | Protocol version `0x08`, model ID `0x36` (54), variant `0x52` |
 | Firmware | Mid-2026; broadcasts no live data during a session |
 | Accessory | iO Sense charger present (not required) |
 | Home Assistant | 2026.7 on Home Assistant OS, Raspberry Pi |
 | Bluetooth | ESPHome proxy (M5Stack Atom) with active connections, plus the Pi's built-in adapter and a Shelly BLE scanner |
 | Protocol version | 8 (advertisement byte 0) |
+
+The advertisement does not carry the marketing model number. Model ID
+`0x36` maps to the generic "IO Series" entry shared by most of the line
+(only iO 4 and iO 5 have distinct IDs, `0x34` and `0x35`), which is why
+Home Assistant names these brushes "IO Series" plus a MAC suffix. The
+iO Series 10 above was identified from the physical device, not the
+protocol.
 
 Older iO models and pre-2026 firmware are expected to work, but on those
 the official integration may already be sufficient — see
@@ -278,8 +286,9 @@ from live sessions instead.
 
 ## Protocol notes
 
-Findings from GATT reconnaissance of an iO-series brush (model bytes
-`36 08 52`), July 2026, cross-checked against MatrixEditor/oralb-io.
+Findings from GATT reconnaissance of an Oral-B iO Series 10 (model ID
+`0x36`, protocol version 8), July 2026, cross-checked against
+MatrixEditor/oralb-io.
 Documented here so others do not have to repeat the work.
 
 ### Vendor service `a0f0ff00-5047-4d53-8208-4f72616c2d42`
@@ -394,6 +403,6 @@ device; other models may differ.
 
 [hacs-badge]: https://img.shields.io/badge/HACS-Custom-41BDF5.svg
 [hacs-url]: https://github.com/hacs/integration
-[release-badge]: https://img.shields.io/github/v/release/thomasgregg/oralb-ha?display_name=tag&sort=semver
+[release-badge]: https://img.shields.io/github/v/release/thomasgregg/oralb-ha
 [release-url]: https://github.com/thomasgregg/oralb-ha/releases
 
