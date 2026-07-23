@@ -10,10 +10,28 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_ADDRESS
+from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
-from .const import DOMAIN, ORALB_MANUFACTURER_ID
+from .const import (
+    CONF_CONNECTION_MODE,
+    CONNECTION_MODE_CHARGER,
+    CONNECTION_MODE_LIVE,
+    DEFAULT_CONNECTION_MODE,
+    DOMAIN,
+    ORALB_MANUFACTURER_ID,
+)
 
 
 def _is_toothbrush(service_info: BluetoothServiceInfoBleak) -> bool:
@@ -31,6 +49,14 @@ class OralBLiveConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._discovered: dict[str, BluetoothServiceInfoBleak] = {}
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> OralBLiveOptionsFlow:
+        """Return the options flow."""
+        return OralBLiveOptionsFlow()
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -105,3 +131,35 @@ class OralBLiveConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
         )
 
+
+class OralBLiveOptionsFlow(OptionsFlow):
+    """Options: pick who wins the brush's single connection slot."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+        current = self.config_entry.options.get(
+            CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_CONNECTION_MODE, default=current
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                CONNECTION_MODE_CHARGER,
+                                CONNECTION_MODE_LIVE,
+                            ],
+                            translation_key="connection_mode",
+                            mode=SelectSelectorMode.LIST,
+                        )
+                    )
+                }
+            ),
+        )

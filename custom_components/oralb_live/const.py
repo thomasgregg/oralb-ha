@@ -12,6 +12,22 @@ DOMAIN = "oralb_live"
 
 ORALB_MANUFACTURER_ID = 220  # 0x00DC, Procter & Gamble
 
+# --- Connection mode ---------------------------------------------------------
+# The brush accepts exactly ONE BLE client at a time and stops
+# advertising while that slot is taken (verified 2026-07 on an iO
+# Series 10 with an iO Sense charger). Whoever holds the slot gets the
+# live data; everyone else gets silence. This is a firmware property of
+# the brush and cannot be engineered away, so it is a per-entry option.
+CONF_CONNECTION_MODE = "connection_mode"
+# Live: Home Assistant seizes and holds the slot; 1 Hz live data in HA,
+# but the iO Sense charger display and the phone app cannot connect.
+CONNECTION_MODE_LIVE = "live"
+# Charger priority: Home Assistant leaves the slot free during
+# sessions (charger lights/timer work as designed) and connects only
+# briefly afterwards to read the brush's own last-session record.
+CONNECTION_MODE_CHARGER = "charger_priority"
+DEFAULT_CONNECTION_MODE = CONNECTION_MODE_CHARGER
+
 # --- GATT characteristics (Oral-B vendor service a0f0ff00-...) ---------------
 CHAR_DEVICE_ID = "a0f0ff01-5047-4d53-8208-4f72616c2d42"  # MAC, reversed
 CHAR_MODEL_ID = "a0f0ff02-5047-4d53-8208-4f72616c2d42"
@@ -24,9 +40,9 @@ CHAR_SECTOR = "a0f0ff09-5047-4d53-8208-4f72616c2d42"  # notify: [sector, ?, tota
 CHAR_PRESSURE = "a0f0ff0b-5047-4d53-8208-4f72616c2d42"  # notify: [state, ...]
 CHAR_SENSOR_DATA = "a0f0ff0d-5047-4d53-8208-4f72616c2d42"  # motion, ~30 Hz
 CHAR_CONTROL = "a0f0ff21-5047-4d53-8208-4f72616c2d42"  # command channel
-CHAR_RTC = "a0f0ff22-5047-4d53-8208-4f72616c2d42"
+CHAR_RTC = "a0f0ff22-5047-4d53-8208-4f72616c2d42"  # seconds, brush epoch
 CHAR_PACER = "a0f0ff26-5047-4d53-8208-4f72616c2d42"  # per-sector seconds
-CHAR_SESSION_DATA = "a0f0ff29-5047-4d53-8208-4f72616c2d42"
+CHAR_SESSION_DATA = "a0f0ff29-5047-4d53-8208-4f72616c2d42"  # last session
 
 NOTIFY_CHARS = (
     CHAR_STATE,
@@ -67,13 +83,26 @@ STATES: dict[int, str] = {
 
 RUNNING_STATE = 3
 
-# States in which the brush is reachable and worth connecting to.
-# Charging (4) is included: the brush accepts a second client while an
-# iO Sense charger is connected, and docked is when we can most reliably
-# establish the link before a session starts.
+# States in which the brush is reachable and worth connecting to in
+# LIVE mode. Charging (4) is included: docked is the most reliable
+# moment to win the free slot before a session starts.
 AWAKE_STATES = {1, 2, 3, 4, 5, 8, 9, 10}
 # States in which the brush will not hold a connection anyway.
 RELEASE_STATES = {114, 115}
+
+# --- Charger-priority mode ---------------------------------------------------
+# Advert states that show a session happened since our last sync.
+SESSION_SEEN_STATES = {3, 8, 9, 10}
+# Advert states quiet enough to sync in without disturbing anyone.
+SYNC_STATES = {2, 4}
+# Never attempt syncs more often than this.
+SYNC_MIN_INTERVAL_SECONDS = 60
+# Refresh battery/state at least this often even without a session.
+PERIODIC_SYNC_INTERVAL_SECONDS = 6 * 3600
+# Sanity bound for a session duration parsed from the ff29 record.
+MAX_SESSION_SECONDS = 7200
+
+STORAGE_VERSION = 1
 
 # iO-series mode identifiers. Unknown values are exposed as "mode_<n>".
 MODES: dict[int, str] = {
@@ -105,12 +134,15 @@ PRESSURE_FROM_ADV: dict[int, str] = {
 
 SIGNAL_UPDATE = f"{DOMAIN}_update"
 
-# Connection management
+# --- Connection management (live mode) ---------------------------------------
 CONNECT_RETRIES = 3
-# Retry interval when we hold no connection. The brush stops advertising
-# while a client is attached, so we cannot rely on advertisements alone
-# to trigger a reconnect.
+# Backstop retry interval while we hold no connection. The brush stops
+# advertising while ANY client holds its single slot, so advertisements
+# alone cannot be relied on to trigger a reconnect.
 RECONNECT_INTERVAL_SECONDS = 30
-# Drop and rebuild a connection that has gone quiet for this long.
+# The brush itself drops clients that stay idle for ~30 s (observed
+# brush-side timeout, 2026-07). Reconnection after such a drop is
+# immediate (see _on_disconnect); this constant only guards against a
+# wedged link whose disconnect callback never fired.
 STALE_CONNECTION_SECONDS = 900
 RELEASE_GRACE_SECONDS = 8
