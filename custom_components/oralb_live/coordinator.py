@@ -49,7 +49,7 @@ from .const import (
     CHAR_BRUSH_TIME,
     CHAR_MODE,
     CHAR_PACER,
-    CHAR_PRESSURE_EVENT,
+    CHAR_PRESSURE,
     CHAR_SECTOR,
     CHAR_STATE,
     CHAR_STATUS_BLOB,
@@ -59,6 +59,7 @@ from .const import (
     NOTIFY_CHARS,
     ORALB_MANUFACTURER_ID,
     PRESSURE_FROM_ADV,
+    PRESSURE_STATES,
     RELEASE_GRACE_SECONDS,
     RELEASE_STATES,
     SECTOR_NO_SECTOR,
@@ -258,8 +259,10 @@ class OralBLiveCoordinator:
             self._apply_mode(payload[0])
         elif uuid == CHAR_SECTOR and payload:
             self._apply_sector(payload[0], None)
-        elif uuid == CHAR_PRESSURE_EVENT:
-            self.data["pressure"] = "high" if any(payload) else "normal"
+        elif uuid == CHAR_PRESSURE and payload:
+            self.data["pressure"] = PRESSURE_STATES.get(
+                payload[0], f"pressure_{payload[0]}"
+            )
         self._push()
 
     # ---------------------------------------------------------- state maps
