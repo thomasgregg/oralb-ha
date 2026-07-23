@@ -67,10 +67,13 @@ STATES: dict[int, str] = {
 
 RUNNING_STATE = 3
 
-# States in which the brush is awake and accepts/keeps a connection.
-AWAKE_STATES = {1, 2, 3, 5, 8, 9, 10}
-# States after which we release the connection so the phone/app can have it.
-RELEASE_STATES = {4, 114, 115}
+# States in which the brush is reachable and worth connecting to.
+# Charging (4) is included: the brush accepts a second client while an
+# iO Sense charger is connected, and docked is when we can most reliably
+# establish the link before a session starts.
+AWAKE_STATES = {1, 2, 3, 4, 5, 8, 9, 10}
+# States in which the brush will not hold a connection anyway.
+RELEASE_STATES = {114, 115}
 
 # iO-series mode identifiers. Unknown values are exposed as "mode_<n>".
 MODES: dict[int, str] = {
@@ -103,6 +106,11 @@ PRESSURE_FROM_ADV: dict[int, str] = {
 SIGNAL_UPDATE = f"{DOMAIN}_update"
 
 # Connection management
-CONNECT_RETRIES = 2
-IDLE_DISCONNECT_SECONDS = 120
+CONNECT_RETRIES = 3
+# Retry interval when we hold no connection. The brush stops advertising
+# while a client is attached, so we cannot rely on advertisements alone
+# to trigger a reconnect.
+RECONNECT_INTERVAL_SECONDS = 30
+# Drop and rebuild a connection that has gone quiet for this long.
+STALE_CONNECTION_SECONDS = 900
 RELEASE_GRACE_SECONDS = 8
