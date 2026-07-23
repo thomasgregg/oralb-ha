@@ -48,6 +48,7 @@ from .const import (
     AWAKE_STATES,
     CHAR_BRUSH_TIME,
     CHAR_MODE,
+    CHAR_PACER,
     CHAR_PRESSURE_EVENT,
     CHAR_SECTOR,
     CHAR_STATE,
@@ -66,6 +67,11 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _decode_time(hi: int, lo: int) -> int:
+    """Brush time frames are [minutes, seconds]."""
+    return hi * 60 + lo
 
 
 class OralBLiveCoordinator:
@@ -144,8 +150,8 @@ class OralBLiveCoordinator:
         self._apply_state(state_raw)
         # While live notifications flow, they are fresher than adverts.
         if not self.data["live"]:
-            self.data["time"] = (
-                (payload[ADV_IDX_TIME_HI] << 8) | payload[ADV_IDX_TIME_LO]
+            self.data["time"] = _decode_time(
+                payload[ADV_IDX_TIME_HI], payload[ADV_IDX_TIME_LO]
             )
             self.data["pressure"] = PRESSURE_FROM_ADV.get(
                 payload[ADV_IDX_PRESSURE], "normal"
@@ -224,9 +230,16 @@ class OralBLiveCoordinator:
         except (BleakError, TimeoutError):
             _LOGGER.debug("%s: battery read failed", self.name)
         try:
+            pacer = await client.read_gatt_char(CHAR_PACER)
+            sectors = len([b for b in pacer if b])
+            if sectors:
+                self.data["number_of_sectors"] = sectors
+        except (BleakError, TimeoutError):
+            pass
+        try:
             t = await client.read_gatt_char(CHAR_BRUSH_TIME)
             if len(t) >= 2:
-                self.data["time"] = (t[0] << 8) | t[1]
+                self.data["time"] = _decode_time(t[0], t[1])
         except (BleakError, TimeoutError):
             pass
 
@@ -236,7 +249,7 @@ class OralBLiveCoordinator:
         self._last_activity = time.monotonic()
         uuid = str(char.uuid)
         if uuid == CHAR_BRUSH_TIME and len(payload) >= 2:
-            self.data["time"] = (payload[0] << 8) | payload[1]
+            self.data["time"] = _decode_time(payload[0], payload[1])
         elif uuid == CHAR_STATE and payload:
             self._apply_state(payload[0])
             if payload[0] in RELEASE_STATES:
@@ -244,8 +257,7 @@ class OralBLiveCoordinator:
         elif uuid == CHAR_MODE and payload:
             self._apply_mode(payload[0])
         elif uuid == CHAR_SECTOR and payload:
-            total = payload[2] if len(payload) >= 3 else None
-            self._apply_sector(payload[0], total)
+            self._apply_sector(payload[0], None)
         elif uuid == CHAR_PRESSURE_EVENT and len(payload) >= 2:
             self.data["pressure"] = "high" if payload[1] else "normal"
         self._push()
@@ -260,7 +272,7 @@ class OralBLiveCoordinator:
         self.data["mode"] = MODES.get(raw, f"mode_{raw}")
 
     def _apply_sector(self, raw: int, total: int | None) -> None:
-        if raw == SECTOR_NO_SECTOR:
+        if raw in (SECTOR_NO_SECTOR, 0):
             self.data["sector"] = "no_sector"
         else:
             self.data["sector"] = f"sector_{raw}"
