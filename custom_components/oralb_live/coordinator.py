@@ -258,8 +258,8 @@ class OralBLiveCoordinator:
             self._apply_mode(payload[0])
         elif uuid == CHAR_SECTOR and payload:
             self._apply_sector(payload[0], None)
-        elif uuid == CHAR_PRESSURE_EVENT and len(payload) >= 2:
-            self.data["pressure"] = "high" if payload[1] else "normal"
+        elif uuid == CHAR_PRESSURE_EVENT:
+            self.data["pressure"] = "high" if any(payload) else "normal"
         self._push()
 
     # ---------------------------------------------------------- state maps
@@ -272,7 +272,7 @@ class OralBLiveCoordinator:
         self.data["mode"] = MODES.get(raw, f"mode_{raw}")
 
     def _apply_sector(self, raw: int, total: int | None) -> None:
-        if raw in (SECTOR_NO_SECTOR, 0):
+        if raw == SECTOR_NO_SECTOR:
             self.data["sector"] = "no_sector"
         else:
             self.data["sector"] = f"sector_{raw}"
