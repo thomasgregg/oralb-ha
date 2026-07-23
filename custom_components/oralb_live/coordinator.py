@@ -81,12 +81,15 @@ from .const import (
     RELEASE_STATES,
     RUNNING_STATE,
     SECTOR_NO_SECTOR,
+    SESSION_RECORD_SETTLE_SECONDS,
     SESSION_SEEN_STATES,
     SIGNAL_UPDATE,
     STALE_CONNECTION_SECONDS,
     STATES,
     STORAGE_VERSION,
     SYNC_MIN_INTERVAL_SECONDS,
+    SYNC_RETRY_ATTEMPTS,
+    SYNC_RETRY_DELAY_SECONDS,
     SYNC_STATES,
 )
 
@@ -151,6 +154,7 @@ class OralBLiveCoordinator:
         self._last_sync_attempt = 0.0
         self._last_sync_ok = 0.0
         self._last_synced_session_ts: int | None = None
+        self._session_observed = False
         slug = address.replace(":", "").replace("-", "_").lower()
         self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{slug}")
 
@@ -235,6 +239,7 @@ class OralBLiveCoordinator:
             # quiet states -- which is also the only time the brush
             # advertises with a free slot anyway.
             if state_raw in SESSION_SEEN_STATES:
+                self._session_observed = True
                 self._session_pending_sync = True
             if state_raw in SYNC_STATES:
                 self._maybe_schedule_sync()
@@ -357,10 +362,51 @@ class OralBLiveCoordinator:
         )
         if not due:
             return
-        self._last_sync_attempt = now
-        self._sync_task = self.hass.async_create_task(self._async_sync())
+        self._sync_task = self.hass.async_create_task(self._async_sync_sequence())
 
-    async def _async_sync(self) -> None:
+    async def _async_sync_sequence(self) -> None:
+        """Wait for ff29 to settle, then retry stale post-session records."""
+        attempts = SYNC_RETRY_ATTEMPTS if self._session_observed else 1
+        if self._session_observed:
+            _LOGGER.debug(
+                "%s: waiting %ss for the session record to settle",
+                self.name,
+                SESSION_RECORD_SETTLE_SECONDS,
+            )
+            await asyncio.sleep(SESSION_RECORD_SETTLE_SECONDS)
+
+        for attempt in range(1, attempts + 1):
+            self._last_sync_attempt = time.monotonic()
+            result = await self._async_sync_once()
+            if result == "new":
+                self._session_pending_sync = False
+                self._session_observed = False
+                return
+            if not self._session_observed:
+                # Startup and periodic probes do not imply a new session.
+                self._session_pending_sync = False
+                return
+            if attempt < attempts:
+                _LOGGER.debug(
+                    "%s: session record %s; retrying in %ss (%s/%s)",
+                    self.name,
+                    result,
+                    SYNC_RETRY_DELAY_SECONDS,
+                    attempt,
+                    attempts,
+                )
+                await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
+
+        _LOGGER.debug(
+            "%s: no new session record after %s attempts; giving up until "
+            "another session is observed",
+            self.name,
+            attempts,
+        )
+        self._session_pending_sync = False
+        self._session_observed = False
+
+    async def _async_sync_once(self) -> str:
         """Connect briefly, read the last-session record, disconnect.
 
         Total connected time is a few seconds -- far below the brush's
@@ -375,7 +421,7 @@ class OralBLiveCoordinator:
             )
             if ble_device is None:
                 _LOGGER.debug("%s: sync skipped, no connectable path", self.name)
-                return
+                return "failed"
             try:
                 client = await establish_connection(
                     BleakClientWithServiceCache,
@@ -385,15 +431,16 @@ class OralBLiveCoordinator:
                 )
             except (BleakError, TimeoutError) as err:
                 _LOGGER.debug("%s: sync connect failed: %s", self.name, err)
-                return
-            record = rtc = status = state = None
+                return "failed"
             try:
-                record = await client.read_gatt_char(CHAR_SESSION_DATA)
-                rtc = await client.read_gatt_char(CHAR_RTC)
-                status = await client.read_gatt_char(CHAR_STATUS_BLOB)
-                state = await client.read_gatt_char(CHAR_STATE)
-            except (BleakError, TimeoutError) as err:
-                _LOGGER.debug("%s: sync read failed: %s", self.name, err)
+                record = await self._async_sync_read(
+                    client, CHAR_SESSION_DATA, "session record"
+                )
+                rtc = await self._async_sync_read(client, CHAR_RTC, "RTC")
+                status = await self._async_sync_read(
+                    client, CHAR_STATUS_BLOB, "status"
+                )
+                state = await self._async_sync_read(client, CHAR_STATE, "state")
             finally:
                 try:
                     await client.disconnect()
@@ -403,16 +450,31 @@ class OralBLiveCoordinator:
             self.data["battery"] = status[0]
         if state:
             self._apply_state(state[0])
+        result = "missing"
         if record is not None:
-            await self._async_apply_session_record(record, rtc)
-        self._last_sync_ok = time.monotonic()
-        self._session_pending_sync = False
+            result = await self._async_apply_session_record(record, rtc)
+        if any(value is not None for value in (record, rtc, status, state)):
+            self._last_sync_ok = time.monotonic()
         self._push()
-        _LOGGER.debug("%s: sync complete", self.name)
+        _LOGGER.debug("%s: sync complete (session record: %s)", self.name, result)
+        return result
+
+    async def _async_sync_read(
+        self,
+        client: BleakClientWithServiceCache,
+        char_uuid: str,
+        label: str,
+    ) -> bytearray | None:
+        """Read one sync characteristic without suppressing later reads."""
+        try:
+            return await client.read_gatt_char(char_uuid)
+        except (BleakError, TimeoutError) as err:
+            _LOGGER.debug("%s: %s read failed: %s", self.name, label, err)
+            return None
 
     async def _async_apply_session_record(
         self, record: bytes | bytearray, rtc: bytes | bytearray | None
-    ) -> None:
+    ) -> str:
         """Parse the ff29 last-session record and log new sessions.
 
         Layout (23 bytes, little-endian, protocol 8):
@@ -438,17 +500,31 @@ class OralBLiveCoordinator:
                 len(record),
                 bytes(record).hex(" "),
             )
-            return
+            return "invalid"
         session_ts = int.from_bytes(record[0:4], "little")
         duration = int.from_bytes(record[8:10], "little")
         mode_raw = record[19]
         if session_ts == 0 or not 0 < duration <= MAX_SESSION_SECONDS:
-            return
+            _LOGGER.debug(
+                "%s: invalid ff29 record (timestamp=%s, duration=%s): %s",
+                self.name,
+                session_ts,
+                duration,
+                bytes(record).hex(" "),
+            )
+            return "invalid"
         if self._last_synced_session_ts is None:
             stored = await self._store.async_load() or {}
             self._last_synced_session_ts = stored.get("last_session_ts", 0)
         if session_ts == self._last_synced_session_ts:
-            return
+            _LOGGER.debug(
+                "%s: ff29 still contains the previous session "
+                "(timestamp=%s, duration=%ss)",
+                self.name,
+                session_ts,
+                duration,
+            )
+            return "duplicate"
 
         rtc_now: int | None = None
         if rtc is not None and len(rtc) >= 4:
@@ -481,6 +557,7 @@ class OralBLiveCoordinator:
             self.data["last_session_mode"],
             start,
         )
+        return "new"
 
     # ---------------------------------------------------------- state maps
     def _apply_state(self, raw: int) -> None:

@@ -97,6 +97,11 @@ SESSION_SEEN_STATES = {3, 8, 9, 10}
 SYNC_STATES = {2, 4}
 # Never attempt syncs more often than this.
 SYNC_MIN_INTERVAL_SECONDS = 60
+# Give the brush time to commit ff29 after returning to a quiet state.
+SESSION_RECORD_SETTLE_SECONDS = 30
+# A freshly completed session can briefly return the previous ff29 record.
+SYNC_RETRY_DELAY_SECONDS = 30
+SYNC_RETRY_ATTEMPTS = 4
 # Refresh battery/state at least this often even without a session.
 PERIODIC_SYNC_INTERVAL_SECONDS = 6 * 3600
 # Sanity bound for a session duration parsed from the ff29 record.
