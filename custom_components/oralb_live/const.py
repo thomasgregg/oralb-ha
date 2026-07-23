@@ -65,6 +65,8 @@ STATES: dict[int, str] = {
     115: "transport",
 }
 
+RUNNING_STATE = 3
+
 # States in which the brush is awake and accepts/keeps a connection.
 AWAKE_STATES = {1, 2, 3, 5, 8, 9, 10}
 # States after which we release the connection so the phone/app can have it.
@@ -104,4 +106,3 @@ SIGNAL_UPDATE = f"{DOMAIN}_update"
 CONNECT_RETRIES = 2
 IDLE_DISCONNECT_SECONDS = 120
 RELEASE_GRACE_SECONDS = 8
-
