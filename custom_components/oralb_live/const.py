@@ -53,6 +53,7 @@ STATES: dict[int, str] = {
     6: "flight_menu",
     7: "final_test",
     8: "selection_menu",
+    9: "session_summary",
     10: "post_brushing_summary",
     113: "pcb_test",
     114: "sleeping",
@@ -60,7 +61,7 @@ STATES: dict[int, str] = {
 }
 
 # States in which the brush is awake and accepts/keeps a connection.
-AWAKE_STATES = {1, 2, 3, 5, 8, 10}
+AWAKE_STATES = {1, 2, 3, 5, 8, 9, 10}
 # States after which we release the connection so the phone/app can have it.
 RELEASE_STATES = {4, 114, 115}
 
@@ -91,4 +92,3 @@ SIGNAL_UPDATE = f"{DOMAIN}_update"
 CONNECT_RETRIES = 2
 IDLE_DISCONNECT_SECONDS = 120
 RELEASE_GRACE_SECONDS = 8
-
