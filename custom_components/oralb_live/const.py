@@ -102,6 +102,10 @@ SESSION_RECORD_SETTLE_SECONDS = 30
 # A freshly completed session can briefly return the previous ff29 record.
 SYNC_RETRY_DELAY_SECONDS = 30
 SYNC_RETRY_ATTEMPTS = 4
+# Treat a brush record close to a passively observed start as the same
+# session, so the authoritative record can refine the fallback without
+# incrementing the daily count twice.
+SESSION_RECONCILE_WINDOW_SECONDS = 2 * 60
 # Refresh battery/state at least this often even without a session.
 PERIODIC_SYNC_INTERVAL_SECONDS = 6 * 3600
 # Sanity bound for a session duration parsed from the ff29 record.

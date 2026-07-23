@@ -87,21 +87,25 @@ Configure*. Switching takes effect immediately.
 
 ### Charger priority (default)
 
-Home Assistant never competes for the slot. During a session the
-charger (or the app) connects as designed, so the iO Sense lights and
-timer behave exactly as they do out of the box. When the brush is
-docked or idle again after a session — it frees the slot and resumes
-advertising within about 30 seconds — Home Assistant connects for a
-few seconds, reads the brush's own **last-session record** (see
-[Protocol notes](#last-session-record-ff29)), the battery level and
-the state, then disconnects.
+Home Assistant never competes for the slot during brushing. The charger
+(or the app) connects as designed, so the iO Sense lights and timer
+behave exactly as they do out of the box. If the brush broadcasts
+running and quiet states, Home Assistant records the session
+immediately from those passive advertisements. Duration falls back to
+elapsed wall time when the advertised timer remains at zero.
 
-What you give up: the timer, pressure and quadrant entities do not
-update *during* the session, because the brush is silent on the air
-while the charger holds the slot. The session appears in Home
-Assistant roughly a minute after you finish brushing — timed, dated
-and measured by the brush itself, so nothing is lost if an
-advertisement is missed.
+After the session, Home Assistant also makes short attempts to read the
+brush's own **last-session record** (see
+[Protocol notes](#last-session-record-ff29)), battery level and state.
+When that succeeds, its authoritative timestamp, duration and mode
+refine the passively recorded session without counting it twice. When
+the charger continues to own the brush's only connection, the passive
+record remains available instead of losing the session.
+
+What you give up: live timer, pressure and quadrant updates depend on
+what the brush firmware exposes in advertisements. They are not
+guaranteed in charger-priority mode because Home Assistant deliberately
+does not take the connection slot.
 
 What you keep: a complete brushing log (start time, duration, mode),
 battery tracking, and a fully functional charger and phone app.
@@ -171,7 +175,7 @@ post-session sync — see [Connection modes](#connection-modes).
 | Live timer on recent iO firmware | Stays at 0, jumps at the end | Counts up at 1 Hz while brushing (live mode) |
 | Live pressure during a session | Frozen at its pre-session value | `low` / `normal` / `high`, live from `ff0b` (live mode) |
 | Live quadrant during a session | Frozen | Advances as the brush paces them (live mode) |
-| A missed summary advertisement | Session lost entirely | Session still recorded: live stream, or the brush's own `ff29` record |
+| A missed summary advertisement | Session lost entirely | Session recorded from observed start/end states, live stream, or the brush's own `ff29` record |
 | Brushing log | None | Last session, duration, sessions today, kept across restarts |
 | Number of sectors | From advertisement | Read from the brush's quadrant configuration |
 | Battery | Active poll (can stall updates on this firmware) | Read on connect / each sync |
@@ -211,8 +215,8 @@ dashboards and toothbrush cards keep working.
 | Sessions today | Number of sessions today, resets at midnight |
 
 In charger-priority mode the in-session entities (time, pressure,
-sector) update only from advertisements and the post-session sync; in
-live mode they stream at 1 Hz. See
+sector) update only when advertisements expose them; in live mode they
+stream at 1 Hz. See
 [Connection modes](#connection-modes).
 
 The state entity also exposes `live_connection`, `connection_mode`,
@@ -224,9 +228,9 @@ diagnosing how a session was captured.
 When a session ends, **Last session** records the start time with
 `duration_seconds`, `mode`, `quadrants_covered` and
 `high_pressure_events` as attributes. In live mode these come from the
-live stream; in charger-priority mode the start time, duration and
-mode come from the brush's own last-session record (quadrant and
-pressure detail are not available in that record). Because it is a
+live stream. In charger-priority mode passive advertisements provide an
+immediate fallback; a later brush history read refines its start time,
+duration and mode when the connection is available. Because it is a
 proper timestamp sensor, Home Assistant's recorder keeps the history
 automatically: a history graph on **Last session duration** is a
 complete brushing log that accumulates from installation onwards.

@@ -163,12 +163,43 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             ):
                 if self.entity_description.device_class is SensorDeviceClass.TIMESTAMP:
                     self._attr_native_value = dt_util.parse_datetime(last.state)
-                elif self.entity_description.device_class is SensorDeviceClass.DURATION:
+                elif (
+                    self.entity_description.device_class is SensorDeviceClass.DURATION
+                    or self.entity_description.key == "sessions_today"
+                ):
                     self._attr_native_value = int(float(last.state))
                 else:
                     self._attr_native_value = last.state
+                # Restore into the shared coordinator too. This lets a later
+                # ff29 read recognize and refine a passively recorded session
+                # after an integration reload, instead of counting it twice.
+                if (
+                    self.coordinator.data.get(self.entity_description.data_key)
+                    is None
+                ):
+                    self.coordinator.data[self.entity_description.data_key] = (
+                        self._attr_native_value
+                    )
                 if self.entity_description.key == "last_session":
                     self._attr_extra_state_attributes = dict(last.attributes or {})
+                    restored_attributes = {
+                        "last_session_duration": last.attributes.get(
+                            "duration_seconds"
+                        ),
+                        "last_session_mode": last.attributes.get("mode"),
+                        "last_session_sectors": last.attributes.get(
+                            "quadrants_covered"
+                        ),
+                        "last_session_high_pressure": last.attributes.get(
+                            "high_pressure_events"
+                        ),
+                    }
+                    for key, value in restored_attributes.items():
+                        if (
+                            value is not None
+                            and self.coordinator.data.get(key) is None
+                        ):
+                            self.coordinator.data[key] = value
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,

@@ -14,12 +14,13 @@ display and the phone app do not work.
 
 CHARGER-PRIORITY mode (default): never compete for the slot. During a
 session the charger connects as designed and its lights/timer work.
-When the brush is idle or docked again after a session -- it frees the
-slot and resumes advertising within ~30 s -- we connect for a few
-seconds, read the brush's own last-session record (ff29), the RTC,
-battery and state, then disconnect. The trade-off: no live in-session
-entities; the session appears about a minute after brushing ends,
-timed by the brush itself.
+Passive running/quiet advertisements provide an immediate wall-clock
+session fallback without taking the slot. When the brush is idle or
+docked again, we also try briefly to read the brush's own last-session
+record (ff29), RTC, battery and state, then disconnect. If the charger
+still owns the slot, the passive fallback remains the session record;
+if the GATT read succeeds, it refines that same record without counting
+it twice.
 """
 
 from __future__ import annotations
@@ -81,6 +82,7 @@ from .const import (
     RELEASE_STATES,
     RUNNING_STATE,
     SECTOR_NO_SECTOR,
+    SESSION_RECONCILE_WINDOW_SECONDS,
     SESSION_RECORD_SETTLE_SECONDS,
     SESSION_SEEN_STATES,
     SIGNAL_UPDATE,
@@ -144,6 +146,7 @@ class OralBLiveCoordinator:
         # --- session tracking (live mode / passive adverts) ---
         self._session_active = False
         self._session_start: Any = None
+        self._session_started_monotonic: float | None = None
         self._session_max_time = 0
         self._session_sectors: set[int] = set()
         self._session_high_pressure = 0
@@ -536,13 +539,19 @@ class OralBLiveCoordinator:
 
         today = dt_util.now().date()
         previous_start = self.data.get("last_session_start")
-        count = self.data.get("sessions_today") or 0
-        if (
+        reconciles_passive_session = (
             previous_start is not None
-            and dt_util.as_local(previous_start).date() != today
-        ):
-            count = 0
-        self.data["sessions_today"] = count + 1
+            and abs((start - previous_start).total_seconds())
+            <= SESSION_RECONCILE_WINDOW_SECONDS
+        )
+        if not reconciles_passive_session:
+            count = self.data.get("sessions_today") or 0
+            if (
+                previous_start is not None
+                and dt_util.as_local(previous_start).date() != today
+            ):
+                count = 0
+            self.data["sessions_today"] = count + 1
         self.data["last_session_start"] = start
         self.data["last_session_duration"] = duration
         self.data["last_session_mode"] = MODES.get(mode_raw, f"mode_{mode_raw}")
@@ -550,13 +559,23 @@ class OralBLiveCoordinator:
         # the record yet; passive advert tracking may have filled them.
         self._last_synced_session_ts = session_ts
         await self._store.async_save({"last_session_ts": session_ts})
-        _LOGGER.debug(
-            "%s: synced session from brush: %ss, mode %s, started %s",
-            self.name,
-            duration,
-            self.data["last_session_mode"],
-            start,
-        )
+        if reconciles_passive_session:
+            _LOGGER.debug(
+                "%s: reconciled passive session with brush record: "
+                "%ss, mode %s, started %s",
+                self.name,
+                duration,
+                self.data["last_session_mode"],
+                start,
+            )
+        else:
+            _LOGGER.debug(
+                "%s: synced session from brush: %ss, mode %s, started %s",
+                self.name,
+                duration,
+                self.data["last_session_mode"],
+                start,
+            )
         return "new"
 
     # ---------------------------------------------------------- state maps
@@ -574,6 +593,7 @@ class OralBLiveCoordinator:
         """A brushing session just started."""
         self._session_active = True
         self._session_start = dt_util.utcnow()
+        self._session_started_monotonic = time.monotonic()
         self._session_max_time = 0
         self._session_sectors = set()
         self._session_high_pressure = 0
@@ -583,17 +603,29 @@ class OralBLiveCoordinator:
     def _end_session(self) -> None:
         """A brushing session just finished; record the result.
 
-        In charger-priority mode this usually records nothing (the
-        brush is silent while the charger holds it, so no duration
-        accumulates); the authoritative record then arrives via the
-        ff29 sync instead.
+        Prefer the brush's advertised/notified timer. If it stays at
+        zero, use elapsed wall time between the observed running and
+        quiet states. This passive fallback needs no connection and is
+        later reconciled with ff29 if that record becomes available.
         """
         if not self._session_active:
             return
         self._session_active = False
         duration = self._session_max_time or 0
+        duration_source = "brush timer"
+        if duration <= 0 and self._session_started_monotonic is not None:
+            duration = round(time.monotonic() - self._session_started_monotonic)
+            duration_source = "passive elapsed time"
+        self._session_started_monotonic = None
         if duration <= 0:
             _LOGGER.debug("%s: session ended with no duration; ignored", self.name)
+            return
+        if duration > MAX_SESSION_SECONDS:
+            _LOGGER.debug(
+                "%s: session duration %ss exceeds the maximum; ignored",
+                self.name,
+                duration,
+            )
             return
 
         today = dt_util.now().date()
@@ -611,8 +643,10 @@ class OralBLiveCoordinator:
         self.data["last_session_sectors"] = len(self._session_sectors)
         self.data["last_session_high_pressure"] = self._session_high_pressure
         _LOGGER.debug(
-            "%s: session ended: %ss, mode %s, %s quadrants, %s high-pressure events",
+            "%s: session ended from %s: %ss, mode %s, %s quadrants, "
+            "%s high-pressure events",
             self.name,
+            duration_source,
             duration,
             self.data.get("mode"),
             len(self._session_sectors),
