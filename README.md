@@ -106,7 +106,12 @@ the charger continues to own the brush's only connection, the passive
 record remains available instead of losing the session.
 
 The same brief sync reads the smiley/display face and any supported
-battery, pacer and brush-head diagnostics.
+battery, pacer and brush-head diagnostics **only if Home Assistant wins
+the brush's connection slot**. This is opportunistic, not guaranteed.
+On an iO Sense setup where the charger continues holding the slot,
+Smiley, battery, target duration, available modes and brush-head
+diagnostics can remain `unknown` indefinitely. The passive session log
+still works.
 
 Back-to-back sessions are tracked independently. If another session
 starts while the previous brush-history read is settling or retrying,
@@ -116,10 +121,13 @@ cleared with the older one.
 What you give up: live timer, pressure and quadrant updates depend on
 what the brush firmware exposes in advertisements. They are not
 guaranteed in charger-priority mode because Home Assistant deliberately
-does not take the connection slot.
+does not take the connection slot. GATT-only entities such as Smiley and
+the extended diagnostics are also not guaranteed.
 
 What you keep: a complete brushing log (start time, duration, mode),
-battery tracking, and a fully functional charger and phone app.
+passive state/mode data, and a fully functional charger and phone app.
+Battery and other GATT-only values are available only when a brief sync
+succeeds.
 
 If several sessions happen while Home Assistant is down or out of
 range, only the most recent one is recovered — the record on the brush
@@ -131,6 +139,8 @@ The original behaviour (v0.4 and earlier). Home Assistant seizes the
 slot whenever it is free — most reliably while the brush is docked —
 and holds it. All entities update live at 1 Hz during brushing: timer,
 pressure, quadrant, mode. Sessions are recorded from the live stream.
+Use this mode when Smiley, battery diagnostics, pacer configuration or
+other GATT-only values must update reliably.
 
 What you give up: while Home Assistant holds the slot, the iO Sense
 display does not work and the phone app cannot sync. The brush also
@@ -186,11 +196,11 @@ post-session sync — see [Connection modes](#connection-modes).
 | Live timer on recent iO firmware | Stays at 0, jumps at the end | Counts up at 1 Hz while brushing (live mode) |
 | Live pressure during a session | Frozen at its pre-session value | `low` / `normal` / `high`, live from `ff0b` (live mode) |
 | Live quadrant during a session | Frozen | Advances as the brush paces them (live mode) |
-| Smiley / display face | Not exposed | Read from `ff0a`; notifications are live when connected |
+| Smiley / display face | Not exposed | Read from `ff0a`; reliable in live mode, opportunistic in charger priority |
 | A missed summary advertisement | Session lost entirely | Session recorded from observed start/end states, live stream, or the brush's own `ff29` record |
 | Brushing log | None | Last session, duration, sessions today, kept across restarts |
 | Number of sectors | From advertisement | Read from the brush's quadrant configuration |
-| Battery | Active poll (can stall updates on this firmware) | Percentage and supported diagnostics read on connect / each sync |
+| Battery | Active poll (can stall updates on this firmware) | Percentage and diagnostics when a GATT connection succeeds |
 | Brush-head life | Not exposed | Remaining days/time read when `ff2d` is supported |
 | Cost | None | One Bluetooth connection slot (held, or briefly per sync) |
 | iO Sense charger display | Works | Works in charger-priority mode; disabled in live mode |
@@ -224,8 +234,8 @@ dashboards and toothbrush cards keep working.
 | Target duration | Sum of the configured per-sector target times |
 | Mode | Includes `daily_clean`, `super_sensitive`, `tongue_clean`, `smart_adapt`, ... |
 | Pressure | `low` / `normal` / `high`, live while connected |
-| Smiley | Brush display face from `ff0a`: `off`, `standard`, or `special_2` ... `special_7` |
-| Battery | Percentage, read on connect / each sync |
+| Smiley | Brush display face from `ff0a`: reliable in live mode; charger priority requires a successful brief sync |
+| Battery | Percentage: reliable in live mode; charger priority requires a successful brief sync |
 | Battery time remaining | Estimated remaining brushing time from `ff05` |
 | Battery voltage/current/temperature | Protocol 8 diagnostics; voltage, current and temperature are disabled by default |
 | Brush head remaining | Remaining days and brushing seconds from `ff2d`; disabled by default |
@@ -237,6 +247,13 @@ In charger-priority mode the in-session entities (time, pressure,
 sector) update only when advertisements expose them; in live mode they
 stream at 1 Hz. See
 [Connection modes](#connection-modes).
+
+Smiley, battery details, target duration, available modes and
+brush-head lifetime require a direct GATT connection. **Live mode is
+required for reliable updates.** In charger-priority mode they update
+only when Home Assistant briefly wins the single connection slot after
+a session; they can remain `unknown` when the charger or phone retains
+that slot.
 
 The state entity also exposes `live_connection`, `connection_mode`,
 `rssi`, raw values, protocol version, reported model and firmware
