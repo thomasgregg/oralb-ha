@@ -5,6 +5,10 @@
     {
       "manufacturer_id": 220,
       "connectable": false
+    },
+    {
+      "service_uuid": "a0f03e00-5047-4d53-8208-4f72616c2d42",
+      "connectable": true
     }
   ],
   "codeowners": ["@thomasgregg"],
@@ -15,5 +19,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/thomasgregg/oralb-ha/issues",
   "requirements": [],
-  "version": "0.6.1"
+  "version": "0.7.0"
 }

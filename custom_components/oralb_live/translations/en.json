@@ -19,7 +19,7 @@
   "options": {
     "step": {
       "init": {
-        "description": "The brush accepts a single Bluetooth connection at a time, so Home Assistant and the iO Sense charger display cannot both be active during a brushing session. Choose who wins.",
+        "description": "Choose whether Home Assistant should cooperate with the charger/app or own the brush connection directly. A paired iO Sense is discovered and matched automatically.",
         "data": { "connection_mode": "Connection mode" }
       }
     }
@@ -27,8 +27,8 @@
   "selector": {
     "connection_mode": {
       "options": {
-        "charger_priority": "Charger priority — the iO Sense lights and timer work during brushing; the session syncs to Home Assistant right after it ends",
-        "live": "Live — Home Assistant streams the timer, pressure and quadrant at 1 Hz during brushing; the iO Sense display and phone app will not work"
+        "charger_priority": "Charger/app compatible (recommended) — automatically uses a paired iO Sense as a local live-data bridge and falls back safely when no charger is available",
+        "live": "Home Assistant direct — uses the brush connection for the fastest notifications; the iO Sense display and phone app cannot use the brush simultaneously"
       }
     }
   }

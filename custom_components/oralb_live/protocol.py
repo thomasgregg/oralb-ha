@@ -36,8 +36,8 @@ def parse_battery_status(
             result["battery_voltage"] = millivolts / 1000
 
     if len(payload) >= 7:
-        milliamperes = int.from_bytes(payload[5:7], "little")
-        if milliamperes != 0xFFFF:
+        milliamperes = int.from_bytes(payload[5:7], "little", signed=True)
+        if milliamperes != -1:
             result["battery_current"] = milliamperes
 
     if len(payload) >= 8:
@@ -95,6 +95,41 @@ def parse_available_modes(payload: bytes | bytearray) -> list[int]:
     return modes
 
 
+def parse_session_record(payload: bytes | bytearray) -> dict[str, int | float]:
+    """Decode the protocol 7/8 FF29 retained-session summary.
+
+    The two 16-bit words at offsets 4 and 6 contain packed identifiers and
+    configuration. Pressure times use 100 ms units; pressure magnitudes use
+    100 mN units. The layout is verified against the vendor parser and a real
+    offline session recovered through an iO Sense charger.
+    """
+    if len(payload) < 20:
+        return {}
+    packed_identity = int.from_bytes(payload[4:6], "little")
+    packed_configuration = int.from_bytes(payload[6:8], "little")
+    high_pressure_time = int.from_bytes(payload[10:12], "little")
+    low_pressure_time = int.from_bytes(payload[12:14], "little")
+    result: dict[str, int | float] = {
+        "session_timestamp": int.from_bytes(payload[0:4], "little"),
+        "session_id": packed_identity & 0x1FFF,
+        "user_id": (packed_identity & 0xE000) >> 13,
+        "target_duration": packed_configuration & 0x1FFF,
+        "number_of_sectors": (packed_configuration & 0xE000) >> 13,
+        "duration": int.from_bytes(payload[8:10], "little"),
+        "high_pressure_time": high_pressure_time / 10,
+        "low_pressure_time": low_pressure_time / 10,
+        "average_pressure": payload[14] * 100,
+        "maximum_pressure": payload[15] * 100,
+        "high_pressure_events": payload[16],
+        "low_pressure_events": payload[17],
+        "on_events": payload[18],
+        "mode_raw": payload[19],
+    }
+    if len(payload) >= 21:
+        result["battery_end"] = payload[20]
+    return result
+
+
 def decode_sector(
     raw: int, total: int | None, configured_total: int | None
 ) -> tuple[str, int | None, int | None]:
@@ -108,4 +143,18 @@ def decode_sector(
         return "no_sector", None, decoded_total
     if quadrant == 7:
         quadrant = decoded_total or 4
+    return f"sector_{quadrant}", quadrant, decoded_total
+
+
+def decode_charger_sector(
+    raw: int, total: int | None, configured_total: int | None
+) -> tuple[str, int | None, int | None]:
+    """Decode the zero-based FF09 zone returned by charger passthrough."""
+    decoded_total = total if total and 1 <= total <= 8 else configured_total
+    if raw == 0xF0:
+        return "no_sector", None, decoded_total
+    if raw == 0xFF:
+        quadrant = decoded_total or 4
+    else:
+        quadrant = (raw & 0x07) + 1
     return f"sector_{quadrant}", quadrant, decoded_total

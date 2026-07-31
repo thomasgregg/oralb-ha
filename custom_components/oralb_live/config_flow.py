@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
@@ -105,13 +104,8 @@ class OralBLiveConfigFlow(ConfigFlow, domain=DOMAIN):
             )
 
         current = self._async_current_ids(include_ignore=False)
-        for service_info in async_discovered_service_info(
-            self.hass, connectable=False
-        ):
-            if (
-                service_info.address not in current
-                and _is_toothbrush(service_info)
-            ):
+        for service_info in async_discovered_service_info(self.hass, connectable=False):
+            if service_info.address not in current and _is_toothbrush(service_info):
                 self._discovered[service_info.address] = service_info
 
         if not self._discovered:
@@ -148,9 +142,7 @@ class OralBLiveOptionsFlow(OptionsFlow):
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Required(
-                        CONF_CONNECTION_MODE, default=current
-                    ): SelectSelector(
+                    vol.Required(CONF_CONNECTION_MODE, default=current): SelectSelector(
                         SelectSelectorConfig(
                             options=[
                                 CONNECTION_MODE_CHARGER,

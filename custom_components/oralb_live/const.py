@@ -19,14 +19,18 @@ ORALB_MANUFACTURER_ID = 220  # 0x00DC, Procter & Gamble
 # live data; everyone else gets silence. This is a firmware property of
 # the brush and cannot be engineered away, so it is a per-entry option.
 CONF_CONNECTION_MODE = "connection_mode"
-# Live: Home Assistant seizes and holds the slot; 1 Hz live data in HA,
-# but the iO Sense charger display and the phone app cannot connect.
+# Home Assistant direct: seize and hold the brush slot for notification-rate
+# data; the iO Sense display and phone app cannot use the brush simultaneously.
 CONNECTION_MODE_LIVE = "live"
-# Charger priority: Home Assistant leaves the slot free during
-# sessions (charger lights/timer work as designed) and connects only
-# briefly afterwards to read the brush's own last-session record.
+# Charger/app compatible: leave the brush slot free and automatically use a
+# matched iO Sense as a live read bridge when one is present.
 CONNECTION_MODE_CHARGER = "charger_priority"
 DEFAULT_CONNECTION_MODE = CONNECTION_MODE_CHARGER
+
+DATA_SOURCE_ADVERTISEMENT = "advertisement"
+DATA_SOURCE_CHARGER = "charger_bridge"
+DATA_SOURCE_DIRECT = "direct_brush"
+DATA_SOURCE_SESSION = "retained_session"
 
 # --- GATT characteristics (Oral-B vendor service a0f0ff00-...) ---------------
 CHAR_DEVICE_ID = "a0f0ff01-5047-4d53-8208-4f72616c2d42"  # MAC, reversed
@@ -144,9 +148,11 @@ MODES: dict[int, str] = {
     4: "intense",
     5: "super_sensitive",
     6: "tongue_clean",
+    7: "off",
     8: "settings",
     9: "off",
     11: "smart_adapt",
+    12: "gentle_white",
 }
 
 SECTOR_NO_SECTOR = 0xF0
@@ -160,6 +166,10 @@ SMILEYS: dict[int, str] = {
     5: "special_5",
     6: "special_6",
     7: "special_7",
+    8: "special_8",
+    9: "special_9",
+    10: "special_10",
+    11: "special_11",
 }
 
 REFILL_STATES: dict[int, str] = {
@@ -227,6 +237,24 @@ PRESSURE_FROM_ADV: dict[int, str] = {
 }
 
 SIGNAL_UPDATE = f"{DOMAIN}_update"
+SIGNAL_CHARGER_DISCOVERED = f"{DOMAIN}_charger_discovered"
+SIGNAL_CHARGER_UPDATE = f"{DOMAIN}_charger_update"
+
+# --- iO Sense bridge --------------------------------------------------------
+# A 150-second real-session benchmark completed 444/444 passthrough reads.
+# Three sequential reads had a 1.141 s p95, while pressure+timer and
+# pressure+zone stayed below 0.81 s p95. The production scheduler therefore
+# reads pressure every second and alternates timer/zone as the second read.
+CHARGER_BRIDGE_INTERVAL_SECONDS = 1.0
+CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS = 1.5
+# Poll the charger's native session state alongside the two-read live schedule.
+# Native status replies are short and provide an authoritative stop signal.
+CHARGER_SESSION_STATUS_EVERY_TICKS = 5
+CHARGER_IDLE_DISCONNECT_SECONDS = 3.0
+CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS = 5.0
+CHARGER_IDLE_PROBE_INTERVAL_SECONDS = 5 * 60.0
+CHARGER_SNAPSHOT_INTERVAL_SECONDS = 5 * 60.0
+CHARGER_SESSION_SYNC_INTERVAL_SECONDS = 60.0
 
 # --- Connection management (live mode) ---------------------------------------
 CONNECT_RETRIES = 3

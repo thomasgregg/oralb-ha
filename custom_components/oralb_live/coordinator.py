@@ -1,26 +1,9 @@
-"""Coordinator for Oral-B Live with two connection modes.
+"""Hybrid coordinator for direct-brush and charger-compatible operation.
 
-The brush accepts exactly ONE BLE client at a time and stops
-advertising while that slot is taken. Whoever holds the slot gets the
-data; everyone else -- the iO Sense charger, the phone app, Home
-Assistant -- gets silence. That firmware property forces a choice,
-exposed as the `connection_mode` option:
-
-LIVE mode (the v0.4 behaviour): seize and hold the slot whenever it is
-free, subscribe to the live notification characteristics, and stream
-the 1 Hz brushing timer, pressure, quadrant and mode into the
-entities. The trade-off: while we hold the slot, the iO Sense charger
-display and the phone app do not work.
-
-CHARGER-PRIORITY mode (default): never compete for the slot. During a
-session the charger connects as designed and its lights/timer work.
-Passive running/quiet advertisements provide an immediate wall-clock
-session fallback without taking the slot. When the brush is idle or
-docked again, we also try briefly to read the brush's own last-session
-record (ff29), RTC, battery, display face and supported diagnostics, then
-disconnect. If the charger still owns the slot, the passive fallback remains
-the session record; if the GATT read succeeds, it refines that same record
-without counting it twice.
+The default mode leaves the brush's single BLE slot to its iO Sense charger or
+phone app. A locally matched iO Sense becomes a read-only live bridge; passive
+advertisements and retained-session reads remain automatic fallbacks. The
+direct mode instead owns the brush slot and receives notification-rate data.
 """
 
 from __future__ import annotations
@@ -37,7 +20,6 @@ from bleak_retry_connector import (
     BleakError,
     establish_connection,
 )
-
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import (
     BluetoothChange,
@@ -50,6 +32,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
+from .charger import IOSenseBridge
 from .const import (
     ADV_IDX_FIRMWARE,
     ADV_IDX_MODE,
@@ -77,7 +60,12 @@ from .const import (
     CHAR_STATE,
     CHAR_STATUS_BLOB,
     CONNECT_RETRIES,
+    CONNECTION_MODE_CHARGER,
     CONNECTION_MODE_LIVE,
+    DATA_SOURCE_ADVERTISEMENT,
+    DATA_SOURCE_CHARGER,
+    DATA_SOURCE_DIRECT,
+    DATA_SOURCE_SESSION,
     DOMAIN,
     MAX_SESSION_SECONDS,
     MIN_PASSIVE_SESSION_SECONDS,
@@ -91,10 +79,10 @@ from .const import (
     PRESSURE_FROM_ADV,
     PRESSURE_STATES,
     RECONNECT_INTERVAL_SECONDS,
+    REFILL_STATES,
     RELEASE_GRACE_SECONDS,
     RELEASE_STATES,
     RUNNING_STATE,
-    REFILL_STATES,
     SESSION_RECONCILE_WINDOW_SECONDS,
     SESSION_RECORD_SETTLE_SECONDS,
     SESSION_SEEN_STATES,
@@ -109,12 +97,14 @@ from .const import (
     SYNC_STATES,
 )
 from .protocol import (
+    decode_charger_sector,
     decode_sector,
     parse_available_modes,
     parse_battery_status,
     parse_device_info,
     parse_pacer,
     parse_refill_remainder,
+    parse_session_record,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -166,11 +156,24 @@ class OralBLiveCoordinator:
             "rssi": None,
             "live": False,
             "connection_mode": mode,
+            "data_source": DATA_SOURCE_ADVERTISEMENT,
+            "charger_address": None,
+            "charger_bridge_latency_ms": None,
+            "pressure_force": None,
             "last_session_start": None,
             "last_session_duration": None,
             "last_session_mode": None,
             "last_session_sectors": None,
             "last_session_high_pressure": None,
+            "last_session_low_pressure": None,
+            "last_session_high_pressure_time": None,
+            "last_session_low_pressure_time": None,
+            "last_session_average_pressure": None,
+            "last_session_maximum_pressure": None,
+            "last_session_battery_end": None,
+            "last_session_target_duration": None,
+            "last_session_id": None,
+            "last_session_source": None,
             "sessions_today": None,
         }
         self.available = False
@@ -200,6 +203,12 @@ class OralBLiveCoordinator:
         self._last_synced_session_ts: int | None = None
         self._session_generation = 0
         self._processed_session_generation = 0
+        self._charger_timer_anchor: tuple[int, float] | None = None
+        self._charger_session_record: bytes | None = None
+        self._charger_session_rtc: bytes | None = None
+        self.charger: IOSenseBridge | None = (
+            IOSenseBridge(self) if mode == CONNECTION_MODE_CHARGER else None
+        )
         slug = address.replace(":", "").replace("-", "_").lower()
         self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{slug}")
 
@@ -221,6 +230,8 @@ class OralBLiveCoordinator:
             self.hass, self.address, connectable=False
         ):
             self._parse_advertisement(service_info)
+        if self.charger:
+            self.charger.async_start()
         if self.mode == CONNECTION_MODE_LIVE:
             # The brush stops advertising while a client (for example an
             # iO Sense charger) holds its single slot, so advertisements
@@ -240,6 +251,8 @@ class OralBLiveCoordinator:
         if self._unsub_unavailable:
             self._unsub_unavailable()
             self._unsub_unavailable = None
+        if self.charger:
+            await self.charger.async_stop()
         await self._async_disconnect()
 
     # -------------------------------------------------------------- passive
@@ -264,6 +277,7 @@ class OralBLiveCoordinator:
         self._apply_state(state_raw)
         # While live notifications flow, they are fresher than adverts.
         if not self.data["live"]:
+            self.data["data_source"] = DATA_SOURCE_ADVERTISEMENT
             self.data["time"] = _decode_time(
                 payload[ADV_IDX_TIME_HI], payload[ADV_IDX_TIME_LO]
             )
@@ -299,7 +313,7 @@ class OralBLiveCoordinator:
 
     @callback
     def _async_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
-        self.available = False
+        self.available = bool(self.charger and self.charger.available)
         self._push()
 
     # --------------------------------------------------------------- active
@@ -346,6 +360,7 @@ class OralBLiveCoordinator:
                 await self._async_disconnect()
                 return
             self.data["live"] = True
+            self.data["data_source"] = DATA_SOURCE_DIRECT
             self._push()
             _LOGGER.debug("%s: live notifications active", self.name)
             self._watchdog()
@@ -413,9 +428,96 @@ class OralBLiveCoordinator:
             self._apply_smiley(payload)
         self._push()
 
+    # ------------------------------------------------------ iO Sense bridge
+    def _charger_discovered(self, charger: IOSenseBridge) -> None:
+        """Attach a locally verified iO Sense paired to this brush."""
+        self.data["charger_address"] = charger.address
+        self.available = True
+        self._push()
+
+    def _charger_session_started(self) -> None:
+        """Start session tracking from charger-native state."""
+        self.available = True
+        self.data["data_source"] = DATA_SOURCE_CHARGER
+        self.data["live"] = True
+        self._charger_timer_anchor = None
+        self._apply_state(RUNNING_STATE)
+        self._push()
+
+    def _charger_session_ended(self) -> None:
+        """Finish the locally reconstructed charger-bridge session."""
+        quiet_state = (
+            4 if self.charger and self.charger.data.get("brush_charging") else 2
+        )
+        self._advance_charger_timer()
+        self._apply_state(quiet_state)
+        self.data["live"] = False
+        self._push()
+
+    async def _async_apply_charger_passthrough(
+        self, short_uuid: str, payload: bytes | bytearray
+    ) -> None:
+        """Apply a read-only brush value forwarded by the iO Sense."""
+        raw = bytes(payload)
+        self.available = True
+        self.data["data_source"] = DATA_SOURCE_CHARGER
+        if short_uuid == "FF04" and raw:
+            self._apply_state(raw[0])
+        elif short_uuid == "FF05":
+            self._apply_battery_status(raw)
+        elif short_uuid == "FF07" and raw:
+            self._apply_mode(raw[0])
+        elif short_uuid == "FF08" and len(raw) >= 2:
+            seconds = _decode_time(raw[0], raw[1])
+            self.data["time"] = seconds
+            self._charger_timer_anchor = (seconds, time.monotonic())
+            self._track_session_time(seconds)
+        elif short_uuid == "FF09" and len(raw) >= 3:
+            self._apply_charger_sector(raw[0], raw[2])
+        elif short_uuid == "FF0A":
+            self._apply_smiley(raw)
+        elif short_uuid == "FF0B" and raw:
+            self.data["pressure"] = PRESSURE_STATES.get(raw[0], f"pressure_{raw[0]}")
+            if len(raw) >= 5:
+                self.data["pressure_force"] = int.from_bytes(raw[3:5], "little")
+            self._track_session_pressure(self.data["pressure"])
+        elif short_uuid == "FF22" and len(raw) >= 4:
+            self._charger_session_rtc = raw
+        elif short_uuid == "FF25":
+            self._apply_available_modes(raw)
+        elif short_uuid == "FF26":
+            self._apply_pacer(raw)
+        elif short_uuid == "FF29":
+            self._charger_session_record = raw
+        elif short_uuid == "FF2D":
+            self._apply_refill(raw)
+
+        if self._charger_session_record and self._charger_session_rtc:
+            record, rtc = self._charger_session_record, self._charger_session_rtc
+            self._charger_session_record = None
+            self._charger_session_rtc = None
+            if await self._async_apply_session_record(record, rtc) == "new":
+                self.data["last_session_source"] = DATA_SOURCE_SESSION
+                self._session_pending_sync = False
+                self._processed_session_generation = self._session_generation
+                self._last_sync_ok = time.monotonic()
+        self._push()
+
+    def _advance_charger_timer(self) -> None:
+        """Advance the displayed timer between two-second brush anchors."""
+        if not self._session_active or self._charger_timer_anchor is None:
+            return
+        anchor, observed = self._charger_timer_anchor
+        estimated = anchor + int(time.monotonic() - observed)
+        if estimated > (self.data.get("time") or 0):
+            self.data["time"] = estimated
+            self._track_session_time(estimated)
+
     # ------------------------------------------------- charger-priority sync
     def _maybe_schedule_sync(self) -> None:
         """Rate-limited trigger for a post-session / periodic sync."""
+        if self.charger and self.charger.address:
+            return
         if self._sync_task and not self._sync_task.done():
             return
         now = time.monotonic()
@@ -605,23 +707,14 @@ class OralBLiveCoordinator:
     ) -> str:
         """Parse the ff29 last-session record and log new sessions.
 
-        Layout (23 bytes, little-endian, protocol 8):
-          [0:4]   session start, seconds on the brush clock
-          [4:6]   session counter (tentative)
-          [6:8]   target duration, seconds
-          [8:10]  session duration, seconds
-          [10:12] pressure-related count (tentative)
-          [12:14] per-quadrant time, seconds
-          [19]    brushing mode
-          [20]    battery percent at session end
-
         The brush clock drifts (observed ~8 days off wall time), so the
         start time is derived RELATIVE to the RTC read in the same
         connection: wall_start = now - (rtc - record_ts). The raw
         record timestamp is used only for deduplication, persisted so
         restarts do not double-count.
         """
-        if len(record) < 20:
+        parsed = parse_session_record(record)
+        if not parsed:
             _LOGGER.debug(
                 "%s: unexpected ff29 length %s: %s",
                 self.name,
@@ -629,9 +722,9 @@ class OralBLiveCoordinator:
                 bytes(record).hex(" "),
             )
             return "invalid"
-        session_ts = int.from_bytes(record[0:4], "little")
-        duration = int.from_bytes(record[8:10], "little")
-        mode_raw = record[19]
+        session_ts = int(parsed["session_timestamp"])
+        duration = int(parsed["duration"])
+        mode_raw = int(parsed["mode_raw"])
         if session_ts == 0 or not 0 < duration <= MAX_SESSION_SECONDS:
             _LOGGER.debug(
                 "%s: invalid ff29 record (timestamp=%s, duration=%s): %s",
@@ -705,8 +798,18 @@ class OralBLiveCoordinator:
             self.data["last_session_start"] = start
             self.data["last_session_duration"] = duration
             self.data["last_session_mode"] = MODES.get(mode_raw, f"mode_{mode_raw}")
-            # Quadrant coverage / high-pressure events are not decoded from
-            # the record yet; passive advert tracking may have filled them.
+            self.data["last_session_id"] = parsed["session_id"]
+            self.data["last_session_target_duration"] = parsed["target_duration"]
+            if parsed["number_of_sectors"]:
+                self.data["last_session_sectors"] = parsed["number_of_sectors"]
+            self.data["last_session_high_pressure"] = parsed["high_pressure_events"]
+            self.data["last_session_low_pressure"] = parsed["low_pressure_events"]
+            self.data["last_session_high_pressure_time"] = parsed["high_pressure_time"]
+            self.data["last_session_low_pressure_time"] = parsed["low_pressure_time"]
+            self.data["last_session_average_pressure"] = parsed["average_pressure"]
+            self.data["last_session_maximum_pressure"] = parsed["maximum_pressure"]
+            self.data["last_session_battery_end"] = parsed.get("battery_end")
+            self.data["last_session_source"] = DATA_SOURCE_SESSION
         self._last_synced_session_ts = session_ts
         await self._store.async_save({"last_session_ts": session_ts})
         if reconciles_passive_session:
@@ -832,6 +935,15 @@ class OralBLiveCoordinator:
         self.data["last_session_mode"] = self.data.get("mode")
         self.data["last_session_sectors"] = len(self._session_sectors)
         self.data["last_session_high_pressure"] = self._session_high_pressure
+        self.data["last_session_low_pressure"] = None
+        self.data["last_session_high_pressure_time"] = None
+        self.data["last_session_low_pressure_time"] = None
+        self.data["last_session_average_pressure"] = None
+        self.data["last_session_maximum_pressure"] = None
+        self.data["last_session_battery_end"] = None
+        self.data["last_session_target_duration"] = self.data.get("target_duration")
+        self.data["last_session_id"] = None
+        self.data["last_session_source"] = self.data.get("data_source")
         self._pending_passive_sessions.append(self._session_start)
         self._pending_passive_sessions = self._pending_passive_sessions[-10:]
         _LOGGER.debug(
@@ -874,6 +986,20 @@ class OralBLiveCoordinator:
             self._session_sectors.add(quadrant)
         if decoded_total:
             self.data["number_of_sectors"] = decoded_total
+
+    def _apply_charger_sector(self, raw: int, total: int | None) -> None:
+        """Apply the zero-based quadrant value returned by charger reads."""
+        self.data["sector_raw"] = raw
+        sector, quadrant, decoded_total = decode_charger_sector(
+            raw,
+            total,
+            self.data.get("number_of_sectors"),
+        )
+        self.data["sector"] = sector
+        if decoded_total:
+            self.data["number_of_sectors"] = decoded_total
+        if self._session_active and quadrant is not None:
+            self._session_sectors.add(quadrant)
 
     def _apply_battery_status(self, payload: bytes | bytearray | None) -> None:
         if payload is not None:
@@ -1003,4 +1129,11 @@ class OralBLiveCoordinator:
 
     # --------------------------------------------------------------- update
     def _push(self) -> None:
+        if self.charger:
+            self.data["charger_address"] = self.charger.address
+            self.data["charger_bridge_latency_ms"] = self.charger.data.get(
+                "last_response_latency_ms"
+            )
+            if self.charger.available:
+                self.available = True
         async_dispatcher_send(self.hass, f"{SIGNAL_UPDATE}_{self.address}", self.data)

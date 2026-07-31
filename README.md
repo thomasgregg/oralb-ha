@@ -1,351 +1,197 @@
 # Oral-B Live
 
-[![hacs][hacs-badge]][hacs-url]
-[![release][release-badge]][release-url]
+[![HACS][hacs-badge]][hacs-url]
+[![Release][release-badge]][release-url]
 
-**Live brushing data for Oral-B iO toothbrushes in Home Assistant.**
+**Local live brushing data for Oral-B iO toothbrushes and iO Sense chargers in Home Assistant.**
 
-Recent iO firmware stopped broadcasting live session data over Bluetooth
-advertisements. This integration retrieves it over a GATT connection
-instead, restoring the real-time brushing timer, quadrant tracking,
-pressure, mode and display face that passive listening can no longer
-provide. It also adds a persistent brushing log and battery, pacer and
-brush-head diagnostics.
-
----
+Oral-B Live combines passive Bluetooth advertisements, direct toothbrush GATT
+notifications, iO Sense charger passthrough reads, and the brush's retained
+session summary. It provides live timer, pressure, zone and mode entities,
+keeps a persistent brushing log, and exposes supported battery, brush-head,
+display and charger diagnostics without using the Oral-B cloud.
 
 ## Contents
 
-- [The problem](#the-problem)
 - [How it works](#how-it-works)
-- [Connection modes](#connection-modes)
-- [How this differs from the official integration](#how-this-differs-from-the-official-integration)
+- [Connection options](#connection-options)
+- [Data sources and fallbacks](#data-sources-and-fallbacks)
 - [Entities](#entities)
-- [Tested with](#tested-with)
 - [Installation](#installation)
 - [Configuration](#configuration)
-- [Dashboard](#dashboard)
 - [Requirements](#requirements)
+- [Protocol findings](#protocol-findings)
+- [Full protocol reference](docs/protocol.md)
 - [Known limitations](#known-limitations)
-- [Protocol notes](#protocol-notes)
 - [Troubleshooting](#troubleshooting)
-- [Credits](#credits)
-
----
-
-## The problem
-
-Oral-B toothbrushes traditionally broadcast their state in BLE
-advertisements once per second while brushing. Home Assistant's official
-`oralb` integration listens for these passively, which works well and
-costs nothing in battery or connection slots.
-
-On recent iO firmware this changed. During a brushing session the brush
-is effectively silent on the air: no advertisements while the motor
-runs, followed by a single post-session summary carrying only the final
-duration. A passive listener therefore sees a brushing session as a
-sudden jump from idle to "you brushed for 96 seconds", with no live
-timer, no quadrant progress and no mid-session updates.
-
-The underlying data still exists. It simply moved from broadcasts to
-**GATT notifications**, which require an active connection.
 
 ## How it works
 
-Oral-B Live runs a hybrid coordinator:
+An Oral-B iO toothbrush accepts one BLE client at a time and stops advertising
+while that connection is occupied. Oral-B Live therefore offers two clear
+behaviours rather than exposing its internal transports as separate modes.
 
-**Passive layer.** Listens to advertisements (manufacturer ID `0x00DC`)
-exactly like the official integration. Zero cost while the brush sleeps
-on its charger, and it keeps state, battery and pressure up to date
-between sessions.
+```text
+Charger/app compatible
 
-**Active layer.** Opens a GATT connection — through any connectable
-Bluetooth path, including ESPHome Bluetooth proxies with active
-connections enabled — either held continuously for live 1 Hz data or
-opened briefly after each session, depending on the configured
-[connection mode](#connection-modes).
+Toothbrush <--private BLE--> iO Sense <--local BLE--> Home Assistant
+      |                                             |
+      +-- retained FF29 session --------------------+
 
-**One connection slot.** The brush accepts exactly one BLE client at a
-time — and it stops advertising entirely while that slot is taken.
-Whoever holds the slot gets everything (live notifications, the session
-record); everyone else gets silence. This was established empirically
-in July 2026 on an iO Series 10 with an iO Sense charger: with Home
-Assistant holding the connection, live data streamed into Home
-Assistant perfectly — and the iO Sense display stayed dark. With the
-charger holding it, the display worked — and the brush was
-radio-silent to everyone else until the session was over. This is a
-firmware property of the brush, not something any integration can work
-around, and it forces the trade-off described in the next section.
+Home Assistant direct
 
-## Connection modes
+Toothbrush <--direct BLE notifications--> Home Assistant
+```
 
-Three parties want the brush's single connection slot: the iO Sense
-charger (for its lights and countdown display), the Oral-B phone app,
-and Home Assistant. Only one of them can have it during a brushing
-session. Because no software can remove that constraint, who wins is a
-configuration option: *Settings → Devices & Services → Oral-B Live →
-Configure*. Switching takes effect immediately.
+In charger/app-compatible mode, the integration discovers an iO Sense through
+its `A0F03E00` service, reads the charger's cached paired-brush identity, and
+matches the brush MAC to the existing config entry. No charger selection or
+third mode is required. Unrelated iO Sense chargers are ignored.
 
-### Charger priority (default)
+While the charger owns the brush connection, Home Assistant connects to the
+charger and uses its read-only `0x37` passthrough command. The charger remains
+the brush's BLE owner and its display continues to handle the session.
 
-Home Assistant never competes for the slot during brushing. The charger
-(or the app) connects as designed, so the iO Sense lights and timer
-behave exactly as they do out of the box. If the brush broadcasts
-running and quiet states, Home Assistant records the session
-immediately from those passive advertisements. Duration falls back to
-elapsed wall time when the advertised timer remains at zero. A guarded
-fallback also handles firmware that remains in `selection_menu` during
-a short motor session without ever advertising `running`.
+## Connection options
 
-After the session, Home Assistant also makes short attempts to read the
-brush's own **last-session record** (see
-[Protocol notes](#last-session-record-ff29)), battery level and state.
-When that succeeds, its authoritative timestamp, duration and mode
-refine the passively recorded session without counting it twice. When
-the charger continues to own the brush's only connection, the passive
-record remains available instead of losing the session.
+Choose the behaviour under *Settings → Devices & services → Oral-B Live →
+Configure*.
 
-The same brief sync reads the smiley/display face and any supported
-battery, pacer and brush-head diagnostics **only if Home Assistant wins
-the brush's connection slot**. This is opportunistic, not guaranteed.
-On an iO Sense setup where the charger continues holding the slot,
-Smiley, battery, target duration, available modes and brush-head
-diagnostics can remain `unknown` indefinitely. The passive session log
-still works.
+### Charger/app compatible (recommended)
 
-Back-to-back sessions are tracked independently. If another session
-starts while the previous brush-history read is settling or retrying,
-the newer session remains queued for its own read instead of being
-cleared with the older one.
+Home Assistant leaves the toothbrush connection available to the iO Sense and
+phone app. When a paired iO Sense is present, it is used automatically as a
+local live-data bridge.
 
-What you give up: live timer, pressure and quadrant updates depend on
-what the brush firmware exposes in advertisements. They are not
-guaranteed in charger-priority mode because Home Assistant deliberately
-does not take the connection slot. GATT-only entities such as Smiley and
-the extended diagnostics are also not guaranteed.
+During a session the bridge uses the measured production scheduler:
 
-What you keep: a complete brushing log (start time, duration, mode),
-passive state/mode data, and a fully functional charger and phone app.
-Battery and other GATT-only values are available only when a brief sync
-succeeds.
+- pressure (`FF0B`) is read every one-second tick;
+- timer (`FF08`) and zone (`FF09`) alternate as the second read;
+- the displayed timer advances locally between authoritative brush readings;
+- mode and state are read at session start, with charger session state checked
+  periodically for an authoritative stop signal;
+- supported session, battery and display diagnostics are collected on
+  charger-managed idle connections, outside the live pressure path.
 
-If several sessions happen while Home Assistant is down or out of
-range, only the most recent one is recovered — the record on the brush
-holds a single session.
+This keeps pressure fresh every second and timer/zone within two seconds. A
+150-second real-session benchmark completed all 444 requests without a single
+failure. The measured p95 was 779 ms for pressure+timer and 808 ms for
+pressure+zone.
 
-### Live
+If no matching charger is available, the same option falls back automatically
+to passive brush advertisements and guarded post-session reads. There is no
+additional user setting to manage.
 
-The original behaviour (v0.4 and earlier). Home Assistant seizes the
-slot whenever it is free — most reliably while the brush is docked —
-and holds it. All entities update live at 1 Hz during brushing: timer,
-pressure, quadrant, mode. Sessions are recorded from the live stream.
-Use this mode when Smiley, battery diagnostics, pacer configuration or
-other GATT-only values must update reliably.
+### Home Assistant direct
 
-What you give up: while Home Assistant holds the slot, the iO Sense
-display does not work and the phone app cannot sync. The brush also
-drops idle clients after about 30 seconds of its own accord, so the
-integration reconnects continuously in the background — this is
-normal and visible as brief `live_connection` flaps while docked.
+Home Assistant connects directly to the brush and subscribes to the vendor
+GATT characteristics. Timer, pressure, zone, mode and state arrive at the
+brush's notification rate.
 
-## How this differs from the official integration
+This is the highest-rate source, but Home Assistant owns the brush's single
+connection slot. The iO Sense display and phone app cannot use the brush at the
+same time.
 
-Home Assistant ships an `oralb` integration. On most brushes it is the
-better choice: fully passive, no Bluetooth connection slots, no custom
-component. If your brush still broadcasts while you brush, stop here and
-use it.
+## Data sources and fallbacks
 
-On an iO Series 10 with mid-2026 firmware, it no longer does. Here is
-what the official integration actually reports during a session on this
-brush:
+The state entity exposes the active `data_source` so the path is always visible:
 
-- **The timer stays at 0.** It does not count while you brush. A second
-  or two after you switch off, it jumps straight to the final duration
-  — "you brushed for 96 seconds" — with nothing in between.
-- **Pressure is frozen.** It keeps whatever value it read before the
-  session started, however hard you press. The brush's own red ring
-  lights up; Home Assistant never hears about it.
-- **The quadrant never advances.** It holds its previous value for the
-  whole session, so no quadrant progress is visible.
-- **Whole sessions can vanish.** The end-of-session summary is a single
-  advertisement. Miss it — weak signal, a scanner that only listens 10%
-  of the time, the phone app taking the connection — and the session is
-  gone entirely, with no record that you brushed at all.
-- **Updates can stop until you reload.** The battery sensor polls over a
-  GATT connection. When those attempts fail against this firmware,
-  passive updates stall and the entities freeze at their last value
-  until the config entry is reloaded
-  ([home-assistant/core#177039](https://github.com/home-assistant/core/issues/177039)).
+| Data source | Meaning |
+| --- | --- |
+| `charger_bridge` | Live reads forwarded locally through a matched iO Sense |
+| `direct_brush` | Direct GATT notifications from the toothbrush |
+| `advertisement` | Passive manufacturer data from the toothbrush |
+| `retained_session` | Authoritative `FF29` session summary reconciled later |
 
-None of that is a bug in the official integration. The brush changed:
-recent iO firmware stops broadcasting during a session and emits only a
-post-session summary. A passive listener has nothing to listen to. The
-data still exists — it moved to GATT notifications, which require a
-connection.
+Sources are selected automatically inside the chosen connection option.
+Entity IDs stay the same when the source changes.
 
-This integration keeps the passive listening and adds that connection.
-
-The "Oral-B Live" column below describes **live** mode; in
-charger-priority mode the in-session rows are traded for a
-post-session sync — see [Connection modes](#connection-modes).
-
-| | Official `oralb` | Oral-B Live |
-| --- | --- | --- |
-| Data source | Advertisements only | Advertisements plus GATT (notifications or post-session reads) |
-| Connection | Never connects (battery uses a poll) | Configurable: held live connection, or a few seconds after each session |
-| Live timer on recent iO firmware | Stays at 0, jumps at the end | Counts up at 1 Hz while brushing (live mode) |
-| Live pressure during a session | Frozen at its pre-session value | `low` / `normal` / `high`, live from `ff0b` (live mode) |
-| Live quadrant during a session | Frozen | Advances as the brush paces them (live mode) |
-| Smiley / display face | Not exposed | Read from `ff0a`; reliable in live mode, opportunistic in charger priority |
-| A missed summary advertisement | Session lost entirely | Session recorded from observed start/end states, live stream, or the brush's own `ff29` record |
-| Brushing log | None | Last session, duration, sessions today, kept across restarts |
-| Number of sectors | From advertisement | Read from the brush's quadrant configuration |
-| Battery | Active poll (can stall updates on this firmware) | Percentage and diagnostics when a GATT connection succeeds |
-| Brush-head life | Not exposed | Remaining days/time read when `ff2d` is supported |
-| Cost | None | One Bluetooth connection slot (held, or briefly per sync) |
-| iO Sense charger display | Works | Works in charger-priority mode; disabled in live mode |
-| Competes with the phone app | No | Live mode: yes. Charger priority: no |
-
-Practical trade-offs worth knowing before switching:
-
-- The brush accepts one client at a time. In live mode, while this
-  integration is connected, the Oral-B app and the iO Sense charger
-  cannot connect at all — this is why charger-priority mode exists and
-  is the default.
-- Holding a connection (live mode) uses more brush battery than
-  passive listening or brief per-session syncs.
-- Entity IDs differ from the official integration, so dashboard cards
-  need repointing after switching.
-- Everything here was worked out on one brush. On other models the
-  official integration may already be enough.
+Completed sessions are saved immediately from the live or passive stream. The
+brush retains one authoritative `FF29` summary containing exact duration,
+mode, pressure totals, event counts and ending battery. Through the charger it
+becomes readable on the next charger-managed brush connection and refines the
+already-recorded session without counting it twice.
 
 ## Entities
 
-Entity structure mirrors the official `oralb` integration, so existing
-dashboards and toothbrush cards keep working.
+### Toothbrush device
 
 | Entity | Description |
 | --- | --- |
-| Toothbrush state | `idle`, `running`, `charging`, `selection_menu`, `session_summary`, `post_brushing_summary`, ... |
-| Time | Session duration in seconds. Updates at 1 Hz while connected (live mode). |
-| Sector | Current quadrant (`sector_1` ... `sector_6`, or `no_sector`) |
-| Sector timer | Current advertised sector timer |
-| Number of sectors | Read from the brush's quadrant time configuration |
-| Target duration | Sum of the configured per-sector target times |
-| Mode | Includes `daily_clean`, `super_sensitive`, `tongue_clean`, `smart_adapt`, ... |
-| Pressure | `low` / `normal` / `high`, live while connected |
-| Smiley | Brush display face from `ff0a`: reliable in live mode; charger priority requires a successful brief sync |
-| Battery | Percentage: reliable in live mode; charger priority requires a successful brief sync |
-| Battery time remaining | Estimated remaining brushing time from `ff05` |
-| Battery voltage/current/temperature | Protocol 8 diagnostics; voltage, current and temperature are disabled by default |
-| Brush head remaining | Remaining days and brushing seconds from `ff2d`; disabled by default |
-| Last session | Timestamp of the last completed session |
-| Last session duration | Length of that session, in seconds |
-| Sessions today | Number of sessions today, resets at midnight |
+| Toothbrush state | `idle`, `running`, `charging`, `selection_menu`, summaries and diagnostic states |
+| Time | Current brushing duration; locally advanced between charger timer anchors |
+| Pressure | `low`, `normal` or `high`; charger reads also expose raw force as an attribute |
+| Mode | Daily clean, sensitive, gum care, whiten, intense, super sensitive, tongue clean, Smart Adapt, gentle white and supported unknown values |
+| Sector | Current pacer sector (`sector_1` … `sector_8`) |
+| Sector timer | Advertised sector time where available |
+| Number of sectors | Configured pacer sector count |
+| Target duration | Sum of configured per-sector times |
+| Smiley | Brush display face from `FF0A` |
+| Battery | Brush battery percentage |
+| Battery diagnostics | Remaining brushing time, voltage, current and temperature where supported |
+| Brush-head diagnostics | Remaining days and brushing seconds from `FF2D` |
+| Last session | Timestamp plus complete session attributes |
+| Last session duration | Duration of the latest session |
+| Sessions today | Daily session counter, retained across restarts |
 
-In charger-priority mode the in-session entities (time, pressure,
-sector) update only when advertisements expose them; in live mode they
-stream at 1 Hz. See
-[Connection modes](#connection-modes).
+The **Last session** attributes can include:
 
-Smiley, battery details, target duration, available modes and
-brush-head lifetime require a direct GATT connection. **Live mode is
-required for reliable updates.** In charger-priority mode they update
-only when Home Assistant briefly wins the single connection slot after
-a session; they can remain `unknown` when the charger or phone retains
-that slot.
+- duration and brushing mode;
+- source and session identifier;
+- configured target and sectors covered;
+- high/low-pressure event counts and durations;
+- average and maximum pressure in millinewtons;
+- battery percentage at the end of the session.
 
-The state entity also exposes `live_connection`, `connection_mode`,
-`rssi`, raw values, protocol version, reported model and firmware
-revision as attributes. The mode entity lists the brushing modes
-reported by `ff25`; the target-duration entity includes the individual
-sector times.
+### iO Sense Charger device
 
-`ff0a` is documented by the protocol as the brush's display face. It is
-not yet proven to be a brushing-quality score, so this integration
-deliberately calls the entity **Smiley** rather than rating or result.
-Optional diagnostics remain `unknown` on brushes that do not implement
-their characteristic.
+A successfully matched charger appears as a separate device connected through
+the toothbrush device. Its read-only entities include:
 
-### Brushing log
+- charger/session and paired-brush status;
+- Wi-Fi state, RSSI and cloud connection status;
+- displayed clock text, timezone, 12/24-hour format and date-display format;
+- clock brightness, night-light mode and ring colour;
+- firmware/hardware identity and uptime;
+- internet type, automatic-update state, touchpad status and brush connection
+  policy.
 
-When a session ends, **Last session** records the start time with
-`duration_seconds`, `mode`, `quadrants_covered` and
-`high_pressure_events` as attributes. In live mode these come from the
-live stream. In charger-priority mode passive advertisements provide an
-immediate fallback; a later brush history read refines its start time,
-duration and mode when the connection is available. Because it is a
-proper timestamp sensor, Home Assistant's recorder keeps the history
-automatically: a history graph on **Last session duration** is a
-complete brushing log that accumulates from installation onwards.
-
-Session values are restored across restarts and stay readable while the
-brush is out of range. Sessions with no recorded duration (the motor
-switched straight back off) are ignored.
-
-## Tested with
-
-Developed and tested against a single device. Reports from other models
-are welcome, particularly the raw values behind any `unknown_state_<n>`
-or `mode_<n>`.
-
-| | |
-| --- | --- |
-| Brush | **Oral-B iO Series 10** |
-| Advertised identity | Protocol version `0x08`, model ID `0x36` (54), variant `0x52` |
-| Firmware | Mid-2026; broadcasts no live data during a session |
-| Accessory | iO Sense charger present (not required) |
-| Home Assistant | 2026.7 on Home Assistant OS, Raspberry Pi |
-| Bluetooth | ESPHome proxy (M5Stack Atom) with active connections, plus the Pi's built-in adapter and a Shelly BLE scanner |
-| Protocol version | 8 (advertisement byte 0) |
-
-The advertisement does not carry the marketing model number. Model ID
-`0x36` maps to the generic "IO Series" entry shared by most of the line
-(only iO 4 and iO 5 have distinct IDs, `0x34` and `0x35`), which is why
-Home Assistant names these brushes "IO Series" plus a MAC suffix. The
-iO Series 10 above was identified from the physical device, not the
-protocol.
-
-Older iO models and pre-2026 firmware are expected to work, but on those
-the official integration may already be sufficient — see
-[How this differs](#how-this-differs-from-the-official-integration).
+Some low-value diagnostics are disabled by default. The integration does not
+write display, light, network or update settings.
 
 ## Installation
 
-### HACS (recommended)
+### HACS
 
-1. In HACS, open the three-dot menu and choose **Custom repositories**.
-2. Add `https://github.com/thomasgregg/oralb-ha` with category
-   **Integration**.
-3. Install **Oral-B Live** and restart Home Assistant.
+1. In HACS, open **Custom repositories**.
+2. Add `https://github.com/thomasgregg/oralb-ha` as an **Integration**.
+3. Install **Oral-B Live**.
+4. Restart Home Assistant.
+
+HACS tracks GitHub releases. After a new release is published, open HACS and
+select **Redownload** or install the offered update, then restart Home Assistant.
 
 ### Manual
 
-Copy `custom_components/oralb_live` into your Home Assistant
-`config/custom_components/` directory and restart.
+Copy `custom_components/oralb_live` into
+`config/custom_components/oralb_live` and restart Home Assistant.
 
 ## Configuration
 
-1. **Disable the official Oral-B entry** for the same brush under
-   *Settings, Devices & Services*. Both integrations competing for one
-   device causes duplicate entities and failed connections. Remember to
-   repoint any dashboard cards at the new entity IDs afterwards.
-2. Wake the brush by pressing its button. Oral-B Live discovers it
-   automatically; confirm the discovered device.
-3. Alternatively add it manually via *Settings, Devices & Services, Add
-   integration, Oral-B Live*.
-4. Pick a **connection mode** via *Configure* on the integration entry
-   — see [Connection modes](#connection-modes). The default, charger
-   priority, keeps the iO Sense charger display and the phone app
-   working; switch to live mode if you want in-session 1 Hz data in
-   Home Assistant instead.
+1. Disable the official Oral-B config entry for the same brush to avoid
+   duplicate entities and competing Bluetooth activity.
+2. Wake the toothbrush by pressing its button.
+3. Add or confirm **Oral-B Live** under *Settings → Devices & services*.
+4. Open **Configure** and choose one of the two connection options.
+
+The default charger/app-compatible option discovers and matches an iO Sense
+automatically. The charger must be within range of a connectable Home Assistant
+Bluetooth adapter or proxy.
 
 ## Dashboard
 
-The entities are named to match the official integration, so
-[toothbrush-card](https://github.com/Anrolosia/toothbrush-card) works
-without changes. Point it at the Oral-B Live device and it renders the
-live timer, quadrant ring, pressure, mode and battery:
+The main entities follow the structure expected by
+[toothbrush-card](https://github.com/Anrolosia/toothbrush-card):
 
 ```yaml
 type: custom:toothbrush-card
@@ -354,50 +200,35 @@ show_subtitle: true
 show_header: false
 ```
 
-A brushing log underneath, using the session entities:
+A simple session log:
 
 ```yaml
 type: grid
 cards:
-  - type: heading
-    heading: Brushing log
-    heading_style: subtitle
-    icon: mdi:calendar-check
   - type: tile
     entity: sensor.<your_brush>_last_session
     name: Last session
-    icon: mdi:calendar-clock
-    grid_options:
-      columns: 6
   - type: tile
     entity: sensor.<your_brush>_last_session_duration
     name: Duration
-    icon: mdi:timer-outline
-    grid_options:
-      columns: 6
   - type: tile
     entity: sensor.<your_brush>_sessions_today
     name: Sessions today
-    icon: mdi:counter
   - type: history-graph
     title: Brushing history
     hours_to_show: 336
     entities:
-      - entity: sensor.<your_brush>_last_session_duration
-        name: Session duration
+      - sensor.<your_brush>_last_session_duration
 ```
-
-Replace `<your_brush>` with your brush's entity prefix, which is its MAC
-address with underscores (for example `58_26_3a_f6_64_d3`).
 
 ## Requirements
 
-- Home Assistant 2024.1 or newer
-- A **connectable** Bluetooth path within range of the brush. A built-in
-  adapter works; an ESPHome Bluetooth proxy in the bathroom works
-  better.
+- Home Assistant 2024.1 or newer.
+- A connectable Bluetooth adapter or ESPHome Bluetooth proxy near the brush.
+- An iO Sense charger for charger-bridge data; the integration still operates
+  without one through its other local sources.
 
-For an ESPHome proxy, enable active connections and continuous scanning:
+Recommended ESPHome proxy configuration:
 
 ```yaml
 esp32_ble_tracker:
@@ -410,219 +241,165 @@ bluetooth_proxy:
   active: true
 ```
 
-Without `continuous: true`, the proxy listens roughly 10% of the time
-and will miss advertisements from a brush that only speaks occasionally.
+## Protocol findings
 
-## Known limitations
+All runtime communication is local. The protocol was reconstructed from local
+BLE captures and vendor application behaviour and verified on an iO Series 10
+with iO Sense firmware `0.3.4`.
 
-**One client at a time.** The brush's single BLE connection slot is the
-defining constraint of this integration; see
-[Connection modes](#connection-modes) for why the trade-off cannot be
-engineered away. In live mode the charger display and phone app lose;
-in charger-priority mode Home Assistant deliberately loses during the
-session and catches up from the brush's own record afterwards. There
-is no configuration in which both stream live simultaneously.
+See [the full protocol reference](docs/protocol.md) for packet layouts, the
+charger command map, live-read captures, benchmark data, queue experiments and
+the boundary between verified behaviour and inference.
 
-**Charger-priority mode recovers one session at a time.** The brush's
-last-session record holds exactly one session. If Home Assistant is
-down or out of range across several sessions, only the most recent is
-recovered on the next sync.
+### Toothbrush service
 
-**Quadrant changes are paced by the brush.** The brush emits a quadrant
-notification only when the sector actually changes, typically every 30
-seconds depending on its configuration. The quadrant is the brush's own
-pacer telling you where to brush next, not a detection of where the
-brush actually is. Short sessions may show only one quadrant.
+The brush uses vendor service `A0F0FF00-5047-4D53-8208-4F72616C2D42`.
 
-**Full stored history is not available.** The brush exposes its most
-recent session in `ff29` (used by charger-priority mode), but the
-deeper multi-session history the phone app shows requires control-
-channel commands and is deliberately not attempted; see
-[Protocol notes](#protocol-notes).
+| Characteristic | Content |
+| --- | --- |
+| `FF02` | Model, protocol and firmware identifiers |
+| `FF04` | Brush state |
+| `FF05` | Battery and supported electrical diagnostics |
+| `FF07` | Brushing mode |
+| `FF08` | Brushing timer (`[minutes, seconds]`) |
+| `FF09` | Zero-based pacer zone plus configured zone count |
+| `FF0A` | Display face / smiley |
+| `FF0B` | Pressure state, force and motor data |
+| `FF0D` | Motion and gyroscope snapshots |
+| `FF22` | Brush real-time clock |
+| `FF25` | Available modes |
+| `FF26` | Per-zone pacer times |
+| `FF29` | Retained last-session summary |
+| `FF2D` | Brush-head/refill remainder |
 
-## Protocol notes
+### iO Sense service and passthrough
 
-Findings from GATT reconnaissance of an Oral-B iO Series 10 (model ID
-`0x36`, protocol version 8), July 2026, cross-checked against
-MatrixEditor/oralb-io. Documented here so others do not have to repeat
-the work.
+The charger advertises service `A0F03E00-5047-4D53-8208-4F72616C2D42` with
+four characteristics:
 
-### One connection slot, and what it does to advertising
+| Characteristic | Purpose |
+| --- | --- |
+| `A0F03C00` | Command headers and protocol delimiter |
+| `A0F03C01` | Charger data and passthrough responses |
+| `A0F03C02` | Command payloads |
+| `A0F03C03` | Command status acknowledgements |
 
-The brush accepts a single BLE client. While that slot is held — by
-the iO Sense charger, the phone app, or Home Assistant — the brush
-**stops advertising entirely**, so other clients cannot even discover
-it, let alone connect (connection attempts fail with device-not-found
-or time out). When the slot is free the brush advertises continuously
-in idle/charging states with `kCBAdvDataIsConnectable` set, and a
-pending connection completes in well under a second.
+Read-only passthrough uses charger command `0x37`. A brush read request is:
 
-Two behaviours follow that are worth knowing:
+```text
+command: C1 37
+payload: UUID_LSB UUID_MSB 01 00
+end:     E0
+```
 
-- **The brush sheds idle clients after ~30 seconds.** A client that is
-  connected but receiving no notifications (brush idle on the charger)
-  is disconnected by the brush almost exactly 30 s after activity
-  stops. Reconnection is immediate. A held "permanent" connection is
-  therefore really a connect/drop/reconnect cycle while docked.
-- **A connection made while docked survives a session.** If a client
-  wins the slot while the brush is charging, picking the brush up and
-  brushing does not evict it: the client receives the full state
-  transitions, the 1 Hz timer, ~30 Hz pressure and quadrant
-  notifications for the whole session. This is what live mode does.
+The response contains the requested short UUID, read operation, success byte,
+payload length and raw brush data. Requests must be sent sequentially; combined
+multi-record requests are rejected by the tested firmware.
 
-### Vendor service `a0f0ff00-5047-4d53-8208-4f72616c2d42`
+### Retained session (`FF29`)
 
-| Characteristic | Access | Content |
-| --- | --- | --- |
-| `ff01` | read | Device MAC, byte-reversed |
-| `ff02` | read | Model identifier, protocol version and firmware revision |
-| `ff04` | notify, read | Toothbrush state, `[state, 0]` |
-| `ff05` | notify, read | Battery percentage; protocol 6+ adds remaining seconds and protocol 8 adds voltage, current and temperature |
-| `ff06` | notify, read | Button state (0 none, 1 power, 2 mode) |
-| `ff07` | notify, read | Brushing mode |
-| `ff08` | notify, read | Brushing time as `[minutes, seconds]`, 1 Hz while running |
-| `ff09` | notify, read | Current quadrant |
-| `ff0a` | notify, read | Smiley/display face (0 off, 1 standard, 2–7 special faces) |
-| `ff0b` | notify, read | **Pressure** (0 low, 1 normal, 2 high) |
-| `ff0c` | read, write, notify | Cache — requires authentication |
-| `ff0d` | notify, read | Motion sensor data, roughly 30 Hz |
-| `ff29` | read | **Last completed session record** (see below) |
-
-Configuration service `a0f0ff20-...`:
-
-| Characteristic | Access | Content |
-| --- | --- | --- |
-| `ff21` | read, write, notify | Control channel (commands) |
-| `ff22` | read, write | Real-time clock, seconds on the brush's own epoch |
-| `ff25` | read, write | Available brushing modes |
-| `ff26` | read, write | Quadrant times, seconds per sector |
-| `ff2d` | read, write | Brush-head refill state, remaining days and brushing seconds |
-
-Service `a0f0ff80-...` is the over-the-air firmware update channel
-(`ff81` OTA command, `ff82` OTA payload) and is not used by this
-integration.
-
-No pairing or bonding is required for these. Anonymous connections are
-accepted.
-
-### Pressure
-
-Pressure is delivered on `ff0b` as a single state byte: `0` low, `1`
-normal, `2` high. It notifies continuously during a session.
-
-Note for anyone repeating this work: `ff06` is the button state, not
-pressure, despite sitting where a pressure characteristic would
-plausibly go. Reading it during hard brushing returns a constant
-`00 00 00 00`, which is easy to misinterpret as a broken pressure
-sensor.
-
-### Last-session record (`ff29`)
-
-An earlier revision of these notes claimed `ff29` never changed and
-needed control-channel commands to fill. That was wrong: on this
-firmware it updates within seconds of every completed session, and
-anonymous clients can read it freely. Observed layout, 23 bytes,
-little-endian:
-
-| Offset | Example | Content |
-| --- | --- | --- |
-| 0–3 | `c2 1e f5 31` | Session start, seconds on the brush clock |
-| 4–5 | `49 01` | Session counter (tentative; 329, appears to increment per session) |
-| 6–7 | `78 00` | Target duration, seconds (120) |
-| 8–9 | `3c 00` | **Session duration, seconds** |
-| 10–11 | `14 00` | Pressure-related count (tentative) |
-| 12–13 | `1e 00` | Per-quadrant time, seconds (matches `ff26`) |
-| 14–18 | `12 1f 0a 01 01` | Unknown |
-| 19 | `04` | Brushing mode |
-| 20 | `5f` | Battery percent at session end |
-| 21–22 | `00 00` | Unknown |
-
-The example is a real 60-second session in `intense` mode at 95%
-battery. Verification of the timestamp field: `ff22` (the RTC, same
-epoch) read 63 seconds after the session started returned exactly the
-record's timestamp plus 63.
-
-**The brush clock drifts.** On the tested unit it ran about eight days
-ahead of wall time — it is presumably only disciplined when the phone
-app syncs it. Do not convert the record timestamp to absolute time
-directly. Instead read `ff22` in the same connection and compute
-`wall_start = now − (rtc − record_timestamp)`, which cancels the drift
-entirely. This is what charger-priority mode does; the raw timestamp
-is used only to deduplicate records across syncs and restarts.
-
-Bytes 4–5, 10–11 and 14–18 are provisional readings from a small
-number of sessions on one device; corrections welcome.
-
-The deeper multi-session history shown in the phone app is a different
-mechanism: it needs writes to the `ff21` control channel, whose command
-set also contains a factory reset, so it is deliberately not attempted
-here. `ff0c` remains authentication-gated.
-
-### Advertisement payload
-
-Manufacturer data `0x00DC`, 11 bytes:
+The verified protocol 7/8 summary uses 21 bytes, little-endian:
 
 | Offset | Content |
 | --- | --- |
-| 0 | Protocol version |
-| 1 | Model identifier |
-| 2 | Firmware revision |
-| 3 | State |
-| 4 | Pressure flags |
-| 5-6 | Brushing time, `[minutes, seconds]` |
-| 7 | Mode |
-| 8 | Sector; the low three bits contain the quadrant |
-| 9 | Sector timer |
-| 10 | Number of sectors |
+| `0..3` | Session start on the brush clock |
+| `4..5` | Packed 13-bit session ID and 3-bit user ID |
+| `6..7` | Packed 13-bit target duration and 3-bit sector count |
+| `8..9` | Session duration in seconds |
+| `10..11` | High-pressure time in 100 ms units |
+| `12..13` | Low-pressure time in 100 ms units |
+| `14` | Average pressure in 100 mN units |
+| `15` | Maximum pressure in 100 mN units |
+| `16` | High-pressure event count |
+| `17` | Low-pressure event count |
+| `18` | Power-on event count |
+| `19` | Brushing mode |
+| `20` | Battery percentage at session end |
+
+The brush clock can drift. Absolute time is calculated relative to `FF22` read
+in the same connection: `wall_start = now - (rtc - session_timestamp)`.
+
+### Charger-native information
+
+The charger exposes local GET commands for Wi-Fi/internet/cloud status, RSSI,
+clock text and format, timezone, brightness, date-display mode, night-light
+mode, ring colour, firmware/hardware identity, uptime, touchpad state, brush
+policy and session state. `BRUSH_DATA` is paired-brush identity and firmware
+metadata—not brushing history.
+
+The iO Sense Wi-Fi connection is used for an outbound TLS/MQTT path. No local
+LAN API or locally enumerable durable session queue has been identified. Oral-B
+Live does not use cloud credentials, cloud session retrieval, MQTT redirection
+or certificate replacement.
+
+## Known limitations
+
+- The toothbrush still has one BLE client slot. Home Assistant direct mode
+  intentionally occupies it.
+- Charger passthrough is request/response, not a notification stream. Three
+  raw timer+zone+pressure reads had a 1.141-second p95, so the integration uses
+  the verified two-read scheduler instead of claiming three raw 1 Hz reads.
+- The charger accepts passthrough only while it is connected to the brush.
+  Static diagnostics and `FF29` are collected opportunistically during those
+  managed connections.
+- The current session's exact `FF29` summary becomes available through the
+  charger on its next brush connection. The immediate session record is built
+  locally from the live stream and reconciled later.
+- The brush retains only its latest summary. The charger's richer durable
+  upload queue is not exposed by any discovered local command.
+- Connecting to the charger uses its BLE peripheral connection. If the phone
+  app is changing charger settings at the same moment, one client may need to
+  retry; the integration disconnects from an idle charger to minimise this.
+- Protocol support is verified on one iO Series 10/iO Sense pair. Unsupported
+  characteristics remain unknown rather than being guessed.
 
 ## Troubleshooting
 
-**No live updates during brushing.** In charger-priority mode (the
-default) this is by design — the brush is silent while the charger
-holds the connection, and the session syncs about a minute after you
-finish. If you want in-session data in Home Assistant, switch the
-entry to live mode via *Configure*, accepting that the iO Sense
-display will stop working. In live mode, check the `live_connection`
-attribute on the state entity: if it is `false`, the connection was
-not won — disable Bluetooth on the phone or unpair the Oral-B app and
-retry.
+### Charger is not discovered
 
-**Charger display or phone app stopped working.** The entry is in live
-mode and Home Assistant holds the brush's only connection slot. Switch
-to charger-priority mode via *Configure*.
+- Confirm the entry uses **Charger/app compatible**.
+- Keep the iO Sense powered and within active Bluetooth range.
+- Confirm the proxy has `active: true`.
+- Wake the brush once so the charger advertises its paired/connection state.
+- Check the toothbrush state entity's `charger_address` and `data_source`
+  attributes.
 
-**Entities stop updating entirely.** Reload the integration. If this
-recurs with the official `oralb` integration installed alongside,
-disable that entry; see
-[home-assistant/core#177039](https://github.com/home-assistant/core/issues/177039).
+### Live values use advertisements
 
-**Dashboard warns about unknown entities.** Cards still reference the
-official integration's entity IDs. Repoint them at the Oral-B Live
-equivalents.
+`data_source: advertisement` means no matched charger bridge or direct brush
+connection is currently available. The integration remains functional through
+its passive fallback and will switch sources automatically when possible.
 
-**Unknown states or modes.** Unmapped values appear as
-`unknown_state_<n>` and `mode_<n>`. Please open an issue with the raw
-value and what the brush was doing, and it will be added.
+### Charger display or phone app cannot use the brush
+
+The entry is using **Home Assistant direct**. Select **Charger/app compatible**
+to leave the brush connection with the charger/app.
+
+### Session details update later
+
+The immediate session is reconstructed locally. Exact pressure totals and
+ending battery come from `FF29` on the next managed connection and update the
+same session instead of creating a duplicate.
+
+### Entities remain unavailable
+
+Disable another integration that is managing the same brush, verify active
+Bluetooth connectivity, reload the config entry, and wake the brush. Debug
+logging for `custom_components.oralb_live` shows charger matching, source
+selection and read failures without exposing cloud credentials.
 
 ## Credits
 
-- [bkbilly/oralb_ble](https://github.com/bkbilly/oralb_ble) — pioneered
-  the active-connection approach and the original characteristic map.
+- [bkbilly/oralb_ble](https://github.com/bkbilly/oralb_ble)
 - [Bluetooth-Devices/oralb-ble](https://github.com/Bluetooth-Devices/oralb-ble)
-  and the official
-  [oralb integration](https://www.home-assistant.io/integrations/oralb/).
-- [MatrixEditor/oralb-io](https://github.com/MatrixEditor/oralb-io) —
-  the most complete public map of the Oral-B BLE protocol, which
-  corrected several characteristic assignments used here.
+- [Home Assistant Oral-B integration](https://www.home-assistant.io/integrations/oralb/)
+- [MatrixEditor/oralb-io](https://github.com/MatrixEditor/oralb-io)
 - [Anrolosia/toothbrush-card](https://github.com/Anrolosia/toothbrush-card)
-  — the dashboard card these entities are designed to work with.
-- Ruben Faelens, for documenting the app handshake problem.
 
 ## Disclaimer
 
-Not affiliated with, endorsed by, or connected to Oral-B or Procter &
-Gamble. Protocol details were obtained by observing a single iO-series
-device; other models may differ.
+Not affiliated with, endorsed by, or connected to Oral-B or Procter & Gamble.
+Protocol behaviour may differ across models and firmware.
 
 [hacs-badge]: https://img.shields.io/badge/HACS-Custom-41BDF5.svg
 [hacs-url]: https://github.com/hacs/integration
