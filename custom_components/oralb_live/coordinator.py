@@ -97,8 +97,10 @@ from .const import (
     SYNC_STATES,
 )
 from .protocol import (
+    advance_pacer_progress,
     decode_charger_sector,
     decode_sector,
+    derive_pacer_progress,
     parse_available_modes,
     parse_battery_status,
     parse_device_info,
@@ -204,6 +206,8 @@ class OralBLiveCoordinator:
         self._session_generation = 0
         self._processed_session_generation = 0
         self._charger_timer_anchor: tuple[int, float] | None = None
+        self._charger_tick_task: asyncio.Task | None = None
+        self._pacer_anchor: tuple[int, int, int] | None = None
         self._charger_session_record: bytes | None = None
         self._charger_session_rtc: bytes | None = None
         self.charger: IOSenseBridge | None = (
@@ -240,11 +244,16 @@ class OralBLiveCoordinator:
 
     async def async_stop(self) -> None:
         self._stopping = True
-        for task in (self._reconnect_task, self._sync_task):
+        for task in (
+            self._reconnect_task,
+            self._sync_task,
+            self._charger_tick_task,
+        ):
             if task:
                 task.cancel()
         self._reconnect_task = None
         self._sync_task = None
+        self._charger_tick_task = None
         if self._unsub_bluetooth:
             self._unsub_bluetooth()
             self._unsub_bluetooth = None
@@ -287,7 +296,6 @@ class OralBLiveCoordinator:
             self._track_session_time(self.data["time"])
             self._track_session_pressure(self.data["pressure"])
             self._apply_mode(payload[ADV_IDX_MODE])
-            self.data["sector_timer"] = payload[ADV_IDX_SECTOR_TIMER]
             self._apply_sector(
                 payload[ADV_IDX_SECTOR],
                 (
@@ -295,6 +303,7 @@ class OralBLiveCoordinator:
                     if self.data["number_of_sectors"] is None
                     else None
                 ),
+                payload[ADV_IDX_SECTOR_TIMER],
             )
         self._push()
 
@@ -409,6 +418,7 @@ class OralBLiveCoordinator:
         if uuid == CHAR_BRUSH_TIME and len(payload) >= 2:
             self.data["time"] = _decode_time(payload[0], payload[1])
             self._track_session_time(self.data["time"])
+            self._update_pacer_progress()
         elif uuid == CHAR_STATE and payload:
             self._apply_state(payload[0])
             if payload[0] in RELEASE_STATES:
@@ -416,7 +426,11 @@ class OralBLiveCoordinator:
         elif uuid == CHAR_MODE and payload:
             self._apply_mode(payload[0])
         elif uuid == CHAR_SECTOR and payload:
-            self._apply_sector(payload[0], None)
+            self._apply_sector(
+                payload[0],
+                payload[2] if len(payload) >= 3 else None,
+                payload[1] if len(payload) >= 2 else None,
+            )
         elif uuid == CHAR_PRESSURE and payload:
             self.data["pressure"] = PRESSURE_STATES.get(
                 payload[0], f"pressure_{payload[0]}"
@@ -440,8 +454,13 @@ class OralBLiveCoordinator:
         self.available = True
         self.data["data_source"] = DATA_SOURCE_CHARGER
         self.data["live"] = True
-        self._charger_timer_anchor = None
+        self.data["time"] = 0
+        self.data["sector"] = "no_sector"
+        self.data["sector_timer"] = 0
+        self._charger_timer_anchor = (0, time.monotonic())
+        self._pacer_anchor = None
         self._apply_state(RUNNING_STATE)
+        self._start_charger_ticker()
         self._push()
 
     def _charger_session_ended(self) -> None:
@@ -450,6 +469,7 @@ class OralBLiveCoordinator:
             4 if self.charger and self.charger.data.get("brush_charging") else 2
         )
         self._advance_charger_timer()
+        self._cancel_charger_ticker()
         self._apply_state(quiet_state)
         self.data["live"] = False
         self._push()
@@ -472,8 +492,9 @@ class OralBLiveCoordinator:
             self.data["time"] = seconds
             self._charger_timer_anchor = (seconds, time.monotonic())
             self._track_session_time(seconds)
+            self._update_pacer_progress()
         elif short_uuid == "FF09" and len(raw) >= 3:
-            self._apply_charger_sector(raw[0], raw[2])
+            self._apply_charger_sector(raw[0], raw[2], raw[1])
         elif short_uuid == "FF0A":
             self._apply_smiley(raw)
         elif short_uuid == "FF0B" and raw:
@@ -512,6 +533,36 @@ class OralBLiveCoordinator:
         if estimated > (self.data.get("time") or 0):
             self.data["time"] = estimated
             self._track_session_time(estimated)
+        self._update_pacer_progress()
+
+    def _start_charger_ticker(self) -> None:
+        """Advance time and pacer state independently of BLE request latency."""
+        if self._charger_tick_task and not self._charger_tick_task.done():
+            return
+        self._charger_tick_task = self.hass.async_create_task(
+            self._async_charger_tick_loop()
+        )
+
+    def _cancel_charger_ticker(self) -> None:
+        if self._charger_tick_task and not self._charger_tick_task.done():
+            self._charger_tick_task.cancel()
+        self._charger_tick_task = None
+
+    async def _async_charger_tick_loop(self) -> None:
+        """Publish a stable one-second timer even while bridge reads are slow."""
+        next_tick = time.monotonic()
+        try:
+            while not self._stopping and self._session_active:
+                next_tick += 1.0
+                await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+                if self._stopping or not self._session_active:
+                    return
+                self._advance_charger_timer()
+                self.data["data_source"] = DATA_SOURCE_CHARGER
+                self.data["live"] = True
+                self._push()
+        except asyncio.CancelledError:
+            pass
 
     # ------------------------------------------------- charger-priority sync
     def _maybe_schedule_sync(self) -> None:
@@ -856,6 +907,11 @@ class OralBLiveCoordinator:
         elif raw not in session_states and previous in session_states:
             self._end_session()
 
+        if raw != RUNNING_STATE:
+            self.data["sector"] = "no_sector"
+            self.data["sector_timer"] = None
+            self._pacer_anchor = None
+
         if (
             self.mode != CONNECTION_MODE_LIVE
             and raw in SESSION_SEEN_STATES
@@ -893,6 +949,7 @@ class OralBLiveCoordinator:
         if not self._session_active:
             return
         self._session_active = False
+        self._cancel_charger_ticker()
         duration = self._session_max_time or 0
         duration_source = "brush timer"
         if duration <= 0 and self._session_started_monotonic is not None:
@@ -974,20 +1031,29 @@ class OralBLiveCoordinator:
         self.data["mode_raw"] = raw
         self.data["mode"] = MODES.get(raw, f"mode_{raw}")
 
-    def _apply_sector(self, raw: int, total: int | None) -> None:
+    def _apply_sector(
+        self, raw: int, total: int | None, sector_timer: int | None = None
+    ) -> None:
         self.data["sector_raw"] = raw
         sector, quadrant, decoded_total = decode_sector(
             raw,
             total,
             self.data.get("number_of_sectors"),
         )
-        self.data["sector"] = sector
+        self.data["sector"] = (
+            sector
+            if self.data.get("state_raw") == RUNNING_STATE
+            else "no_sector"
+        )
         if self._session_active and quadrant is not None:
             self._session_sectors.add(quadrant)
         if decoded_total:
             self.data["number_of_sectors"] = decoded_total
+        self._apply_pacer_anchor(quadrant, sector_timer)
 
-    def _apply_charger_sector(self, raw: int, total: int | None) -> None:
+    def _apply_charger_sector(
+        self, raw: int, total: int | None, sector_timer: int | None = None
+    ) -> None:
         """Apply the zero-based quadrant value returned by charger reads."""
         self.data["sector_raw"] = raw
         sector, quadrant, decoded_total = decode_charger_sector(
@@ -995,11 +1061,55 @@ class OralBLiveCoordinator:
             total,
             self.data.get("number_of_sectors"),
         )
-        self.data["sector"] = sector
+        self.data["sector"] = (
+            sector
+            if self.data.get("state_raw") == RUNNING_STATE
+            else "no_sector"
+        )
         if decoded_total:
             self.data["number_of_sectors"] = decoded_total
         if self._session_active and quadrant is not None:
             self._session_sectors.add(quadrant)
+        self._apply_pacer_anchor(quadrant, sector_timer)
+
+    def _apply_pacer_anchor(
+        self, quadrant: int | None, sector_timer: int | None
+    ) -> None:
+        """Anchor local pacer advancement to a brush-provided FF09 sample."""
+        if self.data.get("state_raw") != RUNNING_STATE:
+            self.data["sector_timer"] = None
+            self._pacer_anchor = None
+            return
+        if quadrant is None or sector_timer is None:
+            return
+        elapsed = int(self.data.get("time") or 0)
+        self.data["sector_timer"] = sector_timer
+        self._pacer_anchor = (quadrant, sector_timer, elapsed)
+
+    def _update_pacer_progress(self) -> None:
+        """Advance sector and sector timer from the configured FF26 schedule."""
+        if not self._session_active or self.data.get("state_raw") != RUNNING_STATE:
+            return
+        sector_times = self.data.get("sector_times")
+        elapsed = self.data.get("time")
+        if not isinstance(sector_times, list) or not isinstance(elapsed, int):
+            return
+
+        if self._pacer_anchor is not None:
+            anchor_sector, anchor_timer, anchor_elapsed = self._pacer_anchor
+            sector, sector_timer = advance_pacer_progress(
+                anchor_sector,
+                anchor_timer,
+                max(0, elapsed - anchor_elapsed),
+                sector_times,
+            )
+        else:
+            sector, sector_timer = derive_pacer_progress(elapsed, sector_times)
+
+        if sector is None or sector_timer is None:
+            return
+        self.data["sector"] = f"sector_{sector}"
+        self.data["sector_timer"] = sector_timer
 
     def _apply_battery_status(self, payload: bytes | bytearray | None) -> None:
         if payload is not None:
@@ -1029,6 +1139,7 @@ class OralBLiveCoordinator:
     def _apply_pacer(self, payload: bytes | bytearray | None) -> None:
         if payload is not None:
             self.data.update(parse_pacer(payload))
+            self._update_pacer_progress()
 
     def _apply_available_modes(self, payload: bytes | bytearray | None) -> None:
         if payload is None:

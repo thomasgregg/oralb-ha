@@ -84,7 +84,7 @@ The primary brush service is:
 | `FF06` | notify, read | Button state: none, power or mode |
 | `FF07` | notify, read | Brushing mode |
 | `FF08` | notify, read | Brushing timer as `[minutes, seconds]`, normally 1 Hz while running |
-| `FF09` | notify, read | Current sector/zone and configured sector information |
+| `FF09` | notify, read | Current sector/zone, elapsed sector seconds and configured sector information |
 | `FF0A` | notify, read | Smiley/display face |
 | `FF0B` | notify, read | Pressure state and, on protocol 8/9, pressure/motor fields |
 | `FF0C` | read, write, notify | Authentication-gated cache; not used |
@@ -198,7 +198,7 @@ value is:
 | `5..6` | brushing time as `[minutes, seconds]` |
 | `7` | brushing mode |
 | `8` | sector; low three bits contain the sector value |
-| `9` | sector timer |
+| `9` | seconds elapsed in the current sector |
 | `10` | configured number of sectors |
 
 Advertisements provide the passive fallback and are the data source used by
@@ -360,7 +360,7 @@ not force the charger to establish that private connection.
 | `FF05` | battery diagnostics | percentage, estimated brushing runtime remaining on the current charge, voltage, signed current and temperature confirmed |
 | `FF07` | brushing mode | live mode confirmed |
 | `FF08` | timer | `[minutes, seconds]` confirmed live |
-| `FF09` | zone | zero-based zone ID plus configured count confirmed live |
+| `FF09` | zone | zero-based zone ID, elapsed sector timer and configured count confirmed live |
 | `FF0A` | brush display face/smiley | values through `special_10` confirmed |
 | `FF0B` | pressure/motor | pressure state, timestamp, force and motor fields confirmed live |
 | `FF0D` | motion | motion and gyroscope snapshots confirmed; not exposed as an HA entity |
@@ -393,7 +393,10 @@ entities.
 Direct toothbrush notifications and charger passthrough use different
 presentation rules in the observed payloads. Charger `FF09` zone IDs are
 zero-based: raw `0` is `sector_1`, raw `3` is `sector_4`, and `0xFF` denotes
-the configured last sector. `0xF0` means that no sector is defined.
+the configured last sector. `0xF0` means that no sector is defined. The
+three-byte value is `[zone, elapsed sector seconds, configured zone count]`.
+Oral-B Live advances this pacer state locally from the `FF26` schedule between
+reads and treats each `FF09` response as an authoritative correction.
 
 ## Sustained polling benchmark
 
@@ -426,9 +429,11 @@ derived two-read timings are:
 | pressure + zone | 662.129 ms | 808.012 ms | 899.585 ms |
 
 Oral-B Live therefore reads pressure every one-second tick and alternates
-timer and zone as the second read. The displayed timer advances locally
-between the authoritative two-second timer anchors. Charger-native session
-state is checked periodically to provide an explicit stop signal.
+timer and zone as the second read. A separate local 1 Hz ticker advances the
+displayed timer, pacer zone and elapsed zone time independently of BLE request
+latency; `FF08` and `FF09` remain the authoritative correction anchors.
+Charger-native session state is checked periodically to provide an explicit
+stop signal.
 
 ## Retained session summary (`FF29`)
 

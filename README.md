@@ -80,13 +80,19 @@ During a session the bridge uses the measured production scheduler:
 
 - pressure (`FF0B`) is read every one-second tick;
 - timer (`FF08`) and zone (`FF09`) alternate as the second read;
-- the displayed timer advances locally between authoritative brush readings;
+- the configured pacer schedule (`FF26`) is read once at session start;
+- the displayed timer, pacer sector and sector timer advance locally at 1 Hz
+  between authoritative brush readings;
+- `FF09` corrects the locally advanced sector and sector timer whenever the
+  next charger response arrives;
 - mode and state are read at session start, with charger session state checked
   periodically for an authoritative stop signal;
 - supported session, battery and display diagnostics are collected on
   charger-managed idle connections, outside the live pressure path.
 
-This keeps pressure fresh every second and timer/zone within two seconds. A
+This keeps the displayed timer and pacer sector responsive even when an
+individual charger request is slow. Pressure is normally refreshed every
+second and authoritative timer/zone samples arrive every two seconds. A
 150-second real-session benchmark completed all 444 requests without a single
 failure. The measured p95 was 779 ms for pressure+timer and 808 ms for
 pressure+zone.
@@ -106,8 +112,9 @@ connection slot. The iO Sense display and phone app cannot use the brush at the
 same time.
 
 The direct connection subscribes to state (`FF04`), mode (`FF07`), timer
-(`FF08`), sector (`FF09`) and pressure (`FF0B`) notifications, with battery
-(`FF05`) and smiley (`FF0A`) notifications where supported. It also reads the
+(`FF08`), sector and sector timer (`FF09`) and pressure (`FF0B`)
+notifications, with battery (`FF05`) and smiley (`FF0A`) notifications where
+supported. It also reads the
 brush identity, pacer, available modes, brush-head remainder and display face
 when the connection is established.
 
@@ -185,8 +192,8 @@ reconciliation.
 | Time | Current brushing duration; locally advanced between charger timer anchors |
 | Pressure | `low`, `normal` or `high`; charger reads also expose raw force as an attribute |
 | Mode | Daily clean, sensitive, gum care, whiten, intense, super sensitive, tongue clean, Smart Adapt, gentle white and supported unknown values |
-| Sector | Current pacer sector (`sector_1` … `sector_8`) |
-| Sector timer | Advertised sector time where available |
+| Sector | Current pacer sector (`sector_1` … `sector_8`), advanced locally from the configured schedule and corrected by the brush |
+| Sector timer | Elapsed seconds in the current pacer sector while brushing; `unknown` outside an active session |
 | Number of sectors | Configured pacer sector count |
 | Target duration | Sum of configured per-sector times |
 | Smiley | Brush display face from `FF0A` |
@@ -200,6 +207,11 @@ reconciliation.
 The **Sector** entity is the brush's configured pacer prompt, not a measurement
 of the brush's physical position. It changes when the pacer advances, so a
 short session can remain on a single sector.
+
+The **Sector timer** counts elapsed seconds within that pacer sector. In
+charger/app-compatible mode both pacer entities advance locally at 1 Hz from
+the brush's `FF26` schedule, while regular `FF09` reads correct them to the
+toothbrush's authoritative state.
 
 The **Last session** attributes can include:
 

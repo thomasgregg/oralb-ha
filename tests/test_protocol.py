@@ -113,6 +113,29 @@ class ProtocolDecoderTests(unittest.TestCase):
             },
         )
 
+    def test_pacer_progress_from_elapsed_time(self) -> None:
+        sector_times = [30, 30, 30, 30]
+        self.assertEqual(protocol.derive_pacer_progress(0, sector_times), (1, 0))
+        self.assertEqual(protocol.derive_pacer_progress(29, sector_times), (1, 29))
+        self.assertEqual(protocol.derive_pacer_progress(30, sector_times), (2, 0))
+        self.assertEqual(protocol.derive_pacer_progress(91, sector_times), (4, 1))
+        self.assertEqual(protocol.derive_pacer_progress(135, sector_times), (4, 45))
+
+    def test_pacer_progress_advances_from_ff09_anchor(self) -> None:
+        sector_times = [30, 30, 30, 30]
+        self.assertEqual(
+            protocol.advance_pacer_progress(1, 28, 1, sector_times),
+            (1, 29),
+        )
+        self.assertEqual(
+            protocol.advance_pacer_progress(1, 28, 2, sector_times),
+            (2, 0),
+        )
+        self.assertEqual(
+            protocol.advance_pacer_progress(4, 29, 10, sector_times),
+            (4, 39),
+        )
+
     def test_refill_remainder(self) -> None:
         self.assertEqual(
             protocol.parse_refill_remainder(bytes.fromhex("00 1e 00 58 02")),

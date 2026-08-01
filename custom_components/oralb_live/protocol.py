@@ -71,6 +71,47 @@ def parse_pacer(payload: bytes | bytearray) -> dict[str, Any]:
     }
 
 
+def derive_pacer_progress(
+    elapsed_seconds: int, sector_times: list[int]
+) -> tuple[int | None, int | None]:
+    """Return the pacer sector and elapsed seconds within that sector."""
+    if elapsed_seconds < 0 or not sector_times:
+        return None, None
+
+    elapsed = elapsed_seconds
+    for sector, duration in enumerate(sector_times, start=1):
+        if elapsed < duration:
+            return sector, elapsed
+        if sector < len(sector_times):
+            elapsed -= duration
+
+    # The final sector remains active when brushing continues past the target.
+    return len(sector_times), elapsed
+
+
+def advance_pacer_progress(
+    sector: int,
+    sector_timer: int,
+    elapsed_delta: int,
+    sector_times: list[int],
+) -> tuple[int | None, int | None]:
+    """Advance an authoritative pacer sample without another BLE read."""
+    if (
+        sector < 1
+        or sector > len(sector_times)
+        or sector_timer < 0
+        or elapsed_delta < 0
+        or not sector_times
+    ):
+        return None, None
+
+    timer = sector_timer + elapsed_delta
+    while sector < len(sector_times) and timer >= sector_times[sector - 1]:
+        timer -= sector_times[sector - 1]
+        sector += 1
+    return sector, timer
+
+
 def parse_refill_remainder(payload: bytes | bytearray) -> dict[str, int]:
     """Decode ff2d brush-head refill remainder."""
     if len(payload) < 5:

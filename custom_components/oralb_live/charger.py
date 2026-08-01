@@ -530,7 +530,9 @@ class IOSenseBridge:
     async def _async_live_loop(self) -> None:
         tick = 0
         try:
-            for short_uuid in ("FF04", "FF07"):
+            # Read the configured pacer first so the independent 1 Hz ticker
+            # can predict sector boundaries before the first scheduled FF09.
+            for short_uuid in ("FF26", "FF04", "FF07"):
                 if value := await self._async_passthrough(short_uuid):
                     await self.parent._async_apply_charger_passthrough(
                         short_uuid, value
