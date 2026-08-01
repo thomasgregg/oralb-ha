@@ -222,6 +222,17 @@ MODEL_NAMES: dict[int, str] = {
     119: "Genius X D706",
 }
 
+
+def brush_device_name(address: str, model_name: str | None = None) -> str:
+    """Return a descriptive, distinguishable default toothbrush name."""
+    compact_address = "".join(char for char in address if char.isalnum()).upper()
+    suffix = compact_address[-4:] if compact_address else "DEVICE"
+    base = (model_name or "Oral-B").strip() or "Oral-B"
+    if "toothbrush" not in base.casefold():
+        base = f"{base} Toothbrush"
+    return f"{base} {suffix}"
+
+
 # ff0b pressure states (protocol >= 6)
 PRESSURE_STATES: dict[int, str] = {
     0: "low",

@@ -24,12 +24,15 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    ADV_IDX_MODEL,
     CONF_CONNECTION_MODE,
     CONNECTION_MODE_CHARGER,
     CONNECTION_MODE_LIVE,
     DEFAULT_CONNECTION_MODE,
     DOMAIN,
+    MODEL_NAMES,
     ORALB_MANUFACTURER_ID,
+    brush_device_name,
 )
 
 
@@ -38,6 +41,17 @@ def _is_toothbrush(service_info: BluetoothServiceInfoBleak) -> bool:
     # Toothbrush state adverts carry an 11-byte payload; the iO Sense
     # charger advertises with the same vendor id but a different payload.
     return payload is not None and len(payload) == 11
+
+
+def _discovery_name(service_info: BluetoothServiceInfoBleak) -> str:
+    """Build a useful default name from the advertised brush model and MAC."""
+    payload = service_info.manufacturer_data.get(ORALB_MANUFACTURER_ID)
+    model_name = (
+        MODEL_NAMES.get(payload[ADV_IDX_MODEL])
+        if payload is not None and len(payload) == 11
+        else None
+    )
+    return brush_device_name(service_info.address, model_name)
 
 
 class OralBLiveConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -67,7 +81,7 @@ class OralBLiveConfigFlow(ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured()
         self._discovery_info = discovery_info
         self.context["title_placeholders"] = {
-            "name": discovery_info.name or discovery_info.address
+            "name": _discovery_name(discovery_info)
         }
         return await self.async_step_bluetooth_confirm()
 
@@ -78,14 +92,14 @@ class OralBLiveConfigFlow(ConfigFlow, domain=DOMAIN):
         assert self._discovery_info is not None
         if user_input is not None:
             return self.async_create_entry(
-                title=self._discovery_info.name or self._discovery_info.address,
+                title=_discovery_name(self._discovery_info),
                 data={CONF_ADDRESS: self._discovery_info.address},
             )
         self._set_confirm_only()
         return self.async_show_form(
             step_id="bluetooth_confirm",
             description_placeholders={
-                "name": self._discovery_info.name or self._discovery_info.address
+                "name": _discovery_name(self._discovery_info)
             },
         )
 
@@ -99,7 +113,7 @@ class OralBLiveConfigFlow(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
             service_info = self._discovered[address]
             return self.async_create_entry(
-                title=service_info.name or address,
+                title=_discovery_name(service_info),
                 data={CONF_ADDRESS: address},
             )
 
@@ -117,7 +131,7 @@ class OralBLiveConfigFlow(ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_ADDRESS): vol.In(
                         {
-                            address: f"{info.name or 'Oral-B'} ({address})"
+                            address: _discovery_name(info)
                             for address, info in self._discovered.items()
                         }
                     )

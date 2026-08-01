@@ -40,6 +40,7 @@ from .const import (
     SIGNAL_CHARGER_DISCOVERED,
     SIGNAL_CHARGER_UPDATE,
     SIGNAL_UPDATE,
+    brush_device_name,
 )
 from .coordinator import OralBLiveCoordinator
 
@@ -402,7 +403,9 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.address)},
             connections={(CONNECTION_BLUETOOTH, coordinator.address)},
-            name=coordinator.name,
+            name=brush_device_name(
+                coordinator.address, coordinator.data.get("model_name")
+            ),
             manufacturer="Oral-B",
             model=coordinator.data.get("model_name"),
             sw_version=(

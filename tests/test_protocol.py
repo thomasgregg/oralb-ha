@@ -80,6 +80,16 @@ class ProtocolDecoderTests(unittest.TestCase):
             },
         )
 
+    def test_brush_device_name(self) -> None:
+        self.assertEqual(
+            "iO Series Toothbrush 64D3",
+            const.brush_device_name("58:26:3A:F6:64:D3", "iO Series"),
+        )
+        self.assertEqual(
+            "Oral-B Toothbrush 64D3",
+            const.brush_device_name("58:26:3A:F6:64:D3"),
+        )
+
     def test_io_mode_mapping(self) -> None:
         self.assertEqual(const.MODES[5], "super_sensitive")
         self.assertEqual(const.MODES[6], "tongue_clean")
