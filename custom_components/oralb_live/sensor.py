@@ -18,9 +18,9 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE,
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
-    UnitOfSignalStrength,
     UnitOfTemperature,
     UnitOfTime,
 )
@@ -261,7 +261,7 @@ CHARGER_SENSORS: tuple[OralBSensorDescription, ...] = (
         translation_key="charger_wifi_rssi",
         name="Wi-Fi signal",
         data_key="wifi_rssi",
-        native_unit_of_measurement=UnitOfSignalStrength.DECIBELS_MILLIWATT,
+        native_unit_of_measurement=SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
         device_class=SensorDeviceClass.SIGNAL_STRENGTH,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
