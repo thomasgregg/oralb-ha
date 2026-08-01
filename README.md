@@ -15,6 +15,7 @@ display and charger diagnostics without using the Oral-B cloud.
 
 - [How it works](#how-it-works)
 - [Connection options](#connection-options)
+- [Comparison with Home Assistant's built-in Oral-B integration](#comparison-with-home-assistants-built-in-oral-b-integration)
 - [Data sources and fallbacks](#data-sources-and-fallbacks)
 - [Entities](#entities)
 - [Installation](#installation)
@@ -92,6 +93,42 @@ This is the highest-rate source, but Home Assistant owns the brush's single
 connection slot. The iO Sense display and phone app cannot use the brush at the
 same time.
 
+## Comparison with Home Assistant's built-in Oral-B integration
+
+Home Assistant includes an official **Oral-B** integration. It is a good fit
+when the brush advertises all the values you need and you want a small,
+primarily passive set of entities. Oral-B Live is intended for iO setups that
+need charger-mediated or direct live data, retained session results and the
+additional brush and charger diagnostics documented here.
+
+Both integrations operate locally and neither requires the Oral-B cloud.
+
+| Capability | Home Assistant Oral-B | Oral-B Live |
+| --- | --- | --- |
+| Primary data path | Passive toothbrush advertisements, with an active battery poll when needed | Automatic charger bridge, direct brush notifications or passive advertisements, depending on the selected option and availability |
+| Connection choices | No user-selectable connection mode | Charger/app compatible or Home Assistant direct |
+| Live brushing time | From the values present in toothbrush advertisements | Through iO Sense passthrough, direct brush notifications or advertisements; charger mode advances time between authoritative reads |
+| Live pressure | From toothbrush advertisements | Every one-second charger tick, direct notifications or advertisements |
+| Live sector/zone | From toothbrush advertisements | Alternating charger reads, direct notifications or advertisements; supports up to eight sectors |
+| Brush state and mode | Yes | Yes, including the additional decoded iO values |
+| Battery percentage | Yes | Yes |
+| Battery diagnostics | No | Remaining brushing time, voltage, signed current and temperature where supported |
+| Smiley/display face | No | Yes, from `FF0A` |
+| Target and pacer configuration | Sector count and sector timer from advertisements | Sector count, per-sector times and target duration from advertisements or brush reads |
+| Brush-head remainder | No | Remaining days and brushing seconds from `FF2D` |
+| Last-session history | No | Last session, duration and sessions today, restored across HA restarts |
+| Exact retained session | No | `FF29` duration, mode, target, session ID, pressure events/times, average/maximum pressure and ending battery |
+| Session reconciliation | No session log to reconcile | Live/passive record is refined by `FF29` without double-counting |
+| iO Sense identification | No | Automatically matches the charger to its paired brush by MAC address |
+| iO Sense entities | No | Separate charger device with session, Wi-Fi, cloud transport, clock, display, light and policy diagnostics |
+| Active source visibility | No | `data_source` reports `charger_bridge`, `direct_brush` or `advertisement`; the last-session `source` attribute identifies retained summaries |
+| Brush connection slot | Normally remains free apart from a brief poll | Remains with the charger/app in compatible mode; intentionally owned by HA in direct mode |
+| Writes device settings | No | No; charger and brush access is read-only |
+
+Only one integration should manage a given toothbrush in Home Assistant.
+Disable the other config entry for that brush to avoid duplicate devices,
+entities and Bluetooth work.
+
 ## Data sources and fallbacks
 
 The state entity exposes the active `data_source` so the path is always visible:
@@ -101,7 +138,6 @@ The state entity exposes the active `data_source` so the path is always visible:
 | `charger_bridge` | Live reads forwarded locally through a matched iO Sense |
 | `direct_brush` | Direct GATT notifications from the toothbrush |
 | `advertisement` | Passive manufacturer data from the toothbrush |
-| `retained_session` | Authoritative `FF29` session summary reconciled later |
 
 Sources are selected automatically inside the chosen connection option.
 Entity IDs stay the same when the source changes.
@@ -111,6 +147,8 @@ brush retains one authoritative `FF29` summary containing exact duration,
 mode, pressure totals, event counts and ending battery. Through the charger it
 becomes readable on the next charger-managed brush connection and refines the
 already-recorded session without counting it twice.
+The Last session entity records `source: retained_session` after this
+reconciliation.
 
 ## Entities
 
