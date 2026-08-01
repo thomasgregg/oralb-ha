@@ -6,7 +6,53 @@ regression-tested without installing Home Assistant.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class DashboardRecord:
+    """One timestamped brush motion/gyroscope sample."""
+
+    timestamp: int
+    gyro_x: int
+    gyro_y: int
+    gyro_z: int
+    motion_x: int
+    motion_y: int
+    motion_z: int
+
+
+def parse_comino_sensor_snapshot(
+    payload: bytes | bytearray,
+) -> tuple[DashboardRecord, ...]:
+    """Decode the two Comino IMU samples returned by a brush FF0D read.
+
+    FF0D stores the newest record first. Bytes 18-19 identify the payload as
+    Comino motion data; the two records themselves use the same axis order and
+    scale as the FF0E dashboard stream.
+    """
+    raw = bytes(payload)
+    if len(raw) != 20:
+        raise ValueError("Comino sensor snapshot must contain 20 bytes")
+    if raw[18:20] != b"\x10\x80":
+        raise ValueError(f"sensor snapshot is not Comino data: 0x{raw[18:20].hex()}")
+
+    records = []
+    for offset in (0, 8):
+        record = raw[offset : offset + 8]
+        records.append(
+            DashboardRecord(
+                timestamp=int.from_bytes(record[0:2], "little"),
+                gyro_x=int.from_bytes(record[2:3], "little", signed=True),
+                gyro_y=int.from_bytes(record[3:4], "little", signed=True),
+                gyro_z=int.from_bytes(record[4:5], "little", signed=True),
+                motion_x=int.from_bytes(record[5:6], "little", signed=True),
+                motion_y=int.from_bytes(record[6:7], "little", signed=True),
+                motion_z=int.from_bytes(record[7:8], "little", signed=True),
+            )
+        )
+    return tuple(records)
 
 
 def parse_battery_status(

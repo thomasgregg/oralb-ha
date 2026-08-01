@@ -89,6 +89,7 @@ The primary brush service is:
 | `FF0B` | notify, read | Pressure state and, on protocol 8/9, pressure/motor fields |
 | `FF0C` | read, write, notify | Authentication-gated cache; not used |
 | `FF0D` | notify, read | Motion and gyroscope data, approximately 30 Hz |
+| `FF0E` | notify | Configurable batched motion/gyroscope dashboard stream |
 | `FF29` | read | Retained latest-session summary |
 
 The configuration service is:
@@ -181,23 +182,54 @@ through `FF26`; a short session can therefore report only one sector.
 
 `FF0D` contains raw inertial samples, not a zone identifier. The normal
 20-byte form carries four samples of `[uint16 timestamp, int8 x, int8 y,
-int8 z]`. The captured Comino form carries two samples with three additional
-signed gyroscope axes per sample and a format trailer. Direct notifications
-provide the continuous high-rate stream; a charger passthrough read returns
-only the current snapshot.
+int8 z]`. The captured Comino form carries two timestamped records with three
+additional signed gyroscope axes per record and the marker bytes `10 80` at
+offsets 18 and 19. In both the Comino `FF0D` form and `FF0E`, each record is
+ordered as timestamp, gyroscope X/Y/Z, then motion X/Y/Z. `FF0E` is the
+configurable direct dashboard stream used for batches of these calibrated
+features.
 
-The vendor app feeds this stream into its bundled Comino GRU3/GRU6 native
-classifier and maps the classifier output to anatomical zones such as upper
-right outside, lower left inside and out of mouth. The iO Sense command set
-does not include a processed Comino-zone result. Its brush-passthrough API has
-only read and write operations—there is no forwarded-notification operation—
-so Home Assistant's request/response bridge cannot obtain a continuous
-classifier input at the direct notification rate.
+The reconstructed direct-stream setup is a write to `FF21` followed by
+notifications from `FF0E`:
 
-Consequently Oral-B Live exposes `FF09` as **Pacer sector** and does not label
-it as physical position. Adding reliable mouth-position tracking requires an
-open classifier trained for these sensor samples and a sufficiently complete
-continuous stream; a timer-based or single-snapshot guess would be misleading.
+```text
+38 SESSION_HI SESSION_LO DIVIDER 00
+```
+
+The session identifier is big-endian and valid from `1` through `65535`.
+Observed divider values are `0` for the full rate, `2` for half rate and `4`
+for quarter rate. `38 00 00` cancels the stream. An `FF0E` notification is
+`[status, record_count, records...]`, where each record is eight bytes:
+
+```text
+uint16_le timestamp, int8 gyro_x, int8 gyro_y, int8 gyro_z,
+int8 motion_x, int8 motion_y, int8 motion_z
+```
+
+Reconstructed status values are `F0` invalid session, `01` first package,
+`02` packages pending and `08` last package. These writable stream-control
+details are retained for research only. The shipped integration does not start
+the dashboard stream or write `FF21`.
+
+The vendor app feeds 26-sample windows into its Comino GRU3/GRU6 classifier
+and maps each result to one of 20 detailed labels, including upper/lower,
+left/centre/right, inside/outside/onside and out of mouth. Local validation
+reproduced the application's feature order, scaling, normalization, recurrent
+topology, per-sample argmax and 26-sample majority vote.
+
+Charger passthrough cannot forward `FF0E` notifications, but repeated `FF0D`
+reads return two timestamped records newest-first. Interpolating the measured
+gap between consecutive snapshots reconstructs a 25 Hz input timeline and
+produced approximately one classified result per second in local testing. This
+is validation evidence, not a claim that interpolated samples contain the same
+information as a continuous direct stream.
+
+The vendor model assets are proprietary and are not distributable with the
+integration. A local validation backend may expose its results as separate
+**Mouth position**, **Mouth sector** and confidence diagnostics. The public
+`sector` entity remains `FF09`'s timed pacer, matching Home Assistant's built-in
+Oral-B integration and Toothbrush Card. It must not be relabelled as physical
+mouth position.
 
 On the tested direct connection, `FF29` changed within seconds of a completed
 session and the latest record was anonymously readable without first issuing
@@ -335,7 +367,30 @@ The captured 64-byte value contains paired-brush metadata, including:
 - brush MAC and device UUID;
 - internal model/type and colour;
 - display language;
-- brush protocol and firmware/controller metadata.
+- brush protocol, software, hardware, bootloader, media-content, memory-map,
+  information-sector and second-controller versions.
+
+After the charger's two-byte command header has been removed, the verified
+payload offsets used by the integration are:
+
+| Offset | Field |
+| ---: | --- |
+| `16` | model identifier |
+| `39` | brush protocol version |
+| `40` | software version |
+| `41` | hardware version |
+| `43` | bootloader version |
+| `46` | media-content version |
+| `47` | hardware-configuration version |
+| `49` | memory-map version |
+| `52` | information-sector version |
+| `59` | second-controller version |
+
+For an iO/Sonos brush, the Android app formats the user-visible handle firmware
+as zero-padded `second-controller.software.media-content`. The captured values
+`0`, `82` and `26` therefore appear as `00.82.26`. This is the app's composite
+handle version, not a semantic-version interpretation of `FF02`'s single
+software byte.
 
 Despite its name, it is not brushing history. It contains no duration,
 pressure distribution, zone times, score or session list. Oral-B Live uses the
@@ -385,7 +440,7 @@ not force the charger to establish that private connection.
 | `FF09` | pacer sector | zero-based interval ID, elapsed sector timer and configured count confirmed live |
 | `FF0A` | brush display face/smiley | values through `special_10` confirmed |
 | `FF0B` | pressure/motor | pressure state, timestamp, force and motor fields confirmed live |
-| `FF0D` | motion | motion and gyroscope snapshots confirmed; not exposed as an HA entity |
+| `FF0D` | motion | timestamped motion and gyroscope snapshots confirmed; optional local validation can derive separate position diagnostics |
 | `FF22` | brush real-time clock | confirmed |
 | `FF25` | available modes | confirmed |
 | `FF26` | per-zone pacer configuration | confirmed |
@@ -458,12 +513,14 @@ derived two-read timings are:
 | pressure + timer | 655.522 ms | 779.035 ms | 894.694 ms |
 | pressure + zone | 662.129 ms | 808.012 ms | 899.585 ms |
 
-Oral-B Live therefore reads pressure every one-second tick and alternates
-timer and pacer sector as the second read. A separate local 1 Hz ticker advances the
-displayed timer, pacer sector and elapsed sector time independently of BLE request
-latency; `FF08` and `FF09` remain the authoritative correction anchors.
-Charger-native session state is checked periodically to provide an explicit
-stop signal.
+Without a local motion-research model, Oral-B Live therefore reads pressure
+every one-second tick and alternates timer and pacer sector as the second read.
+A separate local 1 Hz ticker advances the displayed timer, pacer sector and
+elapsed sector time independently of BLE request latency; `FF08` and `FF09`
+remain the authoritative correction anchors. When a local validation model is
+present, `FF0D` and pressure take priority and timer/pacer anchors are sampled
+less often so snapshot gaps do not grow further. Charger-native session state
+is checked periodically to provide an explicit stop signal.
 
 ## Retained session summary (`FF29`)
 
@@ -491,8 +548,11 @@ The brush clock can drift. The wall-clock start is calculated relative to an
 `FF22` value read in the same connection:
 
 ```text
-wall_start = now - (brush_rtc - session_timestamp)
+wall_start = wall_time_at_rtc_read - (brush_rtc - session_timestamp)
 ```
+
+The wall timestamp is stored with the RTC sample, so a retained record and RTC
+that arrive in separate charger requests still form an accurate pair.
 
 The live stream creates the HA session immediately. A later `FF29` record is
 matched to that session and refines it without increasing `sessions_today`
@@ -577,6 +637,6 @@ For that reason Oral-B Live:
 | `charger_protocol.py` | pure advertisement, native packet and passthrough decoders/builders |
 | `charger.py` | automatic pairing, connection lifecycle, serial request scheduler and charger diagnostics |
 | `protocol.py` | pure toothbrush payload decoders including exact `FF29` and zero-based charger zones |
-| `coordinator.py` | source selection, live state, timer extrapolation, session tracking and reconciliation |
+| `coordinator.py` | source selection, live state, timer/pacer extrapolation, session tracking, reconciliation and optional local FF0D validation |
 | `sensor.py` | toothbrush entities plus a separate matched iO Sense device |
 | `tests/test_protocol.py` | captured-packet regression tests with no Home Assistant dependency |

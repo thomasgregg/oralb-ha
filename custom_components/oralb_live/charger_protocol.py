@@ -196,6 +196,22 @@ def _brush_data(payload: bytes) -> dict[str, Any]:
         result["model_id"] = payload[16]
         result["protocol_version"] = payload[39]
         result["firmware_revision"] = payload[40]
+    if len(payload) > 59:
+        # iO/Sonos controller metadata. These offsets mirror the current
+        # Android SDK's BRUSH_DATA parser after removing the two-byte charger
+        # command header. The app displays firmware as
+        # second-controller.software.media-content (zero-padded).
+        result.update(
+            {
+                "hardware_version": payload[41],
+                "bootloader_version": payload[43],
+                "media_content_version": payload[46],
+                "hardware_configuration": payload[47],
+                "memory_map_version": payload[49],
+                "info_sector_version": payload[52],
+                "second_controller_version": payload[59],
+            }
+        )
     return result
 
 

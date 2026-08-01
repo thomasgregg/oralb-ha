@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Local reverse-engineering validation assets. These are never distributable.
+custom_components/oralb_live/models/

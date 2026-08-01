@@ -12,6 +12,28 @@ DOMAIN = "oralb_live"
 
 ORALB_MANUFACTURER_ID = 220  # 0x00DC, Procter & Gamble
 
+
+def brush_firmware_version(
+    software_version: int | None,
+    second_controller_version: int | None = None,
+    media_content_version: int | None = None,
+) -> str | None:
+    """Format brush firmware the same way as the Oral-B app.
+
+    iO/Sonos metadata exposes a three-part controller/software/media version.
+    Older advertisements expose only the middle software-version byte.
+    """
+    if software_version is None:
+        return None
+    if second_controller_version is not None and media_content_version is not None:
+        return (
+            f"{second_controller_version:02d}."
+            f"{software_version:02d}."
+            f"{media_content_version:02d}"
+        )
+    return str(software_version)
+
+
 # --- Connection mode ---------------------------------------------------------
 # The brush accepts exactly ONE BLE client at a time and stops
 # advertising while that slot is taken (verified 2026-07 on an iO
@@ -44,7 +66,6 @@ CHAR_SECTOR = "a0f0ff09-5047-4d53-8208-4f72616c2d42"  # notify: [sector, ?, tota
 CHAR_SMILEY = "a0f0ff0a-5047-4d53-8208-4f72616c2d42"  # notify/read: display face
 CHAR_PRESSURE = "a0f0ff0b-5047-4d53-8208-4f72616c2d42"  # notify: [state, ...]
 CHAR_SENSOR_DATA = "a0f0ff0d-5047-4d53-8208-4f72616c2d42"  # motion, ~30 Hz
-CHAR_CONTROL = "a0f0ff21-5047-4d53-8208-4f72616c2d42"  # command channel
 CHAR_RTC = "a0f0ff22-5047-4d53-8208-4f72616c2d42"  # seconds, brush epoch
 CHAR_AVAILABLE_MODES = "a0f0ff25-5047-4d53-8208-4f72616c2d42"
 CHAR_PACER = "a0f0ff26-5047-4d53-8208-4f72616c2d42"  # per-sector seconds
@@ -253,35 +274,33 @@ SIGNAL_CHARGER_UPDATE = f"{DOMAIN}_charger_update"
 
 # --- iO Sense bridge --------------------------------------------------------
 # A 150-second real-session benchmark completed 444/444 passthrough reads.
-# Three sequential reads had a 1.141 s p95, while pressure+timer and
-# pressure+pacer stayed below 0.81 s p95. The production scheduler therefore
-# reads pressure every second and alternates timer/pacer as the second read.
+# The charger serializes requests, so the active schedule gives FF0D motion and
+# FF0B pressure priority. Slow-changing metadata is sampled only occasionally;
+# otherwise each extra read widens the gaps in the charger motion snapshots.
 CHARGER_BRIDGE_INTERVAL_SECONDS = 1.0
 CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS = 1.5
-# Poll the charger's native session state alongside the two-read live schedule.
+# Poll the charger's native session state alongside the priority live schedule.
 # Native status replies are short and provide an authoritative stop signal.
 CHARGER_SESSION_STATUS_EVERY_TICKS = 5
-# Battery changes slowly, so substitute it for one timer/pacer read every
-# 30 seconds. Pressure still remains at 1 Hz and the locally advanced timer
-# keeps moving while this current-value sample is collected.
+# Battery changes slowly, so collect it as an occasional auxiliary read. The
+# locally advanced timer keeps moving while this current-value sample is read.
 CHARGER_BATTERY_EVERY_TICKS = 30
 CHARGER_IDLE_DISCONNECT_SECONDS = 3.0
 CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS = 5.0
 CHARGER_IDLE_PROBE_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SNAPSHOT_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SESSION_SYNC_INTERVAL_SECONDS = 60.0
-
 # Read values that remain useful in quiet states before optional retained
 # session fields. Some brush firmware rejects FF29 and FF22 until the retained
 # record has settled; those failures must not prevent battery or identity from
 # refreshing.
 CHARGER_POST_SESSION_READS = (
     "FF05",
+    "FF2D",
     "FF02",
     "FF0A",
     "FF25",
     "FF26",
-    "FF2D",
     "FF29",
     "FF22",
 )

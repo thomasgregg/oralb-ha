@@ -5,11 +5,11 @@
 
 **Local live brushing data for Oral-B iO toothbrushes and iO Sense chargers in Home Assistant.**
 
-Oral-B Live combines passive Bluetooth advertisements, direct toothbrush GATT
-notifications, iO Sense charger passthrough reads, and the brush's retained
-session summary. It provides live timer, pressure, pacer and mode entities,
-keeps a persistent brushing log, and exposes supported battery, brush-head,
-display and charger diagnostics without using the Oral-B cloud.
+Oral-B Live combines passive Bluetooth updates, a direct toothbrush
+connection, an iO Sense charger bridge, and the brush's retained session
+summary. It provides live timer, pressure, pacer and mode entities, keeps a
+persistent brushing log, and exposes supported battery, brush-head, display
+and charger diagnostics without using the Oral-B cloud.
 
 ## Contents
 
@@ -21,8 +21,7 @@ display and charger diagnostics without using the Oral-B cloud.
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Requirements](#requirements)
-- [Protocol findings](#protocol-findings)
-- [Full protocol reference](docs/protocol.md)
+- [Protocol reference](#protocol-reference)
 - [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
 
@@ -54,16 +53,12 @@ Home Assistant <--direct BLE notifications--> Toothbrush
      owns brush slot
 ```
 
-In charger/app-compatible mode, the integration discovers an iO Sense through
-its `A0F03E00` service, reads the charger's cached paired-brush identity, and
-matches the brush MAC to the existing config entry. No charger selection or
-manual pairing step is required. Unrelated iO Sense chargers are ignored.
-
-While the charger owns the brush connection, Home Assistant connects to the
-charger and uses its read-only `0x37` passthrough command. The charger remains
-the brush's BLE owner and its display continues to handle the session. The
-charger also forwards the brush's retained `FF29` session summary when it
-becomes available on a charger-managed connection.
+In charger/app-compatible mode, the integration discovers the paired iO Sense,
+matches its stored toothbrush identity to the existing config entry and ignores
+unrelated chargers. Home Assistant reads through that charger without taking
+over the toothbrush connection, so the charger display continues to handle the
+session. The same local path also retrieves the brush's retained session result
+when it becomes available.
 
 ## Connection options
 
@@ -76,28 +71,11 @@ Home Assistant leaves the toothbrush connection available to the iO Sense and
 phone app. When a paired iO Sense is present, it is used automatically as a
 local live-data bridge.
 
-During a session the bridge uses the measured production scheduler:
-
-- pressure (`FF0B`) is read every one-second tick;
-- timer (`FF08`) and pacer sector (`FF09`) alternate as the second read;
-- the configured pacer schedule (`FF26`) is read once at session start;
-- the displayed timer, pacer sector and sector timer advance locally at 1 Hz
-  between authoritative brush readings;
-- `FF09` corrects the locally advanced sector and sector timer whenever the
-  next charger response arrives;
-- mode and state are read at session start, with charger session state checked
-  periodically for an authoritative stop signal;
-- battery (`FF05`) is read at session start, every 30 seconds while brushing,
-  and immediately when the charger first reports the session idle;
-- supported session and display diagnostics are collected on
-  charger-managed idle connections, outside the live pressure path.
-
-This keeps the displayed timer and pacer sector responsive even when an
-individual charger request is slow. Pressure is normally refreshed every
-second and authoritative timer/pacer samples arrive every two seconds. A
-150-second real-session benchmark completed all 444 requests without a single
-failure. The measured p95 was 779 ms for pressure+timer and 808 ms for
-pressure+pacer.
+During a session, pressure normally refreshes every second. The displayed
+timer, pacer sector and sector timer also advance at one-second intervals and
+are regularly corrected by fresh values from the brush. Battery and other
+slower-changing diagnostics refresh when the charger can provide them without
+interrupting the live session.
 
 If no matching charger is available, the same option falls back automatically
 to passive brush advertisements and guarded post-session reads. There is no
@@ -105,27 +83,18 @@ additional user setting to manage.
 
 ### Home Assistant direct
 
-Home Assistant connects directly to the brush and subscribes to the vendor
-GATT characteristics. Timer, pressure, pacer, mode and state arrive at the
-brush's notification rate.
+Home Assistant connects directly to the brush. Timer, pressure, pacer, mode
+and state arrive at the brush's fastest available update rate.
 
 This is the highest-rate source, but Home Assistant owns the brush's single
 connection slot. The iO Sense display and phone app cannot use the brush at the
 same time.
 
-The direct connection subscribes to state (`FF04`), mode (`FF07`), timer
-(`FF08`), sector and sector timer (`FF09`) and pressure (`FF0B`)
-notifications, with battery (`FF05`) and smiley (`FF0A`) notifications where
-supported. It also reads the
-brush identity, pacer, available modes, brush-head remainder and display face
-when the connection is established.
-
 A connection acquired while the brush is docked remains active when brushing
-starts, so Home Assistant receives the entire session directly. The brush can
-drop an idle client after approximately 30 seconds; Oral-B Live reconnects
-automatically and uses a periodic retry as a backstop. The complete direct BLE
-characteristic and advertisement findings are preserved in the
-[protocol reference](docs/protocol.md#direct-toothbrush-ble).
+starts, so Home Assistant receives the entire session directly. Oral-B Live
+reconnects automatically if the brush releases an idle connection. The
+complete direct BLE characteristic and advertisement findings are preserved
+in the [protocol reference](docs/protocol.md#direct-toothbrush-ble).
 
 ## Comparison with Home Assistant's built-in Oral-B integration
 
@@ -142,7 +111,8 @@ different needs:
 | What matters to you | Home Assistant Oral-B | Oral-B Live |
 | --- | --- | --- |
 | Installation | Included with Home Assistant | Installed through HACS |
-| Live brushing | Time, pressure, pacer sector, mode and state when broadcast by the brush | Time, pressure, pacer sector, mode and state through the charger or a direct brush connection |
+| Live brushing | Time, pressure, timed pacer sector, mode and state when broadcast by the brush | The same card-compatible values through the charger or a direct brush connection |
+| Toothbrush Card mouth graphic | Displays the brush's sequential timed sector | Displays the same sequential timed sector; physical-position research is kept separate |
 | Completed-session summary | Not provided | Last session, duration and sessions today, retained across Home Assistant restarts |
 | Detailed session result | Not available | Actual duration, mode, target, pressure summary, ending battery and session ID where supported |
 | Battery | Percentage | Percentage plus estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
@@ -170,15 +140,15 @@ The state entity exposes the active `data_source` so the path is always visible:
 | Data source | Meaning |
 | --- | --- |
 | `charger_bridge` | Live reads forwarded locally through a matched iO Sense |
-| `direct_brush` | Direct GATT notifications from the toothbrush |
+| `direct_brush` | Live updates from a direct toothbrush connection |
 | `advertisement` | Passive manufacturer data from the toothbrush |
 
 Sources are selected automatically inside the chosen connection option.
 Entity IDs stay the same when the source changes.
 
 Completed sessions are saved immediately from the live or passive stream. The
-brush retains one authoritative `FF29` summary containing exact duration,
-mode, pressure totals, event counts and ending battery. Through the charger it
+brush retains one authoritative summary containing exact duration, mode,
+pressure totals, event counts and ending battery. Through the charger it
 becomes readable on the next charger-managed brush connection and refines the
 already-recorded session without counting it twice.
 The Last session entity records `source: retained_session` after this
@@ -198,34 +168,34 @@ reconciliation.
 | Pacer sector timer | Elapsed seconds in the current pacer interval while brushing; `unknown` outside an active session |
 | Pacer sector count | Configured pacer interval count |
 | Target duration | Sum of configured per-sector times |
-| Smiley | Brush display face from `FF0A` |
+| Smiley | Current brush display face |
 | Battery | Brush battery percentage |
 | Battery diagnostics | Estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
-| Brush-head diagnostics | Remaining days and brushing seconds from `FF2D` |
+| Brush-head diagnostics | Remaining days and brushing seconds where supported |
 | Last session | Timestamp plus complete session attributes |
 | Last session duration | Duration of the latest session |
 | Sessions today | Daily session counter, retained across restarts |
 
-The **Pacer sector** entity is the brush's configured timed prompt, not a measurement
-of the brush's physical position. It changes when the pacer advances, so a
-short session can remain on a single sector.
+The **Pacer sector** entity is the brush's configured timed prompt, not a
+measurement of the brush's physical position. It changes when the pacer
+advances, so a short session can remain on a single sector.
 
 The **Pacer sector timer** counts elapsed seconds within that pacer sector. In
 charger/app-compatible mode both pacer entities advance locally at 1 Hz from
-the brush's `FF26` schedule, while regular `FF09` reads correct them to the
+the brush's configured schedule, while regular brush reads correct them to the
 toothbrush's authoritative state.
 
-The Toothbrush Card discovers the compatibility key `sector` and draws this
-sequential pacer stage on its mouth graphic. That graphic is a pacer-progress
-visualization for Oral-B Live, not live mouth-position tracking. Actual mouth
-position is inferred by the Oral-B app from the high-rate `FF0D` motion stream
-with its proprietary Comino classifier; the brush and charger do not expose
-that classified result as a readable value.
+The entities used by Toothbrush Card deliberately retain the same meanings as
+Home Assistant's built-in Oral-B integration. In particular, the `sector`
+translation key always carries the brush's sequential timed pacer. Experimental
+physical-position diagnostics are disabled by default, remain separate and
+never replace the card-facing pacer value. Their status and limitations are
+documented in the [protocol reference](docs/protocol.md#motion-data-and-mouth-position-inference).
 
 The **Battery** entity keeps its last valid percentage across Home Assistant
-restarts and exposes `last_read` and `source` attributes. A fresh `FF05` value
-is preferred; the ending percentage from a new retained `FF29` session is used
-as a local fallback when the brush does not make `FF05` available.
+restarts and exposes `last_read` and `source` attributes. A fresh brush reading
+is preferred; the ending percentage from a newly retained session result is
+used as a local fallback when a current reading is unavailable.
 
 The **Last session** attributes can include:
 
@@ -305,7 +275,21 @@ Bluetooth adapter or proxy.
 ## Dashboard
 
 The main entities follow the structure expected by
-[toothbrush-card](https://github.com/Anrolosia/toothbrush-card):
+[Toothbrush Card](https://github.com/mtheli/toothbrush-card):
+
+| Card reading | Oral-B Live contract |
+| --- | --- |
+| State | `toothbrush_state` translation key |
+| Elapsed brushing time | `brushing_time` translation key and duration device class |
+| Mouth graphic | `sector` timed-pacer value |
+| Sector count | `number_of_sectors` translation key |
+| Pressure | `pressure` translation key |
+| Mode | `mode` translation key |
+| Battery | Battery device class |
+| Routine target | `routine_length` translation key, reported in seconds |
+
+Toothbrush Card 0.27.0 does not yet list the `oralb_live` domain in its visual
+device picker. An explicit device ID can use the generic entity mapping now:
 
 ```yaml
 type: custom:toothbrush-card
@@ -313,6 +297,12 @@ device_id: <your Oral-B Live device id>
 show_subtitle: true
 show_header: false
 ```
+
+For full visual-editor support, Toothbrush Card only needs to add
+`oralb_live: { translationKey: 'toothbrush_state' }` to its supported
+integrations. No physical-position or revisit handling is required: Oral-B
+Live intentionally presents the same sequential pacer semantics as the
+built-in Oral-B integration.
 
 A simple session log:
 
@@ -355,108 +345,24 @@ bluetooth_proxy:
   active: true
 ```
 
-## Protocol findings
+## Protocol reference
 
-All runtime communication is local. The protocol was reconstructed from local
-BLE captures and vendor application behaviour and verified on an iO Series 10
-with iO Sense firmware `0.3.4`.
-
-See [the full protocol reference](docs/protocol.md) for packet layouts, the
-charger command map, live-read captures, benchmark data, queue experiments and
-the boundary between verified behaviour and inference.
-
-### Toothbrush service
-
-The brush uses vendor service `A0F0FF00-5047-4D53-8208-4F72616C2D42`.
-
-| Characteristic | Content |
-| --- | --- |
-| `FF02` | Model, protocol and firmware identifiers |
-| `FF04` | Brush state |
-| `FF05` | Battery and supported electrical diagnostics |
-| `FF07` | Brushing mode |
-| `FF08` | Brushing timer (`[minutes, seconds]`) |
-| `FF09` | Sequential pacer sector, elapsed interval time and configured count |
-| `FF0A` | Display face / smiley |
-| `FF0B` | Pressure state, force and motor data |
-| `FF0D` | Motion and gyroscope snapshots |
-| `FF22` | Brush real-time clock |
-| `FF25` | Available modes |
-| `FF26` | Per-sector pacer times |
-| `FF29` | Retained last-session summary |
-| `FF2D` | Brush-head/refill remainder |
-
-### iO Sense service and passthrough
-
-The charger advertises service `A0F03E00-5047-4D53-8208-4F72616C2D42` with
-four characteristics:
-
-| Characteristic | Purpose |
-| --- | --- |
-| `A0F03C00` | Command headers and protocol delimiter |
-| `A0F03C01` | Charger data and passthrough responses |
-| `A0F03C02` | Command payloads |
-| `A0F03C03` | Command status acknowledgements |
-
-Read-only passthrough uses charger command `0x37`. A brush read request is:
-
-```text
-command: C1 37
-payload: UUID_LSB UUID_MSB 01 00
-end:     E0
-```
-
-The response contains the requested short UUID, read operation, success byte,
-payload length and raw brush data. Requests must be sent sequentially; combined
-multi-record requests are rejected by the tested firmware.
-
-### Retained session (`FF29`)
-
-The verified protocol 7/8 summary uses 21 bytes, little-endian:
-
-| Offset | Content |
-| --- | --- |
-| `0..3` | Session start on the brush clock |
-| `4..5` | Packed 13-bit session ID and 3-bit user ID |
-| `6..7` | Packed 13-bit target duration and 3-bit sector count |
-| `8..9` | Session duration in seconds |
-| `10..11` | High-pressure time in 100 ms units |
-| `12..13` | Low-pressure time in 100 ms units |
-| `14` | Average pressure in 100 mN units |
-| `15` | Maximum pressure in 100 mN units |
-| `16` | High-pressure event count |
-| `17` | Low-pressure event count |
-| `18` | Power-on event count |
-| `19` | Brushing mode |
-| `20` | Battery percentage at session end |
-
-The brush clock can drift. Absolute time is calculated relative to `FF22` read
-in the same connection: `wall_start = now - (rtc - session_timestamp)`.
-
-### Charger-native information
-
-The charger exposes local GET commands for Wi-Fi/internet/cloud status, RSSI,
-clock text and format, timezone, brightness, date-display mode, night-light
-mode, ring colour, firmware/hardware identity, uptime, touchpad state, brush
-policy and session state. `BRUSH_DATA` is paired-brush identity and firmware
-metadata—not brushing history.
-
-The iO Sense Wi-Fi connection is used for an outbound TLS/MQTT path. No local
-LAN API or locally enumerable durable session queue has been identified. Oral-B
-Live does not use cloud credentials, cloud session retrieval, MQTT redirection
-or certificate replacement.
+See [the full protocol reference](docs/protocol.md) for all UUIDs, packet
+layouts, charger commands, firmware formatting, captured benchmarks, queue and
+Wi-Fi experiments, motion research, safety boundaries and the distinction
+between captured, reconstructed and inferred behaviour. Protocol details are
+kept there rather than duplicated in this user guide.
 
 ## Known limitations
 
 - The toothbrush still has one BLE client slot. Home Assistant direct mode
   intentionally occupies it.
-- Charger passthrough is request/response, not a notification stream. Three
-  raw timer+pacer+pressure reads had a 1.141-second p95, so the integration uses
-  the verified two-read scheduler instead of claiming three raw 1 Hz reads.
-- The charger accepts passthrough only while it is connected to the brush.
-  Static diagnostics and `FF29` are collected opportunistically during those
-  managed connections.
-- The current session's exact `FF29` summary becomes available through the
+- The charger bridge is request/response rather than a notification stream, so
+  pressure is prioritised and slower-changing readings share the remaining
+  request time.
+- The charger can forward brush data only while it is connected to the brush.
+  Static diagnostics and retained results are collected opportunistically.
+- The current session's exact retained summary becomes available through the
   charger on its next brush connection. The immediate session record is built
   locally from the live stream and reconciled later.
 - The brush retains only its latest summary. The charger's richer durable
@@ -492,8 +398,8 @@ to leave the brush connection with the charger/app.
 ### Session details update later
 
 The immediate session is reconstructed locally. Exact pressure totals and
-ending battery come from `FF29` on the next managed connection and update the
-same session instead of creating a duplicate.
+ending battery come from the retained result on the next managed connection
+and update the same session instead of creating a duplicate.
 
 ### Entities remain unavailable
 
@@ -508,7 +414,7 @@ selection and read failures without exposing cloud credentials.
 - [Bluetooth-Devices/oralb-ble](https://github.com/Bluetooth-Devices/oralb-ble)
 - [Home Assistant Oral-B integration](https://www.home-assistant.io/integrations/oralb/)
 - [MatrixEditor/oralb-io](https://github.com/MatrixEditor/oralb-io)
-- [Anrolosia/toothbrush-card](https://github.com/Anrolosia/toothbrush-card)
+- [mtheli/toothbrush-card](https://github.com/mtheli/toothbrush-card)
 
 ## Disclaimer
 

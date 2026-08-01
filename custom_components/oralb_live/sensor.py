@@ -63,7 +63,9 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
     ),
     OralBSensorDescription(
         key="time",
-        translation_key="time",
+        # Toothbrush Card gives an explicit brushing-time key precedence over
+        # the integration's other duration-class diagnostics.
+        translation_key="brushing_time",
         name="Time",
         data_key="time",
         native_unit_of_measurement=UnitOfTime.SECONDS,
@@ -89,6 +91,32 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         data_key="sector",
     ),
     OralBSensorDescription(
+        key="mouth_sector",
+        translation_key="mouth_sector",
+        name="Mouth sector",
+        data_key="mouth_sector",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    OralBSensorDescription(
+        key="position",
+        translation_key="position",
+        name="Mouth position",
+        data_key="position",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    OralBSensorDescription(
+        key="position_confidence",
+        translation_key="position_confidence",
+        name="Mouth position confidence",
+        data_key="position_confidence",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    OralBSensorDescription(
         key="sector_timer",
         translation_key="sector_timer",
         name="Pacer sector timer",
@@ -105,8 +133,19 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     OralBSensorDescription(
+        key="position_model_status",
+        translation_key="position_model_status",
+        name="Position model status",
+        data_key="position_model_status",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    OralBSensorDescription(
         key="target_duration",
-        translation_key="target_duration",
+        # Toothbrush Card discovers a device's routine target through this
+        # translation key. The stable entity key/unique ID remains
+        # ``target_duration`` for existing installations.
+        translation_key="routine_length",
         name="Target duration",
         data_key="target_duration",
         native_unit_of_measurement=UnitOfTime.SECONDS,
@@ -205,6 +244,7 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         device_class=SensorDeviceClass.DURATION,
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
+        restore=True,
     ),
     OralBSensorDescription(
         key="refill_brushing_time",
@@ -215,6 +255,7 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         device_class=SensorDeviceClass.DURATION,
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
+        restore=True,
     ),
 )
 
@@ -413,11 +454,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             name=brush_device_name(self.coordinator.address, data.get("model_name")),
             manufacturer="Oral-B",
             model=data.get("model_name"),
-            sw_version=(
-                f"0x{data['firmware_revision']:02x}"
-                if data.get("firmware_revision") is not None
-                else None
-            ),
+            sw_version=data.get("firmware_version"),
             hw_version=(
                 f"BLE protocol {data['protocol_version']}"
                 if data.get("protocol_version") is not None
@@ -501,6 +538,14 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 for key, value in restored_attributes.items():
                     if value is not None and self.coordinator.data.get(key) is None:
                         self.coordinator.data[key] = value
+            elif self.entity_description.key in (
+                "refill_days",
+                "refill_brushing_time",
+            ):
+                for key in ("refill_state", "refill_state_raw"):
+                    value = last.attributes.get(key)
+                    if value is not None and self.coordinator.data.get(key) is None:
+                        self.coordinator.data[key] = value
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,
@@ -543,6 +588,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             identity = (
                 data.get("model_name"),
                 data.get("firmware_revision"),
+                data.get("firmware_version"),
                 data.get("protocol_version"),
             )
             if identity != self._last_device_identity and any(
@@ -558,11 +604,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                             self.coordinator.address, data.get("model_name")
                         ),
                         model=data.get("model_name"),
-                        sw_version=(
-                            f"0x{data['firmware_revision']:02x}"
-                            if data.get("firmware_revision") is not None
-                            else None
-                        ),
+                        sw_version=data.get("firmware_version"),
                         hw_version=(
                             f"BLE protocol {data['protocol_version']}"
                             if data.get("protocol_version") is not None
@@ -582,6 +624,9 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 "model_id": data.get("model_id"),
                 "protocol_version": data.get("protocol_version"),
                 "firmware_revision": data.get("firmware_revision"),
+                "firmware_version": data.get("firmware_version"),
+                "second_controller_version": data.get("second_controller_version"),
+                "media_content_version": data.get("media_content_version"),
             }
         elif self.entity_description.key == "mode":
             self._attr_extra_state_attributes = {
@@ -600,7 +645,22 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         elif self.entity_description.key == "sector":
             self._attr_extra_state_attributes = {
                 "sector_raw": data.get("sector_raw"),
-                "measurement_type": "pacer_interval",
+                "sector_timer_seconds": data.get("sector_timer"),
+                "measurement_type": "timed_pacer",
+                "sector_semantics": "timed_pacer",
+                "supports_revisits": False,
+            }
+        elif self.entity_description.key == "mouth_sector":
+            self._attr_extra_state_attributes = {
+                "measurement_type": (
+                    "motion_classifier_resampled"
+                    if data.get("position_model_status") == "streaming_charger"
+                    else "motion_classifier"
+                ),
+                "sector_semantics": "physical_position",
+                "supports_revisits": True,
+                "position": data.get("position"),
+                "confidence_percent": data.get("position_confidence"),
             }
         elif self.entity_description.key == "battery":
             self._attr_extra_state_attributes = {
@@ -614,6 +674,8 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         elif self.entity_description.key == "pressure":
             self._attr_extra_state_attributes = {
                 "force": data.get("pressure_force"),
+                "raw": data.get("pressure_raw"),
+                "source": data.get("data_source"),
             }
         elif self.entity_description.key in (
             "refill_days",

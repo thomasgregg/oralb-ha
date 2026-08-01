@@ -323,6 +323,12 @@ class IOSenseBridge:
                             identity_value["model_id"],
                             identity_value["protocol_version"],
                             identity_value["firmware_revision"],
+                            second_controller_version=identity_value.get(
+                                "second_controller_version"
+                            ),
+                            media_content_version=identity_value.get(
+                                "media_content_version"
+                            ),
                         )
                     self.address = address
                     self.data["address"] = address
@@ -506,6 +512,10 @@ class IOSenseBridge:
                 if not self._session_running:
                     self._session_running = True
                     self.parent._charger_session_started()
+                elif not self.parent._session_active:
+                    # Re-enter tracking after a reload or missed state edge
+                    # while the charger still reports the session as active.
+                    self.parent._charger_session_started()
                 self._ensure_live_task()
             elif packet.value in {"active_idle", "inactive"} and self._session_running:
                 self._session_running = False
@@ -530,13 +540,6 @@ class IOSenseBridge:
     async def _async_live_loop(self) -> None:
         tick = 0
         try:
-            # Refresh battery, then read the configured pacer so the independent
-            # 1 Hz ticker can predict boundaries before the first scheduled FF09.
-            for short_uuid in ("FF05", "FF26", "FF04", "FF07"):
-                if value := await self._async_passthrough(short_uuid):
-                    await self.parent._async_apply_charger_passthrough(
-                        short_uuid, value
-                    )
             while (
                 not self._stopping
                 and self._session_running
@@ -544,16 +547,44 @@ class IOSenseBridge:
                 and self._client.is_connected
             ):
                 started = time.monotonic()
+                position_capture = self.parent.position_capture_enabled
+                if position_capture and (
+                    motion := await self._async_passthrough("FF0D")
+                ):
+                    await self.parent._async_apply_charger_passthrough("FF0D", motion)
                 if pressure := await self._async_passthrough("FF0B"):
                     await self.parent._async_apply_charger_passthrough("FF0B", pressure)
 
-                if tick > 0 and tick % CHARGER_BATTERY_EVERY_TICKS == 0:
-                    second_uuid = "FF05"
-                else:
-                    second_uuid = "FF08" if tick % 2 == 0 else "FF09"
-                if second := await self._async_passthrough(second_uuid):
+                # When the optional local position model is available, motion
+                # and pressure take priority and slower values are sampled
+                # sparsely. Without that model, use the proven two-read card
+                # schedule: pressure plus alternating FF08/FF09 anchors.
+                auxiliary_uuid = None
+                if tick == 0:
+                    auxiliary_uuid = "FF05"
+                elif tick == 1:
+                    auxiliary_uuid = "FF26"
+                elif tick == 2:
+                    auxiliary_uuid = "FF07"
+                elif tick == 3:
+                    # Read brush-head lifetime once while the charger is
+                    # guaranteed to own the brush connection.  Waiting until
+                    # post-session cleanup is unreliable on chargers that
+                    # release the brush slot immediately.
+                    auxiliary_uuid = "FF2D"
+                elif tick > 0 and tick % CHARGER_BATTERY_EVERY_TICKS == 0:
+                    auxiliary_uuid = "FF05"
+                elif position_capture and (
+                    tick > 0 and tick % (CHARGER_SESSION_STATUS_EVERY_TICKS * 2) == 0
+                ):
+                    auxiliary_uuid = "FF08"
+                elif not position_capture:
+                    auxiliary_uuid = "FF08" if tick % 2 == 0 else "FF09"
+                if auxiliary_uuid and (
+                    auxiliary := await self._async_passthrough(auxiliary_uuid)
+                ):
                     await self.parent._async_apply_charger_passthrough(
-                        second_uuid, second
+                        auxiliary_uuid, auxiliary
                     )
 
                 if tick > 0 and tick % CHARGER_SESSION_STATUS_EVERY_TICKS == 0:

@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -95,7 +96,9 @@ from .const import (
     SYNC_RETRY_ATTEMPTS,
     SYNC_RETRY_DELAY_SECONDS,
     SYNC_STATES,
+    brush_firmware_version,
 )
+from .position import CominoSnapshotResampler, StreamingPositionClassifier
 from .protocol import (
     advance_pacer_progress,
     decode_charger_sector,
@@ -103,6 +106,7 @@ from .protocol import (
     derive_pacer_progress,
     parse_available_modes,
     parse_battery_status,
+    parse_comino_sensor_snapshot,
     parse_device_info,
     parse_pacer,
     parse_refill_remainder,
@@ -130,6 +134,7 @@ class OralBLiveCoordinator:
             "state_raw": None,
             "time": None,
             "pressure": None,
+            "pressure_raw": None,
             "mode": None,
             "mode_raw": None,
             "available_modes": None,
@@ -138,6 +143,10 @@ class OralBLiveCoordinator:
             "sector_raw": None,
             "sector_timer": None,
             "number_of_sectors": None,
+            "mouth_sector": None,
+            "position": None,
+            "position_confidence": None,
+            "position_model_status": "not_loaded",
             "sector_times": None,
             "target_duration": None,
             "smiley": None,
@@ -157,6 +166,9 @@ class OralBLiveCoordinator:
             "model_name": None,
             "protocol_version": None,
             "firmware_revision": None,
+            "firmware_version": None,
+            "second_controller_version": None,
+            "media_content_version": None,
             "rssi": None,
             "live": False,
             "connection_mode": mode,
@@ -190,6 +202,11 @@ class OralBLiveCoordinator:
         self._unsub_bluetooth: callback | None = None
         self._unsub_unavailable: callback | None = None
         self._stopping = False
+        self._position_load_task: asyncio.Task | None = None
+        self._position_worker_task: asyncio.Task | None = None
+        self._position_classifier: StreamingPositionClassifier | None = None
+        self._charger_motion_resampler = CominoSnapshotResampler()
+        self._dashboard_queue: asyncio.Queue | None = None
         # --- session tracking (live mode / passive adverts) ---
         self._session_active = False
         self._session_start: Any = None
@@ -199,6 +216,10 @@ class OralBLiveCoordinator:
         self._session_high_pressure = 0
         self._last_pressure: str | None = None
         self._pending_passive_sessions: list[Any] = []
+        # Keep session-edge tracking separate from the displayed last-known
+        # state.  A cached advertisement may seed the latter after restart,
+        # but must not consume the next genuine state transition.
+        self._tracked_state_raw: int | None = None
         # --- charger-priority sync state ---
         self._sync_task: asyncio.Task | None = None
         self._session_pending_sync = True  # seed on startup
@@ -212,11 +233,17 @@ class OralBLiveCoordinator:
         self._pacer_anchor: tuple[int, int, int] | None = None
         self._charger_session_record: bytes | None = None
         self._charger_session_rtc: bytes | None = None
+        self._charger_session_rtc_sampled_at: datetime | None = None
         self.charger: IOSenseBridge | None = (
             IOSenseBridge(self) if mode == CONNECTION_MODE_CHARGER else None
         )
         slug = address.replace(":", "").replace("-", "_").lower()
         self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{slug}")
+
+    @property
+    def position_capture_enabled(self) -> bool:
+        """Return whether the optional local position model is available."""
+        return self._position_classifier is not None
 
     # ------------------------------------------------------------------ setup
     @callback
@@ -235,9 +262,15 @@ class OralBLiveCoordinator:
         if service_info := bluetooth.async_last_service_info(
             self.hass, self.address, connectable=False
         ):
-            self._parse_advertisement(service_info)
+            # The cached packet can be several minutes old.  It is useful for
+            # identity and last-known values, but must never open a new local
+            # session after an integration reload.
+            self._parse_advertisement(service_info, track_session=False)
         if self.charger:
             self.charger.async_start()
+            self._position_load_task = self.hass.async_create_task(
+                self._async_load_local_position_classifier()
+            )
         if self.mode == CONNECTION_MODE_LIVE:
             # The brush stops advertising while a client (for example an
             # iO Sense charger) holds its single slot, so advertisements
@@ -250,12 +283,16 @@ class OralBLiveCoordinator:
             self._reconnect_task,
             self._sync_task,
             self._charger_tick_task,
+            self._position_load_task,
+            self._position_worker_task,
         ):
             if task:
                 task.cancel()
         self._reconnect_task = None
         self._sync_task = None
         self._charger_tick_task = None
+        self._position_load_task = None
+        self._position_worker_task = None
         if self._unsub_bluetooth:
             self._unsub_bluetooth()
             self._unsub_bluetooth = None
@@ -273,7 +310,12 @@ class OralBLiveCoordinator:
     ) -> None:
         self._parse_advertisement(service_info)
 
-    def _parse_advertisement(self, service_info: BluetoothServiceInfoBleak) -> None:
+    def _parse_advertisement(
+        self,
+        service_info: BluetoothServiceInfoBleak,
+        *,
+        track_session: bool = True,
+    ) -> None:
         payload = service_info.manufacturer_data.get(ORALB_MANUFACTURER_ID)
         if not payload or len(payload) < 11:
             return
@@ -285,7 +327,7 @@ class OralBLiveCoordinator:
             payload[ADV_IDX_FIRMWARE],
         )
         state_raw = payload[ADV_IDX_STATE]
-        self._apply_state(state_raw)
+        self._apply_state(state_raw, track_session=track_session)
         # While live notifications flow, they are fresher than adverts.
         if not self.data["live"]:
             self.data["data_source"] = DATA_SOURCE_ADVERTISEMENT
@@ -401,6 +443,7 @@ class OralBLiveCoordinator:
             client, CHAR_REFILL_REMAINDER, "refill remainder"
         )
         smiley = await self._async_sync_read(client, CHAR_SMILEY, "smiley")
+        pressure = await self._async_sync_read(client, CHAR_PRESSURE, "pressure")
         brushing_time = await self._async_sync_read(
             client, CHAR_BRUSH_TIME, "brushing time"
         )
@@ -411,6 +454,7 @@ class OralBLiveCoordinator:
         self._apply_available_modes(available_modes)
         self._apply_refill(refill)
         self._apply_smiley(smiley)
+        self._apply_pressure(pressure, DATA_SOURCE_DIRECT)
         if brushing_time is not None and len(brushing_time) >= 2:
             self.data["time"] = _decode_time(brushing_time[0], brushing_time[1])
 
@@ -434,10 +478,7 @@ class OralBLiveCoordinator:
                 payload[1] if len(payload) >= 2 else None,
             )
         elif uuid == CHAR_PRESSURE and payload:
-            self.data["pressure"] = PRESSURE_STATES.get(
-                payload[0], f"pressure_{payload[0]}"
-            )
-            self._track_session_pressure(self.data["pressure"])
+            self._apply_pressure(payload, DATA_SOURCE_DIRECT)
         elif uuid == CHAR_STATUS_BLOB:
             self._apply_battery_status(payload, DATA_SOURCE_DIRECT)
         elif uuid == CHAR_SMILEY:
@@ -463,6 +504,7 @@ class OralBLiveCoordinator:
         self._pacer_anchor = None
         self._apply_state(RUNNING_STATE)
         self._start_charger_ticker()
+        self._start_charger_position_capture()
         self._push()
 
     def _charger_session_ended(self) -> None:
@@ -473,6 +515,7 @@ class OralBLiveCoordinator:
         self._advance_charger_timer()
         self._cancel_charger_ticker()
         self._apply_state(quiet_state)
+        self._stop_charger_position_capture()
         self.data["live"] = False
         self._push()
 
@@ -502,12 +545,24 @@ class OralBLiveCoordinator:
         elif short_uuid == "FF0A":
             self._apply_smiley(raw)
         elif short_uuid == "FF0B" and raw:
-            self.data["pressure"] = PRESSURE_STATES.get(raw[0], f"pressure_{raw[0]}")
-            if len(raw) >= 5:
-                self.data["pressure_force"] = int.from_bytes(raw[3:5], "little")
-            self._track_session_pressure(self.data["pressure"])
+            self._apply_pressure(raw, DATA_SOURCE_CHARGER)
+        elif short_uuid == "FF0D":
+            try:
+                snapshot = parse_comino_sensor_snapshot(raw)
+            except ValueError as err:
+                _LOGGER.debug("%s: invalid charger FF0D snapshot: %s", self.name, err)
+            else:
+                records = self._charger_motion_resampler.add_snapshot(snapshot)
+                _LOGGER.debug(
+                    "%s: charger FF0D %s yielded %d resampled motion records",
+                    self.name,
+                    raw.hex(),
+                    len(records),
+                )
+                self._queue_position_records(records)
         elif short_uuid == "FF22" and len(raw) >= 4:
             self._charger_session_rtc = raw
+            self._charger_session_rtc_sampled_at = dt_util.utcnow()
         elif short_uuid == "FF25":
             self._apply_available_modes(raw)
         elif short_uuid == "FF26":
@@ -519,9 +574,16 @@ class OralBLiveCoordinator:
 
         if self._charger_session_record and self._charger_session_rtc:
             record, rtc = self._charger_session_record, self._charger_session_rtc
+            rtc_sampled_at = self._charger_session_rtc_sampled_at
             self._charger_session_record = None
             self._charger_session_rtc = None
-            if await self._async_apply_session_record(record, rtc) == "new":
+            self._charger_session_rtc_sampled_at = None
+            if (
+                await self._async_apply_session_record(
+                    record, rtc, rtc_sampled_at=rtc_sampled_at
+                )
+                == "new"
+            ):
                 self.data["last_session_source"] = DATA_SOURCE_SESSION
                 self._session_pending_sync = False
                 self._processed_session_generation = self._session_generation
@@ -567,6 +629,123 @@ class OralBLiveCoordinator:
                 self._push()
         except asyncio.CancelledError:
             pass
+
+    # --------------------------------------------- local position validation
+    async def _async_load_local_position_classifier(self) -> None:
+        """Load local validation assets without blocking Home Assistant's loop."""
+        model_directory = Path(__file__).with_name("models")
+        if not model_directory.is_dir():
+            self.data["position_model_status"] = "assets_missing"
+            self._push()
+            return
+
+        def _load() -> StreamingPositionClassifier:
+            from .local_comino import LocalCominoEnsemble
+
+            return StreamingPositionClassifier(LocalCominoEnsemble(model_directory))
+
+        self.data["position_model_status"] = "loading"
+        self._push()
+        try:
+            self._position_classifier = await self.hass.async_add_executor_job(_load)
+        except Exception as err:  # noqa: BLE001 - isolate optional native runtime
+            self.data["position_model_status"] = "load_failed"
+            _LOGGER.warning(
+                "%s: local position model failed to load: %s", self.name, err
+            )
+        else:
+            self.data["position_model_status"] = "ready"
+            _LOGGER.debug("%s: local position validation model ready", self.name)
+            if self.charger and self._session_active:
+                # The optional assets may finish loading after a session has
+                # already started. Start the queue/worker before the bridge
+                # begins prioritising FF0D reads.
+                self._start_charger_position_capture()
+        self._push()
+
+    def _start_charger_position_capture(self) -> None:
+        """Classify resampled FF0D motion while the charger owns the brush."""
+        classifier = self._position_classifier
+        if classifier is None:
+            return
+        if self._position_worker_task and not self._position_worker_task.done():
+            return
+        classifier.reset()
+        self._charger_motion_resampler.reset()
+        self._dashboard_queue = asyncio.Queue(maxsize=16)
+        self.data["position"] = "out_of_mouth"
+        self.data["mouth_sector"] = "no_sector"
+        self.data["position_confidence"] = 0.0
+        self.data["position_model_status"] = "streaming_charger"
+        self._position_worker_task = self.hass.async_create_task(
+            self._async_position_worker()
+        )
+        _LOGGER.debug("%s: charger FF0D position capture active", self.name)
+
+    def _stop_charger_position_capture(self) -> None:
+        """Stop bridge motion inference after the active session."""
+        if self._position_worker_task and not self._position_worker_task.done():
+            self._position_worker_task.cancel()
+        self._position_worker_task = None
+        self._dashboard_queue = None
+        self._charger_motion_resampler.reset()
+        if self._position_classifier:
+            self.data["position_model_status"] = "ready"
+            self.data["position"] = "out_of_mouth"
+            self.data["mouth_sector"] = "no_sector"
+            self.data["position_confidence"] = 0.0
+
+    def _queue_position_records(self, records: Any) -> None:
+        """Queue direct or charger-resampled IMU records for inference."""
+        if not records:
+            return
+        queue = self._dashboard_queue
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(records)
+        except asyncio.QueueFull:
+            _LOGGER.debug(
+                "%s: dropping motion records; classifier queue is full", self.name
+            )
+
+    async def _async_position_worker(self) -> None:
+        """Run the stateful classifier serially outside Home Assistant's loop."""
+        classifier = self._position_classifier
+        queue = self._dashboard_queue
+        if classifier is None or queue is None:
+            return
+        try:
+            while not self._stopping and self.charger and self._session_active:
+                records = await queue.get()
+                results = await self.hass.async_add_executor_job(
+                    classifier.add_records, records
+                )
+                for result in results:
+                    self.data["position"] = result.position
+                    self.data["position_confidence"] = round(result.confidence * 100, 1)
+                    self.data["mouth_sector"] = result.sector
+                if results:
+                    latest = results[-1]
+                    _LOGGER.debug(
+                        "%s: classified position %s (%s, %.1f%%)",
+                        self.name,
+                        latest.position,
+                        latest.sector,
+                        latest.confidence * 100,
+                    )
+                    self._push()
+        except asyncio.CancelledError:
+            pass
+        except Exception as err:  # noqa: BLE001 - isolate optional native runtime
+            # Stop prioritising motion immediately so the charger bridge falls
+            # back to the card-focused timer/sector schedule.
+            self._position_classifier = None
+            self._dashboard_queue = None
+            self._charger_motion_resampler.reset()
+            self.data["position_model_status"] = "inference_failed"
+            _LOGGER.warning("%s: position inference failed: %s", self.name, err)
+            self._push()
 
     # ------------------------------------------------- charger-priority sync
     def _maybe_schedule_sync(self) -> None:
@@ -686,6 +865,7 @@ class OralBLiveCoordinator:
                     client, CHAR_SESSION_DATA, "session record"
                 )
                 rtc = await self._async_sync_read(client, CHAR_RTC, "RTC")
+                rtc_sampled_at = dt_util.utcnow() if rtc is not None else None
                 status = await self._async_sync_read(client, CHAR_STATUS_BLOB, "status")
                 state = await self._async_sync_read(client, CHAR_STATE, "state")
                 smiley = await self._async_sync_read(client, CHAR_SMILEY, "smiley")
@@ -724,7 +904,9 @@ class OralBLiveCoordinator:
             self._apply_state(state[0])
         result = "missing"
         if record is not None:
-            result = await self._async_apply_session_record(record, rtc)
+            result = await self._async_apply_session_record(
+                record, rtc, rtc_sampled_at=rtc_sampled_at
+            )
         if any(
             value is not None
             for value in (
@@ -758,14 +940,19 @@ class OralBLiveCoordinator:
             return None
 
     async def _async_apply_session_record(
-        self, record: bytes | bytearray, rtc: bytes | bytearray | None
+        self,
+        record: bytes | bytearray,
+        rtc: bytes | bytearray | None,
+        *,
+        rtc_sampled_at: datetime | None = None,
     ) -> str:
         """Parse the ff29 last-session record and log new sessions.
 
         The brush clock drifts (observed ~8 days off wall time), so the
-        start time is derived RELATIVE to the RTC read in the same
-        connection: wall_start = now - (rtc - record_ts). The raw
-        record timestamp is used only for deduplication, persisted so
+        start time is derived RELATIVE to the matching RTC sample:
+        wall_start = wall_at_rtc_read - (rtc - record_ts). Keeping the wall
+        timestamp with the RTC also makes a delayed charger pair accurate.
+        The raw record timestamp is used only for deduplication, persisted so
         restarts do not double-count.
         """
         parsed = parse_session_record(record)
@@ -813,7 +1000,8 @@ class OralBLiveCoordinator:
         if rtc is not None and len(rtc) >= 4:
             rtc_now = int.from_bytes(rtc[0:4], "little")
         if rtc_now is not None and rtc_now >= session_ts:
-            start = dt_util.utcnow() - timedelta(seconds=rtc_now - session_ts)
+            wall_reference = rtc_sampled_at or dt_util.utcnow()
+            start = wall_reference - timedelta(seconds=rtc_now - session_ts)
         else:
             start = dt_util.utcnow()
 
@@ -903,8 +1091,8 @@ class OralBLiveCoordinator:
         return "new"
 
     # ---------------------------------------------------------- state maps
-    def _apply_state(self, raw: int) -> None:
-        previous = self.data.get("state_raw")
+    def _apply_state(self, raw: int, *, track_session: bool = True) -> None:
+        previous_tracked = self._tracked_state_raw
         self.data["state_raw"] = raw
         self.data["state"] = STATES.get(raw, f"unknown_state_{raw}")
 
@@ -913,20 +1101,27 @@ class OralBLiveCoordinator:
             if self.mode != CONNECTION_MODE_LIVE
             else {RUNNING_STATE}
         )
-        if raw in session_states and previous not in session_states:
-            self._begin_session()
-        elif raw not in session_states and previous in session_states:
-            self._end_session()
+        if track_session:
+            self._tracked_state_raw = raw
+            if raw in session_states and previous_tracked not in session_states:
+                self._begin_session()
+            elif raw not in session_states and previous_tracked in session_states:
+                self._end_session()
 
         if raw != RUNNING_STATE:
             self.data["sector"] = "no_sector"
             self.data["sector_timer"] = None
+            if self._position_classifier:
+                self.data["position"] = "out_of_mouth"
+                self.data["mouth_sector"] = "no_sector"
+                self.data["position_confidence"] = 0.0
             self._pacer_anchor = None
 
         if (
-            self.mode != CONNECTION_MODE_LIVE
+            track_session
+            and self.mode != CONNECTION_MODE_LIVE
             and raw in SESSION_SEEN_STATES
-            and previous not in SESSION_SEEN_STATES
+            and previous_tracked not in SESSION_SEEN_STATES
         ):
             self._session_generation += 1
             self._session_pending_sync = True
@@ -1142,7 +1337,13 @@ class OralBLiveCoordinator:
             )
 
     def _apply_device_identity(
-        self, model_id: int, protocol_version: int, firmware_revision: int
+        self,
+        model_id: int,
+        protocol_version: int,
+        firmware_revision: int,
+        *,
+        second_controller_version: int | None = None,
+        media_content_version: int | None = None,
     ) -> None:
         self.data["model_id"] = model_id
         self.data["model_name"] = MODEL_NAMES.get(
@@ -1150,10 +1351,22 @@ class OralBLiveCoordinator:
         )
         self.data["protocol_version"] = protocol_version
         self.data["firmware_revision"] = firmware_revision
+        if second_controller_version is not None:
+            self.data["second_controller_version"] = second_controller_version
+        if media_content_version is not None:
+            self.data["media_content_version"] = media_content_version
+        self.data["firmware_version"] = brush_firmware_version(
+            firmware_revision,
+            self.data.get("second_controller_version"),
+            self.data.get("media_content_version"),
+        )
 
     def _apply_pacer(self, payload: bytes | bytearray | None) -> None:
         if payload is not None:
-            self.data.update(parse_pacer(payload))
+            parsed = parse_pacer(payload)
+            if "number_of_sectors" in parsed:
+                self.data["number_of_sectors"] = parsed.pop("number_of_sectors")
+            self.data.update(parsed)
             self._update_pacer_progress()
 
     def _apply_available_modes(self, payload: bytes | bytearray | None) -> None:
@@ -1183,6 +1396,24 @@ class OralBLiveCoordinator:
         raw = payload[0]
         self.data["smiley_raw"] = raw
         self.data["smiley"] = SMILEYS.get(raw, f"face_{raw}")
+
+    def _apply_pressure(
+        self,
+        payload: bytes | bytearray | None,
+        source: str | None = None,
+    ) -> None:
+        """Apply a native FF0B sample from either a direct or bridge path."""
+        if not payload:
+            return
+        raw = bytes(payload)
+        self.data["pressure_raw"] = raw.hex()
+        self.data["pressure"] = PRESSURE_STATES.get(raw[0], f"pressure_{raw[0]}")
+        self.data["pressure_force"] = (
+            int.from_bytes(raw[3:5], "little") if len(raw) >= 5 else None
+        )
+        if source:
+            self.data["data_source"] = source
+        self._track_session_pressure(self.data["pressure"])
 
     # ------------------------------------------------------------- teardown
     async def _reconnect_loop(self) -> None:
