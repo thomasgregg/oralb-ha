@@ -261,6 +261,10 @@ CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS = 1.5
 # Poll the charger's native session state alongside the two-read live schedule.
 # Native status replies are short and provide an authoritative stop signal.
 CHARGER_SESSION_STATUS_EVERY_TICKS = 5
+# Battery changes slowly, so substitute it for one timer/pacer read every
+# 30 seconds. Pressure still remains at 1 Hz and the locally advanced timer
+# keeps moving while this current-value sample is collected.
+CHARGER_BATTERY_EVERY_TICKS = 30
 CHARGER_IDLE_DISCONNECT_SECONDS = 3.0
 CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS = 5.0
 CHARGER_IDLE_PROBE_INTERVAL_SECONDS = 5 * 60.0

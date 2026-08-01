@@ -87,8 +87,8 @@ During a session the bridge uses the measured production scheduler:
   next charger response arrives;
 - mode and state are read at session start, with charger session state checked
   periodically for an authoritative stop signal;
-- battery (`FF05`) is read at session start and first during every idle or
-  post-session refresh;
+- battery (`FF05`) is read at session start, every 30 seconds while brushing,
+  and immediately when the charger first reports the session idle;
 - supported session and display diagnostics are collected on
   charger-managed idle connections, outside the live pressure path.
 

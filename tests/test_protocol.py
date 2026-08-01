@@ -109,6 +109,7 @@ class ProtocolDecoderTests(unittest.TestCase):
             const.CHARGER_POST_SESSION_READS.index("FF05"),
             const.CHARGER_POST_SESSION_READS.index("FF29"),
         )
+        self.assertEqual(30, const.CHARGER_BATTERY_EVERY_TICKS)
 
     def test_pacer(self) -> None:
         self.assertEqual(

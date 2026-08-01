@@ -41,6 +41,7 @@ from .charger_protocol import (
 )
 from .const import (
     CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS,
+    CHARGER_BATTERY_EVERY_TICKS,
     CHARGER_BRIDGE_INTERVAL_SECONDS,
     CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS,
     CHARGER_IDLE_DISCONNECT_SECONDS,
@@ -546,7 +547,10 @@ class IOSenseBridge:
                 if pressure := await self._async_passthrough("FF0B"):
                     await self.parent._async_apply_charger_passthrough("FF0B", pressure)
 
-                second_uuid = "FF08" if tick % 2 == 0 else "FF09"
+                if tick > 0 and tick % CHARGER_BATTERY_EVERY_TICKS == 0:
+                    second_uuid = "FF05"
+                else:
+                    second_uuid = "FF08" if tick % 2 == 0 else "FF09"
                 if second := await self._async_passthrough(second_uuid):
                     await self.parent._async_apply_charger_passthrough(
                         second_uuid, second
@@ -579,10 +583,16 @@ class IOSenseBridge:
             return
 
         async def _release() -> None:
+            if not self._session_running:
+                # At active_idle the private charger-to-brush connection can
+                # still exist for only a brief window. Read FF05 first (via
+                # CHARGER_POST_SESSION_READS) before waiting to disconnect;
+                # delaying the read made the battery remain at its pre-session
+                # value on chargers that release the brush quickly.
+                await self._async_post_session_sync(force=True)
             await asyncio.sleep(CHARGER_IDLE_DISCONNECT_SECONDS)
             if not self._session_running:
-                await self._async_post_session_sync(force=True)
-            await self._async_disconnect()
+                await self._async_disconnect()
 
         self._disconnect_task = self.hass.async_create_task(_release())
 

@@ -396,6 +396,14 @@ All 13 reads completed sequentially in one active charger-managed session.
 That proves feature breadth, but the bridge is polled request/response rather
 than a notification-rate stream.
 
+In production the charger bridge reads `FF05` at session start and then every
+30 seconds in place of one alternating timer/pacer request. When native session
+state first changes to idle, `FF05` is also the first immediate passthrough
+read, before the charger disconnect delay. This matters because tested charger
+firmware stops forwarding brush reads shortly after it releases the private
+brush connection. Home Assistant retains the last valid percentage across
+restarts because a quiet, disconnected brush cannot provide a fresh `FF05`.
+
 ### Pressure payload
 
 The first `FF0B` byte is the pressure state:
