@@ -3,6 +3,8 @@
 [![HACS][hacs-badge]][hacs-url]
 [![Release][release-badge]][release-url]
 
+[![Open your Home Assistant instance and open Oral-B Live inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=thomasgregg&repository=oralb-ha&category=integration)
+
 **Local live brushing data for Oral-B iO toothbrushes and iO Sense chargers in Home Assistant.**
 
 Oral-B Live combines passive Bluetooth advertisements, direct toothbrush GATT
@@ -239,6 +241,11 @@ update settings.
 ## Installation
 
 ### HACS
+
+Use the **Open in HACS** button near the top of this page, then download
+**Oral-B Live** and restart Home Assistant.
+
+If the button is unavailable, add the repository manually:
 
 1. In HACS, open **Custom repositories**.
 2. Add `https://github.com/thomasgregg/oralb-ha` as an **Integration**.
