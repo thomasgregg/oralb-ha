@@ -105,6 +105,19 @@ This is the highest-rate source, but Home Assistant owns the brush's single
 connection slot. The iO Sense display and phone app cannot use the brush at the
 same time.
 
+The direct connection subscribes to state (`FF04`), mode (`FF07`), timer
+(`FF08`), sector (`FF09`) and pressure (`FF0B`) notifications, with battery
+(`FF05`) and smiley (`FF0A`) notifications where supported. It also reads the
+brush identity, pacer, available modes, brush-head remainder and display face
+when the connection is established.
+
+A connection acquired while the brush is docked remains active when brushing
+starts, so Home Assistant receives the entire session directly. The brush can
+drop an idle client after approximately 30 seconds; Oral-B Live reconnects
+automatically and uses a periodic retry as a backstop. The complete direct BLE
+characteristic and advertisement findings are preserved in the
+[protocol reference](docs/protocol.md#direct-toothbrush-ble).
+
 ## Comparison with Home Assistant's built-in Oral-B integration
 
 Home Assistant includes an official **Oral-B** integration. It is a good fit
@@ -124,7 +137,7 @@ Both integrations operate locally and neither requires the Oral-B cloud.
 | Live sector/zone | From toothbrush advertisements | Alternating charger reads, direct notifications or advertisements; supports up to eight sectors |
 | Brush state and mode | Yes | Yes, including the additional decoded iO values |
 | Battery percentage | Yes | Yes |
-| Battery diagnostics | No | Remaining brushing time, voltage, signed current and temperature where supported |
+| Battery diagnostics | No | Estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
 | Smiley/display face | No | Yes, from `FF0A` |
 | Target and pacer configuration | Sector count and sector timer from advertisements | Sector count, per-sector times and target duration from advertisements or brush reads |
 | Brush-head remainder | No | Remaining days and brushing seconds from `FF2D` |
@@ -178,7 +191,7 @@ reconciliation.
 | Target duration | Sum of configured per-sector times |
 | Smiley | Brush display face from `FF0A` |
 | Battery | Brush battery percentage |
-| Battery diagnostics | Remaining brushing time, voltage, current and temperature where supported |
+| Battery diagnostics | Estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
 | Brush-head diagnostics | Remaining days and brushing seconds from `FF2D` |
 | Last session | Timestamp plus complete session attributes |
 | Last session duration | Duration of the latest session |

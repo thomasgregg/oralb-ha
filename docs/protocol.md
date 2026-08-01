@@ -4,8 +4,9 @@ This document records the protocol evidence used by Oral-B Live. Runtime
 operation is entirely local: Home Assistant does not require an Oral-B
 account, cloud token, GraphQL request or internet connection.
 
-The implementation uses only read operations. It does not change charger
-display, lighting, Wi-Fi, update or brush configuration.
+The implementation performs only read-only data operations. Charger read
+requests require GATT command writes, but it does not change charger display,
+lighting, Wi-Fi, update or brush configuration.
 
 ## Verified architecture
 
@@ -30,6 +31,133 @@ Evidence in this reference is classified as:
 | Inferred | Best explanation consistent with captures, but not decrypted or directly exposed |
 
 The test pair was an iO Series 10 and iO Sense charger on firmware `0.3.4`.
+
+## Direct toothbrush BLE
+
+Home Assistant direct mode connects to the toothbrush itself. It is the
+highest-rate local path because changing values arrive as GATT notifications
+rather than sequential charger requests.
+
+### Connection lifecycle
+
+The tested toothbrush accepts one BLE client. While that slot is held by Home
+Assistant, an iO Sense or the phone app, the brush stops advertising. Other
+clients cannot discover or connect to it until the slot is released.
+
+When the slot is free, the brush advertises continuously while idle or
+charging and reports itself as connectable. A pending connection normally
+completes in under a second.
+
+Two captured behaviours shape direct mode:
+
+- A connection established while the brush is docked remains active when the
+  brush is picked up and used. State, timer, pressure, mode and zone
+  notifications continue through the session.
+- The brush can disconnect an idle client approximately 30 seconds after
+  activity stops. Oral-B Live reconnects immediately after that callback and
+  also retries every 30 seconds while it has no direct connection. A separate
+  stale-link watchdog rebuilds a connection that remains present but stops
+  delivering activity.
+
+Direct mode deliberately reacquires the brush slot. The charger display and
+phone app therefore cannot use the brush at the same time. The connection is
+released for sleeping and transport states.
+
+No pairing or bonding is required for the normal read/notify characteristics
+used by the integration.
+
+### Toothbrush vendor service
+
+The primary brush service is:
+
+`A0F0FF00-5047-4D53-8208-4F72616C2D42`
+
+| Characteristic | Access | Content |
+| --- | --- | --- |
+| `FF01` | read | Device MAC in byte-reversed wire order |
+| `FF02` | read | Model identifier, protocol version and firmware revision |
+| `FF04` | notify, read | Toothbrush state and substate |
+| `FF05` | notify, read | Battery percentage, estimated brushing runtime remaining and supported electrical diagnostics |
+| `FF06` | notify, read | Button state: none, power or mode |
+| `FF07` | notify, read | Brushing mode |
+| `FF08` | notify, read | Brushing timer as `[minutes, seconds]`, normally 1 Hz while running |
+| `FF09` | notify, read | Current sector/zone and configured sector information |
+| `FF0A` | notify, read | Smiley/display face |
+| `FF0B` | notify, read | Pressure state and, on protocol 8/9, pressure/motor fields |
+| `FF0C` | read, write, notify | Authentication-gated cache; not used |
+| `FF0D` | notify, read | Motion and gyroscope data, approximately 30 Hz |
+| `FF29` | read | Retained latest-session summary |
+
+The configuration service is:
+
+`A0F0FF20-5047-4D53-8208-4F72616C2D42`
+
+| Characteristic | Access | Content |
+| --- | --- | --- |
+| `FF21` | read, write, notify | Brush control/configuration channel; not written by Oral-B Live |
+| `FF22` | read, write | Brush real-time clock |
+| `FF25` | read, write | Available brushing modes |
+| `FF26` | read, write | Per-sector pacer times |
+| `FF2D` | read, write | Brush-head state, remaining days and brushing seconds |
+
+Service `A0F0FF80-5047-4D53-8208-4F72616C2D42` is the firmware-update channel.
+Its `FF81` command and `FF82` payload characteristics are not used.
+
+Although some characteristics permit writes, both integration modes use them
+only to obtain data or receive notifications; they do not write device
+settings.
+
+### Direct notification stream
+
+At connection setup, Oral-B Live subscribes to:
+
+- `FF04` state;
+- `FF07` mode;
+- `FF08` timer;
+- `FF09` sector/zone;
+- `FF0B` pressure;
+- optional `FF05` battery and `FF0A` smiley notifications.
+
+It also performs initial reads of `FF02`, `FF05`, `FF08`, `FF0A`, `FF25`,
+`FF26` and `FF2D`. These populate identity, battery diagnostics, current timer,
+display face, mode availability, target/pacer configuration and brush-head
+remainder without waiting for each value to change.
+
+`FF06` is the button characteristic, not pressure. Pressure is `FF0B`; its
+first byte is `0` low, `1` normal or `2` high. A captured protocol-8/9 payload
+also contains a timestamp, force, motor angle, motor target and identifier.
+Oral-B Live exposes the pressure state and, for charger-forwarded values, raw
+force as an attribute.
+
+`FF08` is elapsed time for the active brushing session. It is unrelated to the
+estimated battery runtime carried by `FF05`.
+
+For the observed direct `FF09` representation, the low three bits carry the
+sector value. Zero means no sector and `7` represents the configured last
+sector. Charger passthrough uses the zero-based representation documented
+under [Zone numbering](#zone-numbering).
+
+### Toothbrush advertisement
+
+The toothbrush also uses manufacturer ID `0x00DC`. Its 11-byte manufacturer
+value is:
+
+| Offset | Content |
+| --- | --- |
+| `0` | brush protocol version |
+| `1` | model identifier |
+| `2` | firmware revision |
+| `3` | state |
+| `4` | pressure/status flags |
+| `5..6` | brushing time as `[minutes, seconds]` |
+| `7` | brushing mode |
+| `8` | sector; low three bits contain the sector value |
+| `9` | sector timer |
+| `10` | configured number of sectors |
+
+Advertisements provide the passive fallback and are the data source used by
+Home Assistant's built-in Oral-B integration. They are unavailable while any
+client owns the toothbrush connection slot.
 
 ## iO Sense advertisement
 
@@ -183,7 +311,7 @@ not force the charger to establish that private connection.
 | UUID | Content | Captured result |
 | --- | --- | --- |
 | `FF04` | state | running state confirmed |
-| `FF05` | battery diagnostics | percentage, remaining time, voltage, signed current and temperature confirmed |
+| `FF05` | battery diagnostics | percentage, estimated brushing runtime remaining on the current charge, voltage, signed current and temperature confirmed |
 | `FF07` | brushing mode | live mode confirmed |
 | `FF08` | timer | `[minutes, seconds]` confirmed live |
 | `FF09` | zone | zero-based zone ID plus configured count confirmed live |
