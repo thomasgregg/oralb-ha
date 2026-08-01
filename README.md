@@ -253,10 +253,14 @@ update settings.
 
 [![Open your Home Assistant instance and open Oral-B Live inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=thomasgregg&repository=oralb-ha&category=integration)
 
-Use the button above, then download **Oral-B Live** and restart Home
-Assistant.
+Oral-B Live is included in the default HACS catalog. Use the button above or:
 
-If the button is unavailable, add the repository manually:
+1. In HACS, open **Integrations**.
+2. Search for **Oral-B Live**.
+3. Select **Download**.
+4. Restart Home Assistant.
+
+Alternatively, install it as a custom repository:
 
 1. In HACS, open **Custom repositories**.
 2. Add `https://github.com/thomasgregg/oralb-ha` as an **Integration**.
@@ -432,7 +436,7 @@ selection and read failures without exposing cloud credentials.
 Not affiliated with, endorsed by, or connected to Oral-B or Procter & Gamble.
 Protocol behaviour may differ across models and firmware.
 
-[hacs-badge]: https://img.shields.io/badge/HACS-Custom-41BDF5.svg
+[hacs-badge]: https://img.shields.io/badge/HACS-Default-41BDF5.svg
 [hacs-url]: https://github.com/hacs/integration
 [release-badge]: https://img.shields.io/github/v/release/thomasgregg/oralb-ha
 [release-url]: https://github.com/thomasgregg/oralb-ha/releases
