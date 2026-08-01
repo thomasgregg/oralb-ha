@@ -25,6 +25,7 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import (
     CONNECTION_BLUETOOTH,
     DeviceInfo,
@@ -84,13 +85,13 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
     OralBSensorDescription(
         key="sector",
         translation_key="sector",
-        name="Sector",
+        name="Pacer sector",
         data_key="sector",
     ),
     OralBSensorDescription(
         key="sector_timer",
         translation_key="sector_timer",
-        name="Sector timer",
+        name="Pacer sector timer",
         data_key="sector_timer",
         native_unit_of_measurement=UnitOfTime.SECONDS,
         device_class=SensorDeviceClass.DURATION,
@@ -99,7 +100,7 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
     OralBSensorDescription(
         key="number_of_sectors",
         translation_key="number_of_sectors",
-        name="Number of sectors",
+        name="Pacer sector count",
         data_key="number_of_sectors",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
@@ -151,6 +152,7 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         native_unit_of_measurement=PERCENTAGE,
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
+        restore=True,
     ),
     OralBSensorDescription(
         key="battery_time_remaining",
@@ -400,22 +402,25 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         self.coordinator = coordinator
         self.entity_description: OralBSensorDescription = description
         self._attr_unique_id = f"{coordinator.address}-{description.key}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, coordinator.address)},
-            connections={(CONNECTION_BLUETOOTH, coordinator.address)},
-            name=brush_device_name(
-                coordinator.address, coordinator.data.get("model_name")
-            ),
+        self._last_device_identity: tuple[Any, ...] | None = None
+        self._attr_device_info = self._device_info(coordinator.data)
+
+    def _device_info(self, data: dict[str, Any]) -> DeviceInfo:
+        """Build current toothbrush registry metadata."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.coordinator.address)},
+            connections={(CONNECTION_BLUETOOTH, self.coordinator.address)},
+            name=brush_device_name(self.coordinator.address, data.get("model_name")),
             manufacturer="Oral-B",
-            model=coordinator.data.get("model_name"),
+            model=data.get("model_name"),
             sw_version=(
-                f"0x{coordinator.data['firmware_revision']:02x}"
-                if coordinator.data.get("firmware_revision") is not None
+                f"0x{data['firmware_revision']:02x}"
+                if data.get("firmware_revision") is not None
                 else None
             ),
             hw_version=(
-                f"BLE protocol {coordinator.data['protocol_version']}"
-                if coordinator.data.get("protocol_version") is not None
+                f"BLE protocol {data['protocol_version']}"
+                if data.get("protocol_version") is not None
                 else None
             ),
         )
@@ -438,6 +443,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             elif (
                 self.entity_description.device_class is SensorDeviceClass.DURATION
                 or self.entity_description.key == "sessions_today"
+                or self.entity_description.key == "battery"
             ):
                 self._attr_native_value = int(float(last.state))
             else:
@@ -449,7 +455,17 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 self.coordinator.data[self.entity_description.data_key] = (
                     self._attr_native_value
                 )
-            if self.entity_description.key == "last_session":
+            if self.entity_description.key == "battery":
+                last_read = last.attributes.get("last_read")
+                self.coordinator.data["battery_updated_at"] = (
+                    dt_util.parse_datetime(last_read)
+                    if isinstance(last_read, str)
+                    else last_read
+                )
+                self.coordinator.data["battery_source"] = (
+                    last.attributes.get("source") or "restored"
+                )
+            elif self.entity_description.key == "last_session":
                 self._attr_extra_state_attributes = dict(last.attributes or {})
                 restored_attributes = {
                     "last_session_duration": last.attributes.get("duration_seconds"),
@@ -524,6 +540,35 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 "source": data.get("last_session_source"),
             }
         if self.entity_description.key == "toothbrush_state":
+            identity = (
+                data.get("model_name"),
+                data.get("firmware_revision"),
+                data.get("protocol_version"),
+            )
+            if identity != self._last_device_identity and any(
+                value is not None for value in identity
+            ):
+                self._attr_device_info = self._device_info(data)
+                if device := self.device_entry:
+                    self._last_device_identity = identity
+                    registry = dr.async_get(self.hass)
+                    registry.async_update_device(
+                        device.id,
+                        name=brush_device_name(
+                            self.coordinator.address, data.get("model_name")
+                        ),
+                        model=data.get("model_name"),
+                        sw_version=(
+                            f"0x{data['firmware_revision']:02x}"
+                            if data.get("firmware_revision") is not None
+                            else None
+                        ),
+                        hw_version=(
+                            f"BLE protocol {data['protocol_version']}"
+                            if data.get("protocol_version") is not None
+                            else None
+                        ),
+                    )
             self._attr_extra_state_attributes = {
                 "live_connection": data.get("live"),
                 "connection_mode": data.get("connection_mode"),
@@ -555,6 +600,12 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         elif self.entity_description.key == "sector":
             self._attr_extra_state_attributes = {
                 "sector_raw": data.get("sector_raw"),
+                "measurement_type": "pacer_interval",
+            }
+        elif self.entity_description.key == "battery":
+            self._attr_extra_state_attributes = {
+                "last_read": data.get("battery_updated_at"),
+                "source": data.get("battery_source"),
             }
         elif self.entity_description.key == "smiley":
             self._attr_extra_state_attributes = {
@@ -577,7 +628,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
     @property
     def available(self) -> bool:
         if self.entity_description.restore:
-            # Session history stays readable even when the brush is away.
+            # Restored values stay readable even when the brush is away.
             return True
         return self.coordinator.available
 

@@ -254,8 +254,8 @@ SIGNAL_CHARGER_UPDATE = f"{DOMAIN}_charger_update"
 # --- iO Sense bridge --------------------------------------------------------
 # A 150-second real-session benchmark completed 444/444 passthrough reads.
 # Three sequential reads had a 1.141 s p95, while pressure+timer and
-# pressure+zone stayed below 0.81 s p95. The production scheduler therefore
-# reads pressure every second and alternates timer/zone as the second read.
+# pressure+pacer stayed below 0.81 s p95. The production scheduler therefore
+# reads pressure every second and alternates timer/pacer as the second read.
 CHARGER_BRIDGE_INTERVAL_SECONDS = 1.0
 CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS = 1.5
 # Poll the charger's native session state alongside the two-read live schedule.
@@ -266,6 +266,21 @@ CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS = 5.0
 CHARGER_IDLE_PROBE_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SNAPSHOT_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SESSION_SYNC_INTERVAL_SECONDS = 60.0
+
+# Read values that remain useful in quiet states before optional retained
+# session fields. Some brush firmware rejects FF29 and FF22 until the retained
+# record has settled; those failures must not prevent battery or identity from
+# refreshing.
+CHARGER_POST_SESSION_READS = (
+    "FF05",
+    "FF02",
+    "FF0A",
+    "FF25",
+    "FF26",
+    "FF2D",
+    "FF29",
+    "FF22",
+)
 
 # --- Connection management (live mode) ---------------------------------------
 CONNECT_RETRIES = 3

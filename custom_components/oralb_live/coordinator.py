@@ -147,6 +147,8 @@ class OralBLiveCoordinator:
             "battery_voltage": None,
             "battery_current": None,
             "battery_temperature": None,
+            "battery_updated_at": None,
+            "battery_source": None,
             "refill_state": None,
             "refill_state_raw": None,
             "refill_days": None,
@@ -403,7 +405,7 @@ class OralBLiveCoordinator:
             client, CHAR_BRUSH_TIME, "brushing time"
         )
 
-        self._apply_battery_status(status)
+        self._apply_battery_status(status, DATA_SOURCE_DIRECT)
         self._apply_device_info(model_info)
         self._apply_pacer(pacer)
         self._apply_available_modes(available_modes)
@@ -437,7 +439,7 @@ class OralBLiveCoordinator:
             )
             self._track_session_pressure(self.data["pressure"])
         elif uuid == CHAR_STATUS_BLOB:
-            self._apply_battery_status(payload)
+            self._apply_battery_status(payload, DATA_SOURCE_DIRECT)
         elif uuid == CHAR_SMILEY:
             self._apply_smiley(payload)
         self._push()
@@ -483,8 +485,10 @@ class OralBLiveCoordinator:
         self.data["data_source"] = DATA_SOURCE_CHARGER
         if short_uuid == "FF04" and raw:
             self._apply_state(raw[0])
+        elif short_uuid == "FF02":
+            self._apply_device_info(raw)
         elif short_uuid == "FF05":
-            self._apply_battery_status(raw)
+            self._apply_battery_status(raw, DATA_SOURCE_CHARGER)
         elif short_uuid == "FF07" and raw:
             self._apply_mode(raw[0])
         elif short_uuid == "FF08" and len(raw) >= 2:
@@ -710,7 +714,7 @@ class OralBLiveCoordinator:
                     await client.disconnect()
                 except (BleakError, TimeoutError):
                     pass
-        self._apply_battery_status(status)
+        self._apply_battery_status(status, DATA_SOURCE_DIRECT)
         self._apply_smiley(smiley)
         self._apply_refill(refill)
         self._apply_device_info(model_info)
@@ -773,6 +777,13 @@ class OralBLiveCoordinator:
                 bytes(record).hex(" "),
             )
             return "invalid"
+        battery_end = parsed.get("battery_end")
+        if isinstance(battery_end, int):
+            # The retained record remains a useful last-known battery reading
+            # even when this session was already counted before a restart.
+            self.data["battery"] = battery_end
+            self.data["battery_updated_at"] = dt_util.utcnow()
+            self.data["battery_source"] = DATA_SOURCE_SESSION
         session_ts = int(parsed["session_timestamp"])
         duration = int(parsed["duration"])
         mode_raw = int(parsed["mode_raw"])
@@ -1041,9 +1052,7 @@ class OralBLiveCoordinator:
             self.data.get("number_of_sectors"),
         )
         self.data["sector"] = (
-            sector
-            if self.data.get("state_raw") == RUNNING_STATE
-            else "no_sector"
+            sector if self.data.get("state_raw") == RUNNING_STATE else "no_sector"
         )
         if self._session_active and quadrant is not None:
             self._session_sectors.add(quadrant)
@@ -1062,9 +1071,7 @@ class OralBLiveCoordinator:
             self.data.get("number_of_sectors"),
         )
         self.data["sector"] = (
-            sector
-            if self.data.get("state_raw") == RUNNING_STATE
-            else "no_sector"
+            sector if self.data.get("state_raw") == RUNNING_STATE else "no_sector"
         )
         if decoded_total:
             self.data["number_of_sectors"] = decoded_total
@@ -1111,9 +1118,17 @@ class OralBLiveCoordinator:
         self.data["sector"] = f"sector_{sector}"
         self.data["sector_timer"] = sector_timer
 
-    def _apply_battery_status(self, payload: bytes | bytearray | None) -> None:
+    def _apply_battery_status(
+        self,
+        payload: bytes | bytearray | None,
+        source: str | None = None,
+    ) -> None:
         if payload is not None:
-            self.data.update(parse_battery_status(payload))
+            parsed = parse_battery_status(payload)
+            self.data.update(parsed)
+            if "battery" in parsed:
+                self.data["battery_updated_at"] = dt_util.utcnow()
+                self.data["battery_source"] = source or self.data.get("data_source")
 
     def _apply_device_info(self, payload: bytes | bytearray | None) -> None:
         if payload is None:

@@ -45,6 +45,7 @@ from .const import (
     CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS,
     CHARGER_IDLE_DISCONNECT_SECONDS,
     CHARGER_IDLE_PROBE_INTERVAL_SECONDS,
+    CHARGER_POST_SESSION_READS,
     CHARGER_SESSION_STATUS_EVERY_TICKS,
     CHARGER_SESSION_SYNC_INTERVAL_SECONDS,
     CHARGER_SNAPSHOT_INTERVAL_SECONDS,
@@ -84,16 +85,6 @@ _CHARGER_DATA_KEYS: dict[ChargerCommand, str] = {
     ChargerCommand.BRUSH_PAIRED: "brush_paired",
     ChargerCommand.BRUSH_STATUS: "brush_status",
 }
-
-_POST_SESSION_READS = (
-    "FF29",
-    "FF22",
-    "FF05",
-    "FF0A",
-    "FF25",
-    "FF26",
-    "FF2D",
-)
 
 
 class IOSenseBridge:
@@ -302,11 +293,12 @@ class IOSenseBridge:
                 await client.start_notify(IOSENSE_STATUS_UUID, self._on_status)
                 if self.address is None:
                     identity = await self._async_get(ChargerCommand.BRUSH_DATA)
-                    paired_mac = (
-                        identity.value.get("brush_mac")
+                    identity_value = (
+                        identity.value
                         if identity and isinstance(identity.value, dict)
-                        else None
+                        else {}
                     )
+                    paired_mac = identity_value.get("brush_mac")
                     if normalize_mac(paired_mac or "") != normalize_mac(
                         self.parent.address
                     ):
@@ -318,6 +310,19 @@ class IOSenseBridge:
                         )
                         await self._async_disconnect()
                         return
+                    if all(
+                        identity_value.get(key) is not None
+                        for key in (
+                            "model_id",
+                            "protocol_version",
+                            "firmware_revision",
+                        )
+                    ):
+                        self.parent._apply_device_identity(
+                            identity_value["model_id"],
+                            identity_value["protocol_version"],
+                            identity_value["firmware_revision"],
+                        )
                     self.address = address
                     self.data["address"] = address
                     self._unsub_unavailable = bluetooth.async_track_unavailable(
@@ -376,26 +381,20 @@ class IOSenseBridge:
         if not self._session_running:
             await self._async_get(ChargerCommand.BRUSH_STATUS)
 
-    async def _async_post_session_sync(self) -> None:
+    async def _async_post_session_sync(self, *, force: bool = False) -> None:
         """Collect retained brush data while the charger still owns the slot."""
-        if (
+        if not force and (
             time.monotonic() - self._last_session_sync_monotonic
             < CHARGER_SESSION_SYNC_INTERVAL_SECONDS
         ):
             return
         successful = 0
-        failed = 0
-        for short_uuid in _POST_SESSION_READS:
+        for short_uuid in CHARGER_POST_SESSION_READS:
             if self._stopping or self._session_running:
                 return
             if value := await self._async_passthrough(short_uuid):
                 await self.parent._async_apply_charger_passthrough(short_uuid, value)
                 successful += 1
-                failed = 0
-            else:
-                failed += 1
-                if failed >= 2:
-                    break
         if successful:
             self._last_session_sync_monotonic = time.monotonic()
 
@@ -530,9 +529,9 @@ class IOSenseBridge:
     async def _async_live_loop(self) -> None:
         tick = 0
         try:
-            # Read the configured pacer first so the independent 1 Hz ticker
-            # can predict sector boundaries before the first scheduled FF09.
-            for short_uuid in ("FF26", "FF04", "FF07"):
+            # Refresh battery, then read the configured pacer so the independent
+            # 1 Hz ticker can predict boundaries before the first scheduled FF09.
+            for short_uuid in ("FF05", "FF26", "FF04", "FF07"):
                 if value := await self._async_passthrough(short_uuid):
                     await self.parent._async_apply_charger_passthrough(
                         short_uuid, value
@@ -581,6 +580,8 @@ class IOSenseBridge:
 
         async def _release() -> None:
             await asyncio.sleep(CHARGER_IDLE_DISCONNECT_SECONDS)
+            if not self._session_running:
+                await self._async_post_session_sync(force=True)
             await self._async_disconnect()
 
         self._disconnect_task = self.hass.async_create_task(_release())

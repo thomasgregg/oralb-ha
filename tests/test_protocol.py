@@ -103,6 +103,13 @@ class ProtocolDecoderTests(unittest.TestCase):
         self.assertEqual(const.STATES[116], "transport")
         self.assertEqual(const.RELEASE_STATES, {115, 116})
 
+    def test_charger_refreshes_current_values_before_retained_session(self) -> None:
+        self.assertEqual(("FF05", "FF02"), const.CHARGER_POST_SESSION_READS[:2])
+        self.assertLess(
+            const.CHARGER_POST_SESSION_READS.index("FF05"),
+            const.CHARGER_POST_SESSION_READS.index("FF29"),
+        )
+
     def test_pacer(self) -> None:
         self.assertEqual(
             protocol.parse_pacer(bytes([30, 30, 30, 30, 0, 0, 0, 0])),
@@ -199,6 +206,12 @@ class ProtocolDecoderTests(unittest.TestCase):
         self.assertEqual(4, parsed["mode_raw"])
         self.assertEqual(94, parsed["battery_end"])
 
+    def test_session_record_ignores_unknown_battery(self) -> None:
+        parsed = protocol.parse_session_record(
+            bytes.fromhex("26e4ff3161017800800064000a00132128020104ff")
+        )
+        self.assertNotIn("battery_end", parsed)
+
 
 class ChargerProtocolTests(unittest.TestCase):
     """Exercise captured iO Sense packets and read-only frame builders."""
@@ -237,6 +250,7 @@ class ChargerProtocolTests(unittest.TestCase):
         )
         value = charger_protocol.decode_charger_read(raw).value
         self.assertEqual("58:26:3A:F6:64:D3", value["brush_mac"])
+        self.assertEqual(54, value["model_id"])
         self.assertEqual(8, value["protocol_version"])
         self.assertEqual(82, value["firmware_revision"])
 

@@ -166,7 +166,7 @@ def parse_session_record(payload: bytes | bytearray) -> dict[str, int | float]:
         "on_events": payload[18],
         "mode_raw": payload[19],
     }
-    if len(payload) >= 21:
+    if len(payload) >= 21 and payload[20] <= 100:
         result["battery_end"] = payload[20]
     return result
 
@@ -190,7 +190,7 @@ def decode_sector(
 def decode_charger_sector(
     raw: int, total: int | None, configured_total: int | None
 ) -> tuple[str, int | None, int | None]:
-    """Decode the zero-based FF09 zone returned by charger passthrough."""
+    """Decode the zero-based FF09 pacer sector returned by charger passthrough."""
     decoded_total = total if total and 1 <= total <= 8 else configured_total
     if raw == 0xF0:
         return "no_sector", None, decoded_total

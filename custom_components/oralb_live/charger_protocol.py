@@ -193,6 +193,7 @@ def _brush_data(payload: bytes) -> dict[str, Any]:
     if len(payload) >= 7:
         result["brush_mac"] = ":".join(f"{value:02X}" for value in payload[1:7])
     if len(payload) > 40:
+        result["model_id"] = payload[16]
         result["protocol_version"] = payload[39]
         result["firmware_revision"] = payload[40]
     return result

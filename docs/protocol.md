@@ -84,7 +84,7 @@ The primary brush service is:
 | `FF06` | notify, read | Button state: none, power or mode |
 | `FF07` | notify, read | Brushing mode |
 | `FF08` | notify, read | Brushing timer as `[minutes, seconds]`, normally 1 Hz while running |
-| `FF09` | notify, read | Current sector/zone, elapsed sector seconds and configured sector information |
+| `FF09` | notify, read | Sequential pacer sector, elapsed interval seconds and configured sector count |
 | `FF0A` | notify, read | Smiley/display face |
 | `FF0B` | notify, read | Pressure state and, on protocol 8/9, pressure/motor fields |
 | `FF0C` | read, write, notify | Authentication-gated cache; not used |
@@ -117,7 +117,7 @@ At connection setup, Oral-B Live subscribes to:
 - `FF04` state;
 - `FF07` mode;
 - `FF08` timer;
-- `FF09` sector/zone;
+- `FF09` pacer sector;
 - `FF0B` pressure;
 - optional `FF05` battery and `FF0A` smiley notifications.
 
@@ -170,12 +170,34 @@ reads. Unknown future values remain visible as their raw face number.
 estimated battery runtime carried by `FF05`.
 
 For the observed direct `FF09` representation, the low three bits carry the
-sector value. Zero means no sector and `7` represents the configured last
+pacer-sector value. Zero means no sector and `7` represents the configured last
 sector. Charger passthrough uses the zero-based representation documented
-under [Zone numbering](#zone-numbering). The sector is the brush's configured
+under [Pacer numbering](#pacer-numbering). The sector is the brush's configured
 pacer prompt, not a spatial measurement of where the brush is in the mouth.
 It normally notifies only when the pacer advances at the intervals configured
 through `FF26`; a short session can therefore report only one sector.
+
+### Motion data and mouth-position inference
+
+`FF0D` contains raw inertial samples, not a zone identifier. The normal
+20-byte form carries four samples of `[uint16 timestamp, int8 x, int8 y,
+int8 z]`. The captured Comino form carries two samples with three additional
+signed gyroscope axes per sample and a format trailer. Direct notifications
+provide the continuous high-rate stream; a charger passthrough read returns
+only the current snapshot.
+
+The vendor app feeds this stream into its bundled Comino GRU3/GRU6 native
+classifier and maps the classifier output to anatomical zones such as upper
+right outside, lower left inside and out of mouth. The iO Sense command set
+does not include a processed Comino-zone result. Its brush-passthrough API has
+only read and write operations—there is no forwarded-notification operation—
+so Home Assistant's request/response bridge cannot obtain a continuous
+classifier input at the direct notification rate.
+
+Consequently Oral-B Live exposes `FF09` as **Pacer sector** and does not label
+it as physical position. Adding reliable mouth-position tracking requires an
+open classifier trained for these sensor samples and a sufficiently complete
+continuous stream; a timer-based or single-snapshot guess would be misleading.
 
 On the tested direct connection, `FF29` changed within seconds of a completed
 session and the latest record was anonymously readable without first issuing
@@ -360,7 +382,7 @@ not force the charger to establish that private connection.
 | `FF05` | battery diagnostics | percentage, estimated brushing runtime remaining on the current charge, voltage, signed current and temperature confirmed |
 | `FF07` | brushing mode | live mode confirmed |
 | `FF08` | timer | `[minutes, seconds]` confirmed live |
-| `FF09` | zone | zero-based zone ID, elapsed sector timer and configured count confirmed live |
+| `FF09` | pacer sector | zero-based interval ID, elapsed sector timer and configured count confirmed live |
 | `FF0A` | brush display face/smiley | values through `special_10` confirmed |
 | `FF0B` | pressure/motor | pressure state, timestamp, force and motor fields confirmed live |
 | `FF0D` | motion | motion and gyroscope snapshots confirmed; not exposed as an HA entity |
@@ -388,13 +410,13 @@ The integration also exposes the captured force word as an attribute. Motor
 and motion fields are decoded by the research tooling but are not separate HA
 entities.
 
-### Zone numbering
+### Pacer numbering
 
 Direct toothbrush notifications and charger passthrough use different
-presentation rules in the observed payloads. Charger `FF09` zone IDs are
+presentation rules in the observed payloads. Charger `FF09` pacer IDs are
 zero-based: raw `0` is `sector_1`, raw `3` is `sector_4`, and `0xFF` denotes
 the configured last sector. `0xF0` means that no sector is defined. The
-three-byte value is `[zone, elapsed sector seconds, configured zone count]`.
+three-byte value is `[sector, elapsed sector seconds, configured sector count]`.
 Oral-B Live advances this pacer state locally from the `FF26` schedule between
 reads and treats each `FF09` response as an authoritative correction.
 
@@ -429,8 +451,8 @@ derived two-read timings are:
 | pressure + zone | 662.129 ms | 808.012 ms | 899.585 ms |
 
 Oral-B Live therefore reads pressure every one-second tick and alternates
-timer and zone as the second read. A separate local 1 Hz ticker advances the
-displayed timer, pacer zone and elapsed zone time independently of BLE request
+timer and pacer sector as the second read. A separate local 1 Hz ticker advances the
+displayed timer, pacer sector and elapsed sector time independently of BLE request
 latency; `FF08` and `FF09` remain the authoritative correction anchors.
 Charger-native session state is checked periodically to provide an explicit
 stop signal.

@@ -7,7 +7,7 @@
 
 Oral-B Live combines passive Bluetooth advertisements, direct toothbrush GATT
 notifications, iO Sense charger passthrough reads, and the brush's retained
-session summary. It provides live timer, pressure, zone and mode entities,
+session summary. It provides live timer, pressure, pacer and mode entities,
 keeps a persistent brushing log, and exposes supported battery, brush-head,
 display and charger diagnostics without using the Oral-B cloud.
 
@@ -79,7 +79,7 @@ local live-data bridge.
 During a session the bridge uses the measured production scheduler:
 
 - pressure (`FF0B`) is read every one-second tick;
-- timer (`FF08`) and zone (`FF09`) alternate as the second read;
+- timer (`FF08`) and pacer sector (`FF09`) alternate as the second read;
 - the configured pacer schedule (`FF26`) is read once at session start;
 - the displayed timer, pacer sector and sector timer advance locally at 1 Hz
   between authoritative brush readings;
@@ -87,15 +87,17 @@ During a session the bridge uses the measured production scheduler:
   next charger response arrives;
 - mode and state are read at session start, with charger session state checked
   periodically for an authoritative stop signal;
-- supported session, battery and display diagnostics are collected on
+- battery (`FF05`) is read at session start and first during every idle or
+  post-session refresh;
+- supported session and display diagnostics are collected on
   charger-managed idle connections, outside the live pressure path.
 
 This keeps the displayed timer and pacer sector responsive even when an
 individual charger request is slow. Pressure is normally refreshed every
-second and authoritative timer/zone samples arrive every two seconds. A
+second and authoritative timer/pacer samples arrive every two seconds. A
 150-second real-session benchmark completed all 444 requests without a single
 failure. The measured p95 was 779 ms for pressure+timer and 808 ms for
-pressure+zone.
+pressure+pacer.
 
 If no matching charger is available, the same option falls back automatically
 to passive brush advertisements and guarded post-session reads. There is no
@@ -104,7 +106,7 @@ additional user setting to manage.
 ### Home Assistant direct
 
 Home Assistant connects directly to the brush and subscribes to the vendor
-GATT characteristics. Timer, pressure, zone, mode and state arrive at the
+GATT characteristics. Timer, pressure, pacer, mode and state arrive at the
 brush's notification rate.
 
 This is the highest-rate source, but Home Assistant owns the brush's single
@@ -140,7 +142,7 @@ different needs:
 | What matters to you | Home Assistant Oral-B | Oral-B Live |
 | --- | --- | --- |
 | Installation | Included with Home Assistant | Installed through HACS |
-| Live brushing | Time, pressure, sector, mode and state when broadcast by the brush | Time, pressure, sector, mode and state through the charger or a direct brush connection |
+| Live brushing | Time, pressure, pacer sector, mode and state when broadcast by the brush | Time, pressure, pacer sector, mode and state through the charger or a direct brush connection |
 | Completed-session summary | Not provided | Last session, duration and sessions today, retained across Home Assistant restarts |
 | Detailed session result | Not available | Actual duration, mode, target, pressure summary, ending battery and session ID where supported |
 | Battery | Percentage | Percentage plus estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
@@ -192,9 +194,9 @@ reconciliation.
 | Time | Current brushing duration; locally advanced between charger timer anchors |
 | Pressure | `low`, `normal` or `high`; charger reads also expose raw force as an attribute |
 | Mode | Daily clean, sensitive, gum care, whiten, intense, super sensitive, tongue clean, Smart Adapt, gentle white and supported unknown values |
-| Sector | Current pacer sector (`sector_1` … `sector_8`), advanced locally from the configured schedule and corrected by the brush |
-| Sector timer | Elapsed seconds in the current pacer sector while brushing; `unknown` outside an active session |
-| Number of sectors | Configured pacer sector count |
+| Pacer sector | Current sequential pacer interval (`sector_1` … `sector_8`), advanced locally from the configured schedule and corrected by the brush |
+| Pacer sector timer | Elapsed seconds in the current pacer interval while brushing; `unknown` outside an active session |
+| Pacer sector count | Configured pacer interval count |
 | Target duration | Sum of configured per-sector times |
 | Smiley | Brush display face from `FF0A` |
 | Battery | Brush battery percentage |
@@ -204,14 +206,26 @@ reconciliation.
 | Last session duration | Duration of the latest session |
 | Sessions today | Daily session counter, retained across restarts |
 
-The **Sector** entity is the brush's configured pacer prompt, not a measurement
+The **Pacer sector** entity is the brush's configured timed prompt, not a measurement
 of the brush's physical position. It changes when the pacer advances, so a
 short session can remain on a single sector.
 
-The **Sector timer** counts elapsed seconds within that pacer sector. In
+The **Pacer sector timer** counts elapsed seconds within that pacer sector. In
 charger/app-compatible mode both pacer entities advance locally at 1 Hz from
 the brush's `FF26` schedule, while regular `FF09` reads correct them to the
 toothbrush's authoritative state.
+
+The Toothbrush Card discovers the compatibility key `sector` and draws this
+sequential pacer stage on its mouth graphic. That graphic is a pacer-progress
+visualization for Oral-B Live, not live mouth-position tracking. Actual mouth
+position is inferred by the Oral-B app from the high-rate `FF0D` motion stream
+with its proprietary Comino classifier; the brush and charger do not expose
+that classified result as a readable value.
+
+The **Battery** entity keeps its last valid percentage across Home Assistant
+restarts and exposes `last_read` and `source` attributes. A fresh `FF05` value
+is preferred; the ending percentage from a new retained `FF29` session is used
+as a local fallback when the brush does not make `FF05` available.
 
 The **Last session** attributes can include:
 
@@ -362,13 +376,13 @@ The brush uses vendor service `A0F0FF00-5047-4D53-8208-4F72616C2D42`.
 | `FF05` | Battery and supported electrical diagnostics |
 | `FF07` | Brushing mode |
 | `FF08` | Brushing timer (`[minutes, seconds]`) |
-| `FF09` | Zero-based pacer zone plus configured zone count |
+| `FF09` | Sequential pacer sector, elapsed interval time and configured count |
 | `FF0A` | Display face / smiley |
 | `FF0B` | Pressure state, force and motor data |
 | `FF0D` | Motion and gyroscope snapshots |
 | `FF22` | Brush real-time clock |
 | `FF25` | Available modes |
-| `FF26` | Per-zone pacer times |
+| `FF26` | Per-sector pacer times |
 | `FF29` | Retained last-session summary |
 | `FF2D` | Brush-head/refill remainder |
 
@@ -437,7 +451,7 @@ or certificate replacement.
 - The toothbrush still has one BLE client slot. Home Assistant direct mode
   intentionally occupies it.
 - Charger passthrough is request/response, not a notification stream. Three
-  raw timer+zone+pressure reads had a 1.141-second p95, so the integration uses
+  raw timer+pacer+pressure reads had a 1.141-second p95, so the integration uses
   the verified two-read scheduler instead of claiming three raw 1 Hz reads.
 - The charger accepts passthrough only while it is connected to the brush.
   Static diagnostics and `FF29` are collected opportunistically during those
