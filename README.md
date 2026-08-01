@@ -120,35 +120,35 @@ characteristic and advertisement findings are preserved in the
 
 ## Comparison with Home Assistant's built-in Oral-B integration
 
-Home Assistant includes an official **Oral-B** integration. It is a good fit
-when the brush advertises all the values you need and you want a small,
-primarily passive set of entities. Oral-B Live is intended for iO setups that
-need charger-mediated or direct live data, retained session results and the
-additional brush and charger diagnostics documented here.
+Home Assistant already includes an official **Oral-B** integration. Both
+integrations work locally without the Oral-B cloud, but they are intended for
+different needs:
 
-Both integrations operate locally and neither requires the Oral-B cloud.
+- Choose **Home Assistant Oral-B** if you want the integration included with
+  Home Assistant and only need basic live toothbrush information.
+- Choose **Oral-B Live** if you use an iO Sense charger, want completed-session
+  history, need the additional brush diagnostics, or want to choose whether
+  Home Assistant or the charger/app owns the brush connection.
 
-| Capability | Home Assistant Oral-B | Oral-B Live |
+| What matters to you | Home Assistant Oral-B | Oral-B Live |
 | --- | --- | --- |
-| Primary data path | Passive toothbrush advertisements, with an active battery poll when needed | Automatic charger bridge, direct brush notifications or passive advertisements, depending on the selected option and availability |
-| Connection choices | No user-selectable connection mode | Charger/app compatible or Home Assistant direct |
-| Live brushing time | From the values present in toothbrush advertisements | Through iO Sense passthrough, direct brush notifications or advertisements; charger mode advances time between authoritative reads |
-| Live pressure | From toothbrush advertisements | Every one-second charger tick, direct notifications or advertisements |
-| Live sector/zone | From toothbrush advertisements | Alternating charger reads, direct notifications or advertisements; supports up to eight sectors |
-| Brush state and mode | Yes | Yes, including the additional decoded iO values |
-| Battery percentage | Yes | Yes |
-| Battery diagnostics | No | Estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
-| Smiley/display face | No | Yes, from `FF0A` |
-| Target and pacer configuration | Sector count and sector timer from advertisements | Sector count, per-sector times and target duration from advertisements or brush reads |
-| Brush-head remainder | No | Remaining days and brushing seconds from `FF2D` |
-| Last-session history | No | Last session, duration and sessions today, restored across HA restarts |
-| Exact retained session | No | `FF29` duration, mode, target, session ID, pressure events/times, average/maximum pressure and ending battery |
-| Session reconciliation | No session log to reconcile | Live/passive record is refined by `FF29` without double-counting |
-| iO Sense identification | No | Automatically matches the charger to its paired brush by MAC address |
-| iO Sense entities | No | Separate charger device with session, Wi-Fi, cloud transport, clock, display, light and policy diagnostics |
-| Active source visibility | No | `data_source` reports `charger_bridge`, `direct_brush` or `advertisement`; the last-session `source` attribute identifies retained summaries |
-| Brush connection slot | Normally remains free apart from a brief poll | Remains with the charger/app in compatible mode; intentionally owned by HA in direct mode |
-| Writes device settings | No | No; charger and brush access is read-only |
+| Installation | Included with Home Assistant | Installed through HACS |
+| Live brushing | Time, pressure, sector, mode and state when broadcast by the brush | Time, pressure, sector, mode and state through the charger or a direct brush connection |
+| Completed-session summary | Not provided | Last session, duration and sessions today, retained across Home Assistant restarts |
+| Detailed session result | Not available | Actual duration, mode, target, pressure summary, ending battery and session ID where supported |
+| Battery | Percentage | Percentage plus estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
+| Additional brush information | Basic toothbrush information | Smiley, brush-head remainder, pacer setup, target duration and additional iO modes |
+| iO Sense charger | Not exposed | Separate charger device with connection, display, light, clock, Wi-Fi and transport diagnostics |
+| Works while using the Oral-B app or charger display | Normally, because it mainly listens for broadcasts | Yes with **Charger/app compatible**; not at the same time with **Home Assistant direct** |
+| Connection choice | Automatic | **Charger/app compatible** or **Home Assistant direct** |
+| Oral-B cloud required | No | No |
+| Changes brush or charger settings | No | No; access is read-only |
+
+In **Charger/app compatible**, the iO Sense keeps its private brush connection
+and Oral-B Live obtains live and retained data through the charger. In **Home
+Assistant direct**, Home Assistant takes the brush's single connection for the
+highest-rate notifications, so the app and charger display cannot use the
+brush simultaneously.
 
 Only one integration should manage a given toothbrush in Home Assistant.
 Disable the other config entry for that brush to avoid duplicate devices,
