@@ -28,30 +28,42 @@ display and charger diagnostics without using the Oral-B cloud.
 
 ## How it works
 
-An Oral-B iO toothbrush accepts one BLE client at a time and stops advertising
-while that connection is occupied. Oral-B Live therefore offers two clear
-behaviours rather than exposing its internal transports as separate modes.
+Oral-B Live can collect brushing data in two ways. You choose the behaviour
+under the integration's **Configure** menu:
+
+- **Charger/app compatible** is recommended for an iO Sense setup. The charger
+  keeps its normal connection to the toothbrush, while Home Assistant reads
+  live brush data locally through the charger. Home Assistant does not take
+  the brush connection slot away from the charger or phone app.
+- **Home Assistant direct** connects Home Assistant straight to the toothbrush
+  for its fastest notification stream. While this connection is active, the
+  charger display and phone app cannot connect to the brush.
+
+This choice is necessary because the toothbrush accepts only one BLE client at
+a time and stops advertising while that connection is occupied.
 
 ```text
 Charger/app compatible
 
-Toothbrush <--private BLE--> iO Sense <--local BLE--> Home Assistant
-      |                                             |
-      +-- retained FF29 session --------------------+
+Home Assistant <--local BLE--> iO Sense <--private BLE--> Toothbrush
+                                 keeps brush slot
 
 Home Assistant direct
 
-Toothbrush <--direct BLE notifications--> Home Assistant
+Home Assistant <--direct BLE notifications--> Toothbrush
+     owns brush slot
 ```
 
 In charger/app-compatible mode, the integration discovers an iO Sense through
 its `A0F03E00` service, reads the charger's cached paired-brush identity, and
 matches the brush MAC to the existing config entry. No charger selection or
-third mode is required. Unrelated iO Sense chargers are ignored.
+manual pairing step is required. Unrelated iO Sense chargers are ignored.
 
 While the charger owns the brush connection, Home Assistant connects to the
 charger and uses its read-only `0x37` passthrough command. The charger remains
-the brush's BLE owner and its display continues to handle the session.
+the brush's BLE owner and its display continues to handle the session. The
+charger also forwards the brush's retained `FF29` session summary when it
+becomes available on a charger-managed connection.
 
 ## Connection options
 
