@@ -112,7 +112,7 @@ different needs:
 | --- | --- | --- |
 | Installation | Included with Home Assistant | Installed through HACS |
 | Live brushing | Time, pressure, timed pacer sector, mode and state when broadcast by the brush | The same card-compatible values through the charger or a direct brush connection |
-| Toothbrush Card mouth graphic | Displays the brush's sequential timed sector | Displays the same sequential timed sector; physical-position research is kept separate |
+| Toothbrush Card mouth graphic | Displays the brush's sequential timed sector | Displays the same sequential timed sector; physical-position protocol research is documented separately and is not exposed as an entity |
 | Completed-session summary | Not provided | Last session, duration and sessions today, retained across Home Assistant restarts |
 | Detailed session result | Not available | Actual duration, mode, target, pressure summary, ending battery and session ID where supported |
 | Battery | Percentage | Percentage plus estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
@@ -187,10 +187,16 @@ toothbrush's authoritative state.
 
 The entities used by Toothbrush Card deliberately retain the same meanings as
 Home Assistant's built-in Oral-B integration. In particular, the `sector`
-translation key always carries the brush's sequential timed pacer. Experimental
-physical-position diagnostics are disabled by default, remain separate and
-never replace the card-facing pacer value. Their status and limitations are
-documented in the [protocol reference](docs/protocol.md#motion-data-and-mouth-position-inference).
+translation key always carries the brush's sequential timed pacer. Physical
+mouth-position inference is research-only, is not exposed as a Home Assistant
+entity and never replaces the card-facing pacer value. The protocol findings
+and limitations are documented in the
+[protocol reference](docs/protocol.md#motion-data-and-mouth-position-inference).
+
+Advanced battery, brush-head and pacer diagnostics are populated only after a
+successful brush read. They remain `unknown` until the charger or direct brush
+connection has returned the corresponding characteristic; Oral-B Live does not
+invent placeholder values for unsupported or not-yet-read fields.
 
 The **Battery** entity keeps its last valid percentage across Home Assistant
 restarts and exposes `last_read` and `source` attributes. A fresh brush reading
@@ -205,6 +211,11 @@ The **Last session** attributes can include:
 - high/low-pressure event counts and durations;
 - average and maximum pressure in millinewtons;
 - battery percentage at the end of the session.
+
+Live sessions immediately save the observed mode and a locally sampled
+pressure summary. When the brush later exposes its retained `FF29` result,
+Oral-B Live replaces those estimates with the brush's exact pressure totals,
+event counts and ending battery without creating a second session.
 
 ### iO Sense Charger device
 

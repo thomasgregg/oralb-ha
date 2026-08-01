@@ -26,6 +26,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import (
     CONNECTION_BLUETOOTH,
     DeviceInfo,
@@ -91,32 +92,6 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         data_key="sector",
     ),
     OralBSensorDescription(
-        key="mouth_sector",
-        translation_key="mouth_sector",
-        name="Mouth sector",
-        data_key="mouth_sector",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    OralBSensorDescription(
-        key="position",
-        translation_key="position",
-        name="Mouth position",
-        data_key="position",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    OralBSensorDescription(
-        key="position_confidence",
-        translation_key="position_confidence",
-        name="Mouth position confidence",
-        data_key="position_confidence",
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-    ),
-    OralBSensorDescription(
         key="sector_timer",
         translation_key="sector_timer",
         name="Pacer sector timer",
@@ -131,14 +106,6 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         name="Pacer sector count",
         data_key="number_of_sectors",
         entity_category=EntityCategory.DIAGNOSTIC,
-    ),
-    OralBSensorDescription(
-        key="position_model_status",
-        translation_key="position_model_status",
-        name="Position model status",
-        data_key="position_model_status",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
     ),
     OralBSensorDescription(
         key="target_duration",
@@ -404,6 +371,22 @@ async def async_setup_entry(
 ) -> None:
     """Set up sensors from a config entry."""
     coordinator: OralBLiveCoordinator = hass.data[DOMAIN][entry.entry_id]
+    # Remove short-lived experimental/renamed entities from older development
+    # builds. They are no longer produced, and leaving them in the registry
+    # creates misleading Unknown/Unavailable duplicates on the device page.
+    registry = er.async_get(hass)
+    for suffix in (
+        "mouth_sector",
+        "position",
+        "position_confidence",
+        "position_model_status",
+        "pacer_sector",
+        "pacer_sector_count",
+    ):
+        if entity_id := registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{coordinator.address}-{suffix}"
+        ):
+            registry.async_remove(entity_id)
     async_add_entities(
         OralBLiveSensor(coordinator, description) for description in SENSORS
     )
@@ -649,18 +632,6 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 "measurement_type": "timed_pacer",
                 "sector_semantics": "timed_pacer",
                 "supports_revisits": False,
-            }
-        elif self.entity_description.key == "mouth_sector":
-            self._attr_extra_state_attributes = {
-                "measurement_type": (
-                    "motion_classifier_resampled"
-                    if data.get("position_model_status") == "streaming_charger"
-                    else "motion_classifier"
-                ),
-                "sector_semantics": "physical_position",
-                "supports_revisits": True,
-                "position": data.get("position"),
-                "confidence_percent": data.get("position_confidence"),
             }
         elif self.entity_description.key == "battery":
             self._attr_extra_state_attributes = {

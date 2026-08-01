@@ -274,9 +274,9 @@ SIGNAL_CHARGER_UPDATE = f"{DOMAIN}_charger_update"
 
 # --- iO Sense bridge --------------------------------------------------------
 # A 150-second real-session benchmark completed 444/444 passthrough reads.
-# The charger serializes requests, so the active schedule gives FF0D motion and
-# FF0B pressure priority. Slow-changing metadata is sampled only occasionally;
-# otherwise each extra read widens the gaps in the charger motion snapshots.
+# The charger serializes requests. Keep the live path to two brush reads per
+# cycle: FF0B pressure plus one auxiliary value. A third request caused missed
+# pressure cycles on the tested charger.
 CHARGER_BRIDGE_INTERVAL_SECONDS = 1.0
 CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS = 1.5
 # Poll the charger's native session state alongside the priority live schedule.

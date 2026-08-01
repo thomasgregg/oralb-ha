@@ -225,11 +225,10 @@ is validation evidence, not a claim that interpolated samples contain the same
 information as a continuous direct stream.
 
 The vendor model assets are proprietary and are not distributable with the
-integration. A local validation backend may expose its results as separate
-**Mouth position**, **Mouth sector** and confidence diagnostics. The public
-`sector` entity remains `FF09`'s timed pacer, matching Home Assistant's built-in
-Oral-B integration and Toothbrush Card. It must not be relabelled as physical
-mouth position.
+integration. Mouth-position inference therefore remains protocol research and
+is not exposed as a Home Assistant entity. The public `sector` entity remains
+`FF09`'s timed pacer, matching Home Assistant's built-in Oral-B integration and
+Toothbrush Card. It must not be relabelled as physical mouth position.
 
 On the tested direct connection, `FF29` changed within seconds of a completed
 session and the latest record was anonymously readable without first issuing
@@ -440,7 +439,7 @@ not force the charger to establish that private connection.
 | `FF09` | pacer sector | zero-based interval ID, elapsed sector timer and configured count confirmed live |
 | `FF0A` | brush display face/smiley | values through `special_10` confirmed |
 | `FF0B` | pressure/motor | pressure state, timestamp, force and motor fields confirmed live |
-| `FF0D` | motion | timestamped motion and gyroscope snapshots confirmed; optional local validation can derive separate position diagnostics |
+| `FF0D` | motion | timestamped motion and gyroscope snapshots confirmed; local research tooling demonstrated the inference pipeline described above |
 | `FF22` | brush real-time clock | confirmed |
 | `FF25` | available modes | confirmed |
 | `FF26` | per-zone pacer configuration | confirmed |
@@ -513,14 +512,15 @@ derived two-read timings are:
 | pressure + timer | 655.522 ms | 779.035 ms | 894.694 ms |
 | pressure + zone | 662.129 ms | 808.012 ms | 899.585 ms |
 
-Without a local motion-research model, Oral-B Live therefore reads pressure
-every one-second tick and alternates timer and pacer sector as the second read.
-A separate local 1 Hz ticker advances the displayed timer, pacer sector and
-elapsed sector time independently of BLE request latency; `FF08` and `FF09`
-remain the authoritative correction anchors. When a local validation model is
-present, `FF0D` and pressure take priority and timer/pacer anchors are sampled
-less often so snapshot gaps do not grow further. Charger-native session state
-is checked periodically to provide an explicit stop signal.
+Oral-B Live therefore uses a strict two-read schedule: pressure on every
+one-second tick and one auxiliary value. Battery, mode, pacer configuration and
+brush-head remainder occupy the first auxiliary slots; timer and pacer sector
+then alternate, with battery refreshed periodically. A separate local 1 Hz
+ticker advances the displayed timer, pacer sector and elapsed sector time
+independently of BLE request latency; `FF08` and `FF09` remain the authoritative
+correction anchors. `FF0D` is not polled by the shipped integration because a
+third serial request can delay the live pressure/card path. Charger-native
+session state is checked periodically to provide an explicit stop signal.
 
 ## Retained session summary (`FF29`)
 
@@ -637,6 +637,6 @@ For that reason Oral-B Live:
 | `charger_protocol.py` | pure advertisement, native packet and passthrough decoders/builders |
 | `charger.py` | automatic pairing, connection lifecycle, serial request scheduler and charger diagnostics |
 | `protocol.py` | pure toothbrush payload decoders including exact `FF29` and zero-based charger zones |
-| `coordinator.py` | source selection, live state, timer/pacer extrapolation, session tracking, reconciliation and optional local FF0D validation |
+| `coordinator.py` | source selection, live state, timer/pacer extrapolation, sampled pressure tracking and retained-session reconciliation |
 | `sensor.py` | toothbrush entities plus a separate matched iO Sense device |
 | `tests/test_protocol.py` | captured-packet regression tests with no Home Assistant dependency |

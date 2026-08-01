@@ -12,7 +12,6 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -98,7 +97,6 @@ from .const import (
     SYNC_STATES,
     brush_firmware_version,
 )
-from .position import CominoSnapshotResampler, StreamingPositionClassifier
 from .protocol import (
     advance_pacer_progress,
     decode_charger_sector,
@@ -106,7 +104,6 @@ from .protocol import (
     derive_pacer_progress,
     parse_available_modes,
     parse_battery_status,
-    parse_comino_sensor_snapshot,
     parse_device_info,
     parse_pacer,
     parse_refill_remainder,
@@ -143,10 +140,6 @@ class OralBLiveCoordinator:
             "sector_raw": None,
             "sector_timer": None,
             "number_of_sectors": None,
-            "mouth_sector": None,
-            "position": None,
-            "position_confidence": None,
-            "position_model_status": "not_loaded",
             "sector_times": None,
             "target_duration": None,
             "smiley": None,
@@ -202,11 +195,6 @@ class OralBLiveCoordinator:
         self._unsub_bluetooth: callback | None = None
         self._unsub_unavailable: callback | None = None
         self._stopping = False
-        self._position_load_task: asyncio.Task | None = None
-        self._position_worker_task: asyncio.Task | None = None
-        self._position_classifier: StreamingPositionClassifier | None = None
-        self._charger_motion_resampler = CominoSnapshotResampler()
-        self._dashboard_queue: asyncio.Queue | None = None
         # --- session tracking (live mode / passive adverts) ---
         self._session_active = False
         self._session_start: Any = None
@@ -214,6 +202,15 @@ class OralBLiveCoordinator:
         self._session_max_time = 0
         self._session_sectors: set[int] = set()
         self._session_high_pressure = 0
+        self._session_low_pressure = 0
+        self._session_high_pressure_time = 0.0
+        self._session_low_pressure_time = 0.0
+        self._session_pressure_state_started: float | None = None
+        self._session_pressure_samples = 0
+        self._session_pressure_force_total = 0
+        self._session_pressure_force_samples = 0
+        self._session_pressure_force_max: int | None = None
+        self._session_mode: str | None = None
         self._last_pressure: str | None = None
         self._pending_passive_sessions: list[Any] = []
         # Keep session-edge tracking separate from the displayed last-known
@@ -240,11 +237,6 @@ class OralBLiveCoordinator:
         slug = address.replace(":", "").replace("-", "_").lower()
         self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{slug}")
 
-    @property
-    def position_capture_enabled(self) -> bool:
-        """Return whether the optional local position model is available."""
-        return self._position_classifier is not None
-
     # ------------------------------------------------------------------ setup
     @callback
     def async_start(self) -> None:
@@ -268,9 +260,6 @@ class OralBLiveCoordinator:
             self._parse_advertisement(service_info, track_session=False)
         if self.charger:
             self.charger.async_start()
-            self._position_load_task = self.hass.async_create_task(
-                self._async_load_local_position_classifier()
-            )
         if self.mode == CONNECTION_MODE_LIVE:
             # The brush stops advertising while a client (for example an
             # iO Sense charger) holds its single slot, so advertisements
@@ -283,16 +272,12 @@ class OralBLiveCoordinator:
             self._reconnect_task,
             self._sync_task,
             self._charger_tick_task,
-            self._position_load_task,
-            self._position_worker_task,
         ):
             if task:
                 task.cancel()
         self._reconnect_task = None
         self._sync_task = None
         self._charger_tick_task = None
-        self._position_load_task = None
-        self._position_worker_task = None
         if self._unsub_bluetooth:
             self._unsub_bluetooth()
             self._unsub_bluetooth = None
@@ -504,7 +489,6 @@ class OralBLiveCoordinator:
         self._pacer_anchor = None
         self._apply_state(RUNNING_STATE)
         self._start_charger_ticker()
-        self._start_charger_position_capture()
         self._push()
 
     def _charger_session_ended(self) -> None:
@@ -515,7 +499,6 @@ class OralBLiveCoordinator:
         self._advance_charger_timer()
         self._cancel_charger_ticker()
         self._apply_state(quiet_state)
-        self._stop_charger_position_capture()
         self.data["live"] = False
         self._push()
 
@@ -546,20 +529,6 @@ class OralBLiveCoordinator:
             self._apply_smiley(raw)
         elif short_uuid == "FF0B" and raw:
             self._apply_pressure(raw, DATA_SOURCE_CHARGER)
-        elif short_uuid == "FF0D":
-            try:
-                snapshot = parse_comino_sensor_snapshot(raw)
-            except ValueError as err:
-                _LOGGER.debug("%s: invalid charger FF0D snapshot: %s", self.name, err)
-            else:
-                records = self._charger_motion_resampler.add_snapshot(snapshot)
-                _LOGGER.debug(
-                    "%s: charger FF0D %s yielded %d resampled motion records",
-                    self.name,
-                    raw.hex(),
-                    len(records),
-                )
-                self._queue_position_records(records)
         elif short_uuid == "FF22" and len(raw) >= 4:
             self._charger_session_rtc = raw
             self._charger_session_rtc_sampled_at = dt_util.utcnow()
@@ -629,123 +598,6 @@ class OralBLiveCoordinator:
                 self._push()
         except asyncio.CancelledError:
             pass
-
-    # --------------------------------------------- local position validation
-    async def _async_load_local_position_classifier(self) -> None:
-        """Load local validation assets without blocking Home Assistant's loop."""
-        model_directory = Path(__file__).with_name("models")
-        if not model_directory.is_dir():
-            self.data["position_model_status"] = "assets_missing"
-            self._push()
-            return
-
-        def _load() -> StreamingPositionClassifier:
-            from .local_comino import LocalCominoEnsemble
-
-            return StreamingPositionClassifier(LocalCominoEnsemble(model_directory))
-
-        self.data["position_model_status"] = "loading"
-        self._push()
-        try:
-            self._position_classifier = await self.hass.async_add_executor_job(_load)
-        except Exception as err:  # noqa: BLE001 - isolate optional native runtime
-            self.data["position_model_status"] = "load_failed"
-            _LOGGER.warning(
-                "%s: local position model failed to load: %s", self.name, err
-            )
-        else:
-            self.data["position_model_status"] = "ready"
-            _LOGGER.debug("%s: local position validation model ready", self.name)
-            if self.charger and self._session_active:
-                # The optional assets may finish loading after a session has
-                # already started. Start the queue/worker before the bridge
-                # begins prioritising FF0D reads.
-                self._start_charger_position_capture()
-        self._push()
-
-    def _start_charger_position_capture(self) -> None:
-        """Classify resampled FF0D motion while the charger owns the brush."""
-        classifier = self._position_classifier
-        if classifier is None:
-            return
-        if self._position_worker_task and not self._position_worker_task.done():
-            return
-        classifier.reset()
-        self._charger_motion_resampler.reset()
-        self._dashboard_queue = asyncio.Queue(maxsize=16)
-        self.data["position"] = "out_of_mouth"
-        self.data["mouth_sector"] = "no_sector"
-        self.data["position_confidence"] = 0.0
-        self.data["position_model_status"] = "streaming_charger"
-        self._position_worker_task = self.hass.async_create_task(
-            self._async_position_worker()
-        )
-        _LOGGER.debug("%s: charger FF0D position capture active", self.name)
-
-    def _stop_charger_position_capture(self) -> None:
-        """Stop bridge motion inference after the active session."""
-        if self._position_worker_task and not self._position_worker_task.done():
-            self._position_worker_task.cancel()
-        self._position_worker_task = None
-        self._dashboard_queue = None
-        self._charger_motion_resampler.reset()
-        if self._position_classifier:
-            self.data["position_model_status"] = "ready"
-            self.data["position"] = "out_of_mouth"
-            self.data["mouth_sector"] = "no_sector"
-            self.data["position_confidence"] = 0.0
-
-    def _queue_position_records(self, records: Any) -> None:
-        """Queue direct or charger-resampled IMU records for inference."""
-        if not records:
-            return
-        queue = self._dashboard_queue
-        if queue is None:
-            return
-        try:
-            queue.put_nowait(records)
-        except asyncio.QueueFull:
-            _LOGGER.debug(
-                "%s: dropping motion records; classifier queue is full", self.name
-            )
-
-    async def _async_position_worker(self) -> None:
-        """Run the stateful classifier serially outside Home Assistant's loop."""
-        classifier = self._position_classifier
-        queue = self._dashboard_queue
-        if classifier is None or queue is None:
-            return
-        try:
-            while not self._stopping and self.charger and self._session_active:
-                records = await queue.get()
-                results = await self.hass.async_add_executor_job(
-                    classifier.add_records, records
-                )
-                for result in results:
-                    self.data["position"] = result.position
-                    self.data["position_confidence"] = round(result.confidence * 100, 1)
-                    self.data["mouth_sector"] = result.sector
-                if results:
-                    latest = results[-1]
-                    _LOGGER.debug(
-                        "%s: classified position %s (%s, %.1f%%)",
-                        self.name,
-                        latest.position,
-                        latest.sector,
-                        latest.confidence * 100,
-                    )
-                    self._push()
-        except asyncio.CancelledError:
-            pass
-        except Exception as err:  # noqa: BLE001 - isolate optional native runtime
-            # Stop prioritising motion immediately so the charger bridge falls
-            # back to the card-focused timer/sector schedule.
-            self._position_classifier = None
-            self._dashboard_queue = None
-            self._charger_motion_resampler.reset()
-            self.data["position_model_status"] = "inference_failed"
-            _LOGGER.warning("%s: position inference failed: %s", self.name, err)
-            self._push()
 
     # ------------------------------------------------- charger-priority sync
     def _maybe_schedule_sync(self) -> None:
@@ -1111,10 +963,6 @@ class OralBLiveCoordinator:
         if raw != RUNNING_STATE:
             self.data["sector"] = "no_sector"
             self.data["sector_timer"] = None
-            if self._position_classifier:
-                self.data["position"] = "out_of_mouth"
-                self.data["mouth_sector"] = "no_sector"
-                self.data["position_confidence"] = 0.0
             self._pacer_anchor = None
 
         if (
@@ -1141,6 +989,15 @@ class OralBLiveCoordinator:
         self._session_max_time = 0
         self._session_sectors = set()
         self._session_high_pressure = 0
+        self._session_low_pressure = 0
+        self._session_high_pressure_time = 0.0
+        self._session_low_pressure_time = 0.0
+        self._session_pressure_state_started = None
+        self._session_pressure_samples = 0
+        self._session_pressure_force_total = 0
+        self._session_pressure_force_samples = 0
+        self._session_pressure_force_max = None
+        self._session_mode = self.data.get("mode")
         self._last_pressure = None
         _LOGGER.debug("%s: session started", self.name)
 
@@ -1154,6 +1011,7 @@ class OralBLiveCoordinator:
         """
         if not self._session_active:
             return
+        self._accumulate_session_pressure_time(time.monotonic())
         self._session_active = False
         self._cancel_charger_ticker()
         duration = self._session_max_time or 0
@@ -1195,14 +1053,30 @@ class OralBLiveCoordinator:
 
         self.data["last_session_start"] = self._session_start
         self.data["last_session_duration"] = duration
-        self.data["last_session_mode"] = self.data.get("mode")
+        self.data["last_session_mode"] = self._session_mode or self.data.get("mode")
         self.data["last_session_sectors"] = len(self._session_sectors)
-        self.data["last_session_high_pressure"] = self._session_high_pressure
-        self.data["last_session_low_pressure"] = None
-        self.data["last_session_high_pressure_time"] = None
-        self.data["last_session_low_pressure_time"] = None
-        self.data["last_session_average_pressure"] = None
-        self.data["last_session_maximum_pressure"] = None
+        has_pressure_samples = self._session_pressure_samples > 0
+        self.data["last_session_high_pressure"] = (
+            self._session_high_pressure if has_pressure_samples else None
+        )
+        self.data["last_session_low_pressure"] = (
+            self._session_low_pressure if has_pressure_samples else None
+        )
+        self.data["last_session_high_pressure_time"] = (
+            round(self._session_high_pressure_time, 1) if has_pressure_samples else None
+        )
+        self.data["last_session_low_pressure_time"] = (
+            round(self._session_low_pressure_time, 1) if has_pressure_samples else None
+        )
+        self.data["last_session_average_pressure"] = (
+            round(
+                self._session_pressure_force_total
+                / self._session_pressure_force_samples
+            )
+            if self._session_pressure_force_samples
+            else None
+        )
+        self.data["last_session_maximum_pressure"] = self._session_pressure_force_max
         self.data["last_session_battery_end"] = None
         self.data["last_session_target_duration"] = self.data.get("target_duration")
         self.data["last_session_id"] = None
@@ -1224,18 +1098,47 @@ class OralBLiveCoordinator:
         if self._session_active and seconds > self._session_max_time:
             self._session_max_time = seconds
 
-    def _track_session_pressure(self, pressure: str) -> None:
-        if (
-            self._session_active
-            and pressure == "high"
-            and self._last_pressure != "high"
-        ):
-            self._session_high_pressure += 1
-        self._last_pressure = pressure
+    def _accumulate_session_pressure_time(self, observed: float) -> None:
+        """Accumulate time spent in the previous sampled pressure state."""
+        if self._session_pressure_state_started is None:
+            return
+        elapsed = max(0.0, observed - self._session_pressure_state_started)
+        if self._last_pressure == "high":
+            self._session_high_pressure_time += elapsed
+        elif self._last_pressure == "low":
+            self._session_low_pressure_time += elapsed
+        self._session_pressure_state_started = observed
+
+    def _track_session_pressure(self, pressure: str, force: int | None = None) -> None:
+        """Track a locally sampled pressure summary for the active session."""
+        if not self._session_active:
+            return
+        observed = time.monotonic()
+        self._session_pressure_samples += 1
+        if pressure != self._last_pressure:
+            self._accumulate_session_pressure_time(observed)
+            if pressure == "high":
+                self._session_high_pressure += 1
+            elif pressure == "low":
+                self._session_low_pressure += 1
+            self._last_pressure = pressure
+            self._session_pressure_state_started = observed
+        elif self._session_pressure_state_started is None:
+            self._session_pressure_state_started = observed
+        if force is not None:
+            self._session_pressure_force_total += force
+            self._session_pressure_force_samples += 1
+            self._session_pressure_force_max = (
+                force
+                if self._session_pressure_force_max is None
+                else max(self._session_pressure_force_max, force)
+            )
 
     def _apply_mode(self, raw: int) -> None:
         self.data["mode_raw"] = raw
         self.data["mode"] = MODES.get(raw, f"mode_{raw}")
+        if self._session_active:
+            self._session_mode = self.data["mode"]
 
     def _apply_sector(
         self, raw: int, total: int | None, sector_timer: int | None = None
@@ -1413,7 +1316,7 @@ class OralBLiveCoordinator:
         )
         if source:
             self.data["data_source"] = source
-        self._track_session_pressure(self.data["pressure"])
+        self._track_session_pressure(self.data["pressure"], self.data["pressure_force"])
 
     # ------------------------------------------------------------- teardown
     async def _reconnect_loop(self) -> None:

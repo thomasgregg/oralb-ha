@@ -547,25 +547,21 @@ class IOSenseBridge:
                 and self._client.is_connected
             ):
                 started = time.monotonic()
-                position_capture = self.parent.position_capture_enabled
-                if position_capture and (
-                    motion := await self._async_passthrough("FF0D")
-                ):
-                    await self.parent._async_apply_charger_passthrough("FF0D", motion)
                 if pressure := await self._async_passthrough("FF0B"):
                     await self.parent._async_apply_charger_passthrough("FF0B", pressure)
 
-                # When the optional local position model is available, motion
-                # and pressure take priority and slower values are sampled
-                # sparsely. Without that model, use the proven two-read card
-                # schedule: pressure plus alternating FF08/FF09 anchors.
+                # Keep the proven two-read live schedule. The charger
+                # serialises requests, so adding a third field here can make
+                # the one-second pressure read miss its cycle. Slowly changing
+                # values occupy one auxiliary slot at startup; timer and pacer
+                # anchors alternate afterwards.
                 auxiliary_uuid = None
                 if tick == 0:
                     auxiliary_uuid = "FF05"
                 elif tick == 1:
-                    auxiliary_uuid = "FF26"
-                elif tick == 2:
                     auxiliary_uuid = "FF07"
+                elif tick == 2:
+                    auxiliary_uuid = "FF26"
                 elif tick == 3:
                     # Read brush-head lifetime once while the charger is
                     # guaranteed to own the brush connection.  Waiting until
@@ -574,11 +570,7 @@ class IOSenseBridge:
                     auxiliary_uuid = "FF2D"
                 elif tick > 0 and tick % CHARGER_BATTERY_EVERY_TICKS == 0:
                     auxiliary_uuid = "FF05"
-                elif position_capture and (
-                    tick > 0 and tick % (CHARGER_SESSION_STATUS_EVERY_TICKS * 2) == 0
-                ):
-                    auxiliary_uuid = "FF08"
-                elif not position_capture:
+                else:
                     auxiliary_uuid = "FF08" if tick % 2 == 0 else "FF09"
                 if auxiliary_uuid and (
                     auxiliary := await self._async_passthrough(auxiliary_uuid)
