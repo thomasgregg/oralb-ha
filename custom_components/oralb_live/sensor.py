@@ -217,9 +217,10 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         key="refill_brushing_time",
         translation_key="refill_brushing_time",
         name="Brush head brushing time remaining",
-        data_key="refill_brushing_time",
-        native_unit_of_measurement=UnitOfTime.SECONDS,
+        data_key="refill_brushing_time_hours",
+        native_unit_of_measurement=UnitOfTime.HOURS,
         device_class=SensorDeviceClass.DURATION,
+        suggested_display_precision=1,
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         restore=True,
@@ -460,6 +461,11 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         ):
             if self.entity_description.device_class is SensorDeviceClass.TIMESTAMP:
                 self._attr_native_value = dt_util.parse_datetime(last.state)
+            elif self.entity_description.key == "refill_brushing_time":
+                restored_value = float(last.state)
+                if last.attributes.get("unit_of_measurement") == UnitOfTime.SECONDS:
+                    restored_value /= 3600
+                self._attr_native_value = restored_value
             elif (
                 self.entity_description.device_class is SensorDeviceClass.DURATION
                 or self.entity_description.key == "sessions_today"
@@ -655,6 +661,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             self._attr_extra_state_attributes = {
                 "refill_state": data.get("refill_state"),
                 "refill_state_raw": data.get("refill_state_raw"),
+                "brushing_time_remaining_seconds": data.get("refill_brushing_time"),
             }
         self.async_write_ha_state()
 

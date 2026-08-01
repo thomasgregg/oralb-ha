@@ -109,6 +109,7 @@ class ProtocolDecoderTests(unittest.TestCase):
         self.assertEqual(const.STATES[115], "sleeping")
         self.assertEqual(const.STATES[116], "transport")
         self.assertEqual(const.RELEASE_STATES, {115, 116})
+        self.assertEqual(10, const.MIN_PASSIVE_SESSION_SECONDS)
 
     def test_charger_refreshes_current_values_before_retained_session(self) -> None:
         self.assertEqual(("FF05", "FF2D"), const.CHARGER_POST_SESSION_READS[:2])
@@ -129,6 +130,7 @@ class ProtocolDecoderTests(unittest.TestCase):
             const.CHARGER_POST_SESSION_READS.index("FF29"),
         )
         self.assertEqual(30, const.CHARGER_BATTERY_EVERY_TICKS)
+        self.assertEqual(5, const.CHARGER_BRUSH_STATUS_EVERY_TICKS)
 
     def test_pacer(self) -> None:
         self.assertEqual(
@@ -172,6 +174,23 @@ class ProtocolDecoderTests(unittest.TestCase):
                 "refill_brushing_time": 600,
             },
         )
+
+    def test_session_timer_requires_forward_progress(self) -> None:
+        baseline, confirmed = protocol.advance_session_timer_evidence(None, 77)
+        self.assertEqual(77, baseline)
+        self.assertFalse(confirmed)
+
+        baseline, confirmed = protocol.advance_session_timer_evidence(baseline, 77)
+        self.assertEqual(77, baseline)
+        self.assertFalse(confirmed)
+
+        baseline, confirmed = protocol.advance_session_timer_evidence(baseline, 0)
+        self.assertEqual(0, baseline)
+        self.assertFalse(confirmed)
+
+        baseline, confirmed = protocol.advance_session_timer_evidence(baseline, 2)
+        self.assertEqual(0, baseline)
+        self.assertTrue(confirmed)
 
     def test_available_modes_are_unique(self) -> None:
         self.assertEqual(
@@ -262,6 +281,86 @@ class ProtocolDecoderTests(unittest.TestCase):
 
 class ChargerProtocolTests(unittest.TestCase):
     """Exercise captured iO Sense packets and read-only frame builders."""
+
+    def test_charger_session_prefers_active_brush_status(self) -> None:
+        self.assertTrue(
+            charger_protocol.resolve_charger_session_running("inactive", "pre_run")
+        )
+        self.assertTrue(
+            charger_protocol.resolve_charger_session_running("inactive", "run")
+        )
+
+    def test_charger_session_prefers_quiet_brush_status(self) -> None:
+        for brush_status in ("not_connected", "idle", "charging"):
+            with self.subTest(brush_status=brush_status):
+                self.assertFalse(
+                    charger_protocol.resolve_charger_session_running(
+                        "active_running", brush_status, True
+                    )
+                )
+
+    def test_charger_session_falls_back_to_native_status(self) -> None:
+        self.assertTrue(
+            charger_protocol.resolve_charger_session_running("active_running", None)
+        )
+        self.assertFalse(
+            charger_protocol.resolve_charger_session_running("inactive", None, True)
+        )
+        self.assertTrue(
+            charger_protocol.resolve_charger_session_running(None, "unknown", True)
+        )
+        self.assertTrue(
+            charger_protocol.resolve_charger_session_running(
+                "inactive", "unknown", True
+            )
+        )
+        self.assertTrue(
+            charger_protocol.resolve_charger_session_running(
+                "inactive", "unknown_0xfe", True
+            )
+        )
+        self.assertTrue(
+            charger_protocol.resolve_charger_session_running("inactive", "", True)
+        )
+
+    def test_charger_session_observed_firmware_sequence(self) -> None:
+        running = False
+        running = charger_protocol.resolve_charger_session_running(
+            "inactive", None, running
+        )
+        self.assertFalse(running)
+        running = charger_protocol.resolve_charger_session_running(
+            "inactive", "pre_run", running
+        )
+        self.assertTrue(running)
+        running = charger_protocol.resolve_charger_session_running(
+            "inactive", "unknown", running
+        )
+        self.assertTrue(running)
+        running = charger_protocol.resolve_charger_session_running(
+            "inactive", "charging", running
+        )
+        self.assertFalse(running)
+
+    def test_charger_live_auxiliary_schedule(self) -> None:
+        def auxiliary(tick: int, *, mode_observed: bool = True) -> str:
+            return charger_protocol.charger_live_auxiliary(
+                tick,
+                mode_observed=mode_observed,
+                brush_status_every_ticks=const.CHARGER_BRUSH_STATUS_EVERY_TICKS,
+                battery_every_ticks=const.CHARGER_BATTERY_EVERY_TICKS,
+            )
+
+        expected_startup = ["FF05", "FF07", "FF26", "FF2D", "FF08"]
+        self.assertEqual(
+            expected_startup,
+            [auxiliary(tick) for tick in range(5)],
+        )
+        self.assertEqual("BRUSH_STATUS", auxiliary(5))
+        self.assertEqual("FF05", auxiliary(29))
+        self.assertEqual("BRUSH_STATUS", auxiliary(30))
+        self.assertEqual("FF07", auxiliary(6, mode_observed=False))
+        self.assertEqual("FF08", auxiliary(6))
 
     def test_charger_advertisement(self) -> None:
         parsed = charger_protocol.decode_charger_advertisement(

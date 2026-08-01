@@ -182,6 +182,19 @@ def parse_available_modes(payload: bytes | bytearray) -> list[int]:
     return modes
 
 
+def advance_session_timer_evidence(
+    baseline: int | None, seconds: int
+) -> tuple[int, bool]:
+    """Track an authoritative timer and report genuine forward progress.
+
+    A first sample can be the previous retained timer. A lower sample means the
+    timer reset for a new session; only a later higher value confirms brushing.
+    """
+    if baseline is None or seconds < baseline:
+        return seconds, False
+    return baseline, seconds > baseline
+
+
 def parse_session_record(payload: bytes | bytearray) -> dict[str, int | float]:
     """Decode the protocol 7/8 FF29 retained-session summary.
 

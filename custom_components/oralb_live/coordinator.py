@@ -99,6 +99,7 @@ from .const import (
 )
 from .protocol import (
     advance_pacer_progress,
+    advance_session_timer_evidence,
     decode_charger_sector,
     decode_sector,
     derive_pacer_progress,
@@ -155,6 +156,7 @@ class OralBLiveCoordinator:
             "refill_state_raw": None,
             "refill_days": None,
             "refill_brushing_time": None,
+            "refill_brushing_time_hours": None,
             "model_id": None,
             "model_name": None,
             "protocol_version": None,
@@ -197,6 +199,8 @@ class OralBLiveCoordinator:
         self._stopping = False
         # --- session tracking (live mode / passive adverts) ---
         self._session_active = False
+        self._session_confirmed = False
+        self._session_timer_baseline: int | None = None
         self._session_start: Any = None
         self._session_started_monotonic: float | None = None
         self._session_max_time = 0
@@ -311,6 +315,12 @@ class OralBLiveCoordinator:
             payload[ADV_IDX_PROTOCOL],
             payload[ADV_IDX_FIRMWARE],
         )
+        # While the charger bridge owns the brush connection, its forwarded
+        # values are authoritative. A delayed brush advertisement can otherwise
+        # replace logical running with selection_menu/idle mid-session.
+        if self.charger and (self.charger.session_running or self.data["live"]):
+            self._push()
+            return
         state_raw = payload[ADV_IDX_STATE]
         self._apply_state(state_raw, track_session=track_session)
         # While live notifications flow, they are fresher than adverts.
@@ -322,7 +332,7 @@ class OralBLiveCoordinator:
             self.data["pressure"] = PRESSURE_FROM_ADV.get(
                 payload[ADV_IDX_PRESSURE], "normal"
             )
-            self._track_session_time(self.data["time"])
+            self._track_session_time(self.data["time"], confirm_session=track_session)
             self._track_session_pressure(self.data["pressure"])
             self._apply_mode(payload[ADV_IDX_MODE])
             self._apply_sector(
@@ -448,7 +458,7 @@ class OralBLiveCoordinator:
         uuid = str(char.uuid)
         if uuid == CHAR_BRUSH_TIME and len(payload) >= 2:
             self.data["time"] = _decode_time(payload[0], payload[1])
-            self._track_session_time(self.data["time"])
+            self._track_session_time(self.data["time"], confirm_session=True)
             self._update_pacer_progress()
         elif uuid == CHAR_STATE and payload:
             self._apply_state(payload[0])
@@ -477,7 +487,7 @@ class OralBLiveCoordinator:
         self.available = True
         self._push()
 
-    def _charger_session_started(self) -> None:
+    def _charger_session_started(self, *, confirmed: bool = False) -> None:
         """Start session tracking from charger-native state."""
         self.available = True
         self.data["data_source"] = DATA_SOURCE_CHARGER
@@ -487,7 +497,7 @@ class OralBLiveCoordinator:
         self.data["sector_timer"] = 0
         self._charger_timer_anchor = (0, time.monotonic())
         self._pacer_anchor = None
-        self._apply_state(RUNNING_STATE)
+        self._apply_state(RUNNING_STATE, confirm_session=confirmed)
         self._start_charger_ticker()
         self._push()
 
@@ -521,7 +531,7 @@ class OralBLiveCoordinator:
             seconds = _decode_time(raw[0], raw[1])
             self.data["time"] = seconds
             self._charger_timer_anchor = (seconds, time.monotonic())
-            self._track_session_time(seconds)
+            self._track_session_time(seconds, confirm_session=True)
             self._update_pacer_progress()
         elif short_uuid == "FF09" and len(raw) >= 3:
             self._apply_charger_sector(raw[0], raw[2], raw[1])
@@ -943,7 +953,13 @@ class OralBLiveCoordinator:
         return "new"
 
     # ---------------------------------------------------------- state maps
-    def _apply_state(self, raw: int, *, track_session: bool = True) -> None:
+    def _apply_state(
+        self,
+        raw: int,
+        *,
+        track_session: bool = True,
+        confirm_session: bool | None = None,
+    ) -> None:
         previous_tracked = self._tracked_state_raw
         self.data["state_raw"] = raw
         self.data["state"] = STATES.get(raw, f"unknown_state_{raw}")
@@ -955,8 +971,13 @@ class OralBLiveCoordinator:
         )
         if track_session:
             self._tracked_state_raw = raw
+            confirms_brushing = (
+                raw == RUNNING_STATE if confirm_session is None else confirm_session
+            )
             if raw in session_states and previous_tracked not in session_states:
-                self._begin_session()
+                self._begin_session(confirmed=confirms_brushing)
+            elif raw in session_states and confirms_brushing:
+                self._confirm_session()
             elif raw not in session_states and previous_tracked in session_states:
                 self._end_session()
 
@@ -981,9 +1002,11 @@ class OralBLiveCoordinator:
             )
 
     # ---------------------------------------------------------- sessions
-    def _begin_session(self) -> None:
+    def _begin_session(self, *, confirmed: bool = False) -> None:
         """A brushing session just started."""
         self._session_active = True
+        self._session_confirmed = confirmed
+        self._session_timer_baseline = None
         self._session_start = dt_util.utcnow()
         self._session_started_monotonic = time.monotonic()
         self._session_max_time = 0
@@ -1001,6 +1024,12 @@ class OralBLiveCoordinator:
         self._last_pressure = None
         _LOGGER.debug("%s: session started", self.name)
 
+    def _confirm_session(self) -> None:
+        """Mark a provisional charger/menu observation as real brushing."""
+        if self._session_active and not self._session_confirmed:
+            self._session_confirmed = True
+            _LOGGER.debug("%s: session confirmed by brush data", self.name)
+
     def _end_session(self) -> None:
         """A brushing session just finished; record the result.
 
@@ -1014,6 +1043,13 @@ class OralBLiveCoordinator:
         self._accumulate_session_pressure_time(time.monotonic())
         self._session_active = False
         self._cancel_charger_ticker()
+        if not self._session_confirmed:
+            self._session_started_monotonic = None
+            _LOGGER.debug(
+                "%s: provisional session ended without brush evidence; ignored",
+                self.name,
+            )
+            return
         duration = self._session_max_time or 0
         duration_source = "brush timer"
         if duration <= 0 and self._session_started_monotonic is not None:
@@ -1094,7 +1130,23 @@ class OralBLiveCoordinator:
             self._session_high_pressure,
         )
 
-    def _track_session_time(self, seconds: int) -> None:
+    def _track_session_time(
+        self, seconds: int, *, confirm_session: bool = False
+    ) -> None:
+        if not self._session_active:
+            return
+        if confirm_session and not self._session_confirmed:
+            previous_baseline = self._session_timer_baseline
+            self._session_timer_baseline, timer_advanced = (
+                advance_session_timer_evidence(previous_baseline, seconds)
+            )
+            if not timer_advanced:
+                # The first value may be a retained previous timer. Establish
+                # a baseline (or recognize a reset) and require later progress.
+                if previous_baseline is None or seconds < previous_baseline:
+                    self._session_max_time = 0
+                return
+            self._confirm_session()
         if self._session_active and seconds > self._session_max_time:
             self._session_max_time = seconds
 
@@ -1288,6 +1340,9 @@ class OralBLiveCoordinator:
         parsed = parse_refill_remainder(payload)
         if parsed:
             self.data.update(parsed)
+            self.data["refill_brushing_time_hours"] = (
+                parsed["refill_brushing_time"] / 3600
+            )
             state_raw = parsed["refill_state_raw"]
             self.data["refill_state"] = REFILL_STATES.get(
                 state_raw, f"state_{state_raw}"

@@ -123,10 +123,13 @@ STATES: dict[int, str] = {
 
 RUNNING_STATE = 3
 # Some iO firmware can advertise selection_menu for an entire short motor
-# session without ever exposing running. Treat both as active for the passive
-# charger-priority fallback; a minimum duration below filters button/menu blips.
+# session without ever exposing running. Treat both as provisional active
+# states; the coordinator requires a real running state or forward timer
+# progress before recording them as a completed session.
 PASSIVE_SESSION_ACTIVE_STATES = {RUNNING_STATE, 8}
-MIN_PASSIVE_SESSION_SECONDS = 5
+# Secondary guard for a confirmed session whose only duration source is elapsed
+# wall time. Timer-less selection-menu/pre-run events are rejected separately.
+MIN_PASSIVE_SESSION_SECONDS = 10
 
 # States in which the brush is reachable and worth connecting to in
 # LIVE mode. Charging (4) is included: docked is the most reliable
@@ -279,9 +282,9 @@ SIGNAL_CHARGER_UPDATE = f"{DOMAIN}_charger_update"
 # pressure cycles on the tested charger.
 CHARGER_BRIDGE_INTERVAL_SECONDS = 1.0
 CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS = 1.5
-# Poll the charger's native session state alongside the priority live schedule.
-# Native status replies are short and provide an authoritative stop signal.
-CHARGER_SESSION_STATUS_EVERY_TICKS = 5
+# Recheck the charger's BRUSH_STATUS in one auxiliary slot. It proved more
+# reliable than SESSION_STATUS and provides an authoritative stop signal.
+CHARGER_BRUSH_STATUS_EVERY_TICKS = 5
 # Battery changes slowly, so collect it as an occasional auxiliary read. The
 # locally advanced timer keeps moving while this current-value sample is read.
 CHARGER_BATTERY_EVERY_TICKS = 30

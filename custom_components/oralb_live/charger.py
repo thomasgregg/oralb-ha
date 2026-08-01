@@ -35,9 +35,11 @@ from .charger_protocol import (
     ChargerPacket,
     build_charger_get,
     build_passthrough_read,
+    charger_live_auxiliary,
     decode_charger_advertisement,
     decode_charger_read,
     normalize_mac,
+    resolve_charger_session_running,
 )
 from .const import (
     CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS,
@@ -47,7 +49,7 @@ from .const import (
     CHARGER_IDLE_DISCONNECT_SECONDS,
     CHARGER_IDLE_PROBE_INTERVAL_SECONDS,
     CHARGER_POST_SESSION_READS,
-    CHARGER_SESSION_STATUS_EVERY_TICKS,
+    CHARGER_BRUSH_STATUS_EVERY_TICKS,
     CHARGER_SESSION_SYNC_INTERVAL_SECONDS,
     CHARGER_SNAPSHOT_INTERVAL_SECONDS,
     DATA_SOURCE_CHARGER,
@@ -152,6 +154,11 @@ class IOSenseBridge:
         self._last_connection_bits: int | None = None
         self._stopping = False
         self._discovery_announced = False
+
+    @property
+    def session_running(self) -> bool:
+        """Return whether this bridge currently owns an active brush session."""
+        return self._session_running
 
     @callback
     def async_start(self) -> None:
@@ -385,8 +392,10 @@ class IOSenseBridge:
     async def _async_refresh_session_state(self) -> None:
         """Read the two short charger values that gate live forwarding."""
         await self._async_get(ChargerCommand.SESSION_STATUS)
-        if not self._session_running:
-            await self._async_get(ChargerCommand.BRUSH_STATUS)
+        # Always refresh BRUSH_STATUS as well. It is the reliable authority on
+        # tested firmware and also clears a stale pre_run/run value after a
+        # connection interruption.
+        await self._async_get(ChargerCommand.BRUSH_STATUS)
 
     async def _async_post_session_sync(self, *, force: bool = False) -> None:
         """Collect retained brush data while the charger still owns the slot."""
@@ -506,29 +515,55 @@ class IOSenseBridge:
     def _apply_native_packet(self, packet: ChargerPacket) -> None:
         if packet.command in _CHARGER_DATA_KEYS:
             self.data[_CHARGER_DATA_KEYS[packet.command]] = packet.value
-        if packet.command == ChargerCommand.SESSION_STATUS:
-            if packet.value == "active_running":
-                self._cancel_disconnect()
-                if not self._session_running:
-                    self._session_running = True
-                    self.parent._charger_session_started()
-                elif not self.parent._session_active:
-                    # Re-enter tracking after a reload or missed state edge
-                    # while the charger still reports the session as active.
-                    self.parent._charger_session_started()
-                self._ensure_live_task()
-            elif packet.value in {"active_idle", "inactive"} and self._session_running:
-                self._session_running = False
-                self.parent._charger_session_ended()
-                self._schedule_disconnect()
-        elif packet.command == ChargerCommand.BRUSH_STATUS:
-            self.data["brush_connected"] = packet.value != "not_connected"
-            self.data["brush_charging"] = packet.value == "charging"
-            if packet.value == "run" and not self._session_running:
-                self._cancel_disconnect()
-                self._session_running = True
-                self.parent._charger_session_started()
-                self._ensure_live_task()
+        if packet.command == ChargerCommand.BRUSH_STATUS:
+            if packet.value == "not_connected":
+                self.data["brush_connected"] = False
+                self.data["brush_charging"] = False
+            elif packet.value == "charging":
+                self.data["brush_connected"] = True
+                self.data["brush_charging"] = True
+            elif packet.value in {"pre_run", "run", "idle"}:
+                self.data["brush_connected"] = True
+                self.data["brush_charging"] = False
+        if packet.command in {
+            ChargerCommand.SESSION_STATUS,
+            ChargerCommand.BRUSH_STATUS,
+        }:
+            running = resolve_charger_session_running(
+                self.data.get("session_status"),
+                self.data.get("brush_status"),
+                self._session_running,
+            )
+            if running:
+                self._start_session()
+            else:
+                self._end_session()
+
+    def _start_session(self) -> None:
+        """Start or recover a charger-managed brush stream."""
+        confirmed = (
+            self.data.get("brush_status") == "run"
+            or self.data.get("session_status") == "active_running"
+        )
+        self._cancel_disconnect()
+        if not self._session_running:
+            self._session_running = True
+            self.parent._charger_session_started(confirmed=confirmed)
+        elif not self.parent._session_active:
+            # Re-enter tracking after a reload or missed state edge while the
+            # charger still reports an active brush state.
+            self.parent._charger_session_started(confirmed=confirmed)
+        elif confirmed:
+            self.parent._confirm_session()
+        self._ensure_live_task()
+
+    def _end_session(self) -> None:
+        """Finish a charger-managed stream once the brush is genuinely quiet."""
+        if not self._session_running:
+            return
+        self._session_running = False
+        self.parent._charger_session_ended()
+        self._schedule_disconnect()
 
     def _ensure_live_task(self) -> None:
         if not self._session_running:
@@ -539,6 +574,7 @@ class IOSenseBridge:
 
     async def _async_live_loop(self) -> None:
         tick = 0
+        mode_observed = False
         try:
             while (
                 not self._stopping
@@ -555,34 +591,26 @@ class IOSenseBridge:
                 # the one-second pressure read miss its cycle. Slowly changing
                 # values occupy one auxiliary slot at startup; timer and pacer
                 # anchors alternate afterwards.
-                auxiliary_uuid = None
-                if tick == 0:
-                    auxiliary_uuid = "FF05"
-                elif tick == 1:
-                    auxiliary_uuid = "FF07"
-                elif tick == 2:
-                    auxiliary_uuid = "FF26"
-                elif tick == 3:
-                    # Read brush-head lifetime once while the charger is
-                    # guaranteed to own the brush connection.  Waiting until
-                    # post-session cleanup is unreliable on chargers that
-                    # release the brush slot immediately.
-                    auxiliary_uuid = "FF2D"
-                elif tick > 0 and tick % CHARGER_BATTERY_EVERY_TICKS == 0:
-                    auxiliary_uuid = "FF05"
-                else:
-                    auxiliary_uuid = "FF08" if tick % 2 == 0 else "FF09"
-                if auxiliary_uuid and (
-                    auxiliary := await self._async_passthrough(auxiliary_uuid)
-                ):
-                    await self.parent._async_apply_charger_passthrough(
-                        auxiliary_uuid, auxiliary
-                    )
-
-                if tick > 0 and tick % CHARGER_SESSION_STATUS_EVERY_TICKS == 0:
-                    await self._async_get(ChargerCommand.SESSION_STATUS)
+                auxiliary_action = charger_live_auxiliary(
+                    tick,
+                    mode_observed=mode_observed,
+                    brush_status_every_ticks=CHARGER_BRUSH_STATUS_EVERY_TICKS,
+                    battery_every_ticks=CHARGER_BATTERY_EVERY_TICKS,
+                )
+                if auxiliary_action == "BRUSH_STATUS":
+                    # BRUSH_STATUS proved more reliable than SESSION_STATUS on
+                    # the tested firmware. It occupies the auxiliary slot so
+                    # pressure remains the first of only two serial requests.
+                    await self._async_get(ChargerCommand.BRUSH_STATUS)
                     if not self._session_running:
                         break
+                else:
+                    if auxiliary := await self._async_passthrough(auxiliary_action):
+                        await self.parent._async_apply_charger_passthrough(
+                            auxiliary_action, auxiliary
+                        )
+                        if auxiliary_action == "FF07":
+                            mode_observed = True
 
                 self.parent._advance_charger_timer()
                 self.parent.data["data_source"] = DATA_SOURCE_CHARGER

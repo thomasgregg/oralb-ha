@@ -171,7 +171,7 @@ reconciliation.
 | Smiley | Current brush display face |
 | Battery | Brush battery percentage |
 | Battery diagnostics | Estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
-| Brush-head diagnostics | Remaining days and brushing seconds where supported |
+| Brush-head diagnostics | Estimated calendar days and active brushing hours remaining where supported |
 | Last session | Timestamp plus complete session attributes |
 | Last session duration | Duration of the latest session |
 | Sessions today | Daily session counter, retained across restarts |

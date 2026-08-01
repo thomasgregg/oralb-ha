@@ -135,6 +135,67 @@ ENUMS: dict[ChargerCommand, dict[int, str]] = {
     },
 }
 
+ACTIVE_BRUSH_SESSION_STATES = frozenset({"pre_run", "run"})
+QUIET_BRUSH_STATES = frozenset({"not_connected", "idle", "charging"})
+
+
+def resolve_charger_session_running(
+    session_status: str | None,
+    brush_status: str | None,
+    currently_running: bool = False,
+) -> bool:
+    """Resolve charger session state, preferring the reliable brush status.
+
+    Tested iO Sense firmware can leave SESSION_STATUS at ``inactive`` while a
+    real brushing session reports ``pre_run`` through BRUSH_STATUS. Conversely,
+    BRUSH_STATUS changes to idle/charging promptly at the end of a session.
+    """
+    if brush_status in ACTIVE_BRUSH_SESSION_STATES:
+        return True
+    if brush_status in QUIET_BRUSH_STATES:
+        return False
+    # Any non-null value outside the decoded active/quiet sets is an
+    # inconclusive sample, not evidence that brushing stopped. Preserve an
+    # already-running stream rather than let the firmware's known-stale
+    # SESSION_STATUS split it into two sessions. ``None`` still permits the
+    # native session-status fallback before BRUSH_STATUS has been available.
+    if currently_running and brush_status is not None:
+        return True
+    if session_status == "active_running":
+        return True
+    if session_status in {"active_idle", "inactive"}:
+        return False
+    return currently_running
+
+
+def charger_live_auxiliary(
+    tick: int,
+    *,
+    mode_observed: bool,
+    brush_status_every_ticks: int,
+    battery_every_ticks: int,
+) -> str:
+    """Return the single auxiliary request for a charger live-loop tick."""
+    if tick > 0 and tick % brush_status_every_ticks == 0:
+        return "BRUSH_STATUS"
+    if tick == 0:
+        return "FF05"
+    if tick == 1:
+        return "FF07"
+    if tick == 2:
+        return "FF26"
+    if tick == 3:
+        return "FF2D"
+    # Retry the mode read without starving timer/pacer anchors if its first
+    # response was lost. Once observed, no extra request is needed.
+    if not mode_observed and tick >= 6 and (tick - 6) % 10 == 0:
+        return "FF07"
+    # Status ticks collide with the regular battery interval, so place each
+    # slow battery refresh in the immediately preceding auxiliary slot.
+    if tick > 0 and (tick + 1) % battery_every_ticks == 0:
+        return "FF05"
+    return "FF08" if tick % 2 == 0 else "FF09"
+
 
 @dataclass(frozen=True)
 class ChargerPacket:

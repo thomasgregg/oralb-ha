@@ -353,6 +353,18 @@ command surface:
 | `0x44` | clock text | text currently shown by the charger |
 | `0x46` | brush paired | boolean |
 
+On the tested firmware, `SESSION_STATUS` sometimes remained `inactive` for an
+entire genuine 77-second session while `BRUSH_STATUS` reported `pre_run`.
+`BRUSH_STATUS` is therefore the live-session authority: `pre_run` and `run`
+keep forwarding active, while `idle`, `charging` and `not_connected` end it.
+The native session status remains a fallback when brush status is unavailable.
+Selection-menu/pre-run observations remain provisional until the brush timer
+advances or an explicit running state confirms real brushing. Static retained
+timer values, menu visits and docking blips are discarded regardless of length,
+so they cannot replace the latest real session. A ten-second elapsed-time
+minimum remains as a secondary guard when a confirmed session has no usable
+brush-timer duration.
+
 Other reconstructed commands include provisioning credentials, Wi-Fi SSID
 and security, OTA discovery, low-power mode, night-light schedules, custom
 animations, demo mode, debug logging and system maintenance. Oral-B Live does
@@ -515,12 +527,13 @@ derived two-read timings are:
 Oral-B Live therefore uses a strict two-read schedule: pressure on every
 one-second tick and one auxiliary value. Battery, mode, pacer configuration and
 brush-head remainder occupy the first auxiliary slots; timer and pacer sector
-then alternate, with battery refreshed periodically. A separate local 1 Hz
+then alternate, with battery refreshed periodically and `BRUSH_STATUS` taking
+one auxiliary slot every five ticks. A separate local 1 Hz
 ticker advances the displayed timer, pacer sector and elapsed sector time
 independently of BLE request latency; `FF08` and `FF09` remain the authoritative
 correction anchors. `FF0D` is not polled by the shipped integration because a
 third serial request can delay the live pressure/card path. Charger-native
-session state is checked periodically to provide an explicit stop signal.
+brush state is checked periodically to provide an explicit stop signal.
 
 ## Retained session summary (`FF29`)
 
