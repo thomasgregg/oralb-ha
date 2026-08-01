@@ -197,6 +197,10 @@ reconciliation.
 | Last session duration | Duration of the latest session |
 | Sessions today | Daily session counter, retained across restarts |
 
+The **Sector** entity is the brush's configured pacer prompt, not a measurement
+of the brush's physical position. It changes when the pacer advances, so a
+short session can remain on a single sector.
+
 The **Last session** attributes can include:
 
 - duration and brushing mode;

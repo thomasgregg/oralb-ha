@@ -31,6 +31,9 @@ Evidence in this reference is classified as:
 | Inferred | Best explanation consistent with captures, but not decrypted or directly exposed |
 
 The test pair was an iO Series 10 and iO Sense charger on firmware `0.3.4`.
+The brush returned `36 08 52` from `FF02`: model ID `0x36`, protocol version
+`0x08` and firmware revision `0x52`. The physical product identified it as a
+Series 10; that marketing model is not encoded by this generic model ID.
 
 ## Direct toothbrush BLE
 
@@ -123,11 +126,45 @@ It also performs initial reads of `FF02`, `FF05`, `FF08`, `FF0A`, `FF25`,
 display face, mode availability, target/pacer configuration and brush-head
 remainder without waiting for each value to change.
 
+`FF02` and the corresponding advertisement bytes identify the protocol model,
+not necessarily the marketing model printed on the brush. In the reconstructed
+model map, `0x34` and `0x35` identify iO Series 4 and 5 respectively, while
+`0x30`, `0x31`, `0x32` and the captured `0x36` report only the generic iO
+Series family.
+
+The length-gated `FF05` battery layout is:
+
+| Offset | Encoding | Content |
+| --- | --- | --- |
+| `0` | unsigned byte | battery percentage |
+| `1..2` | little-endian unsigned 16-bit | estimated brushing runtime remaining on the current charge, in seconds; `0xFFFF` means unavailable |
+| `3..4` | little-endian unsigned 16-bit | battery voltage in millivolts |
+| `5..6` | little-endian signed 16-bit | battery current in milliamperes; `-1` means unavailable |
+| `7` | signed byte | battery temperature in degrees Celsius |
+
+Protocol 6 introduced the remaining-runtime field. Protocol 8 extended the
+payload with voltage, signed current and temperature. Older or differently
+featured brushes can return a shorter payload, so fields are decoded only when
+their bytes are present.
+
 `FF06` is the button characteristic, not pressure. Pressure is `FF0B`; its
 first byte is `0` low, `1` normal or `2` high. A captured protocol-8/9 payload
 also contains a timestamp, force, motor angle, motor target and identifier.
 Oral-B Live exposes the pressure state and, for charger-forwarded values, raw
-force as an attribute.
+force as an attribute. A direct `FF06` read during hard brushing returned
+`00 00 00 00`; that capture helped confirm that a constant zero there is a
+button state, not a failed pressure sensor.
+
+The recognized `FF0A` display-face values are:
+
+| Value | Face |
+| ---: | --- |
+| `0` | off |
+| `1` | standard |
+| `2..11` | `special_2` through `special_11` |
+
+Values through `special_10` were confirmed in captured charger-forwarded
+reads. Unknown future values remain visible as their raw face number.
 
 `FF08` is elapsed time for the active brushing session. It is unrelated to the
 estimated battery runtime carried by `FF05`.
@@ -135,7 +172,16 @@ estimated battery runtime carried by `FF05`.
 For the observed direct `FF09` representation, the low three bits carry the
 sector value. Zero means no sector and `7` represents the configured last
 sector. Charger passthrough uses the zero-based representation documented
-under [Zone numbering](#zone-numbering).
+under [Zone numbering](#zone-numbering). The sector is the brush's configured
+pacer prompt, not a spatial measurement of where the brush is in the mouth.
+It normally notifies only when the pacer advances at the intervals configured
+through `FF26`; a short session can therefore report only one sector.
+
+On the tested direct connection, `FF29` changed within seconds of a completed
+session and the latest record was anonymously readable without first issuing
+an `FF21` control command. Charger passthrough has the separate post-session
+availability constraint described under
+[Availability after a session](#availability-after-a-session).
 
 ### Toothbrush advertisement
 
