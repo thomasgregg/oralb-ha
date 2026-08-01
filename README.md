@@ -211,16 +211,30 @@ The **Last session** attributes can include:
 A successfully matched charger appears as a separate device connected through
 the toothbrush device. Its read-only entities include:
 
-- charger/session and paired-brush status;
-- Wi-Fi state, RSSI and cloud connection status;
-- displayed clock text, timezone, 12/24-hour format and date-display format;
-- clock brightness, night-light mode and ring colour;
-- firmware/hardware identity and uptime;
-- internet type, automatic-update state, touchpad status and brush connection
-  policy.
+| Entity | Description |
+| --- | --- |
+| State | Charger availability and connection state, with firmware, hardware, MAC, pairing, charging and bridge details as attributes |
+| Session status | Whether the charger reports an active brushing session |
+| Brush status | Paired-brush connection and charging status reported by the charger |
+| Wi-Fi status | Current charger Wi-Fi state |
+| Wi-Fi signal | Received signal strength in dBm |
+| Cloud connection | Charger connection to the Oral-B service; the integration itself does not use the cloud |
+| Internet type | Network transport reported by the charger |
+| Displayed time | Clock text currently shown on the charger |
+| Timezone | Charger timezone setting |
+| Clock format | 12- or 24-hour display mode |
+| Date display format | Configured date layout |
+| Clock brightness | Configured clock brightness percentage |
+| Night-light mode | Current night-light configuration |
+| Ring color | Configured charger ring color |
+| Uptime | Time since the charger last restarted |
+| Automatic updates | Whether automatic charger firmware updates are enabled |
+| Touchpad status | Current rear-touchpad state |
+| Brush connection policy | Charger policy for maintaining its paired-brush connection |
 
-Some low-value diagnostics are disabled by default. The integration does not
-write display, light, network or update settings.
+Uptime, automatic updates, touchpad status and brush connection policy are
+disabled by default. The integration does not write display, light, network or
+update settings.
 
 ## Installation
 
