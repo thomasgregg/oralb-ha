@@ -188,6 +188,8 @@ class OralBLiveCoordinator:
             "sessions_today": None,
         }
         self.available = False
+        self._advertisement_available = False
+        self._direct_available = False
         self._client: BleakClientWithServiceCache | None = None
         self._connect_lock = asyncio.Lock()
         self._connect_task: asyncio.Task | None = None
@@ -308,7 +310,7 @@ class OralBLiveCoordinator:
         payload = service_info.manufacturer_data.get(ORALB_MANUFACTURER_ID)
         if not payload or len(payload) < 11:
             return
-        self.available = True
+        self._advertisement_available = True
         self.data["rssi"] = service_info.rssi
         self._apply_device_identity(
             payload[ADV_IDX_MODEL],
@@ -360,8 +362,8 @@ class OralBLiveCoordinator:
                 self._maybe_schedule_sync()
 
     @callback
-    def _async_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
-        self.available = bool(self.charger and self.charger.available)
+    def _async_unavailable(self, _service_info: BluetoothServiceInfoBleak) -> None:
+        self._advertisement_available = False
         self._push()
 
     # --------------------------------------------------------------- active
@@ -407,6 +409,7 @@ class OralBLiveCoordinator:
                 _LOGGER.debug("%s: setup after connect failed: %s", self.name, err)
                 await self._async_disconnect()
                 return
+            self._direct_available = True
             self.data["live"] = True
             self.data["data_source"] = DATA_SOURCE_DIRECT
             self._push()
@@ -484,12 +487,10 @@ class OralBLiveCoordinator:
     def _charger_discovered(self, charger: IOSenseBridge) -> None:
         """Attach a locally verified iO Sense paired to this brush."""
         self.data["charger_address"] = charger.address
-        self.available = True
         self._push()
 
     def _charger_session_started(self, *, confirmed: bool = False) -> None:
         """Start session tracking from charger-native state."""
-        self.available = True
         self.data["data_source"] = DATA_SOURCE_CHARGER
         self.data["live"] = True
         self.data["time"] = 0
@@ -517,7 +518,6 @@ class OralBLiveCoordinator:
     ) -> None:
         """Apply a read-only brush value forwarded by the iO Sense."""
         raw = bytes(payload)
-        self.available = True
         self.data["data_source"] = DATA_SOURCE_CHARGER
         if short_uuid == "FF04" and raw:
             self._apply_state(raw[0])
@@ -1418,6 +1418,7 @@ class OralBLiveCoordinator:
         self._disconnect_task = self.hass.async_create_task(_release())
 
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
+        self._direct_available = False
         self.data["live"] = False
         self._client = None
         if self._stopping:
@@ -1434,6 +1435,7 @@ class OralBLiveCoordinator:
 
     async def _async_disconnect(self) -> None:
         client, self._client = self._client, None
+        self._direct_available = False
         self.data["live"] = False
         if client and client.is_connected:
             try:
@@ -1444,11 +1446,14 @@ class OralBLiveCoordinator:
 
     # --------------------------------------------------------------- update
     def _push(self) -> None:
+        self.available = (
+            self._advertisement_available
+            or self._direct_available
+            or bool(self.charger and self.charger.available)
+        )
         if self.charger:
             self.data["charger_address"] = self.charger.address
             self.data["charger_bridge_latency_ms"] = self.charger.data.get(
                 "last_response_latency_ms"
             )
-            if self.charger.available:
-                self.available = True
         async_dispatcher_send(self.hass, f"{SIGNAL_UPDATE}_{self.address}", self.data)

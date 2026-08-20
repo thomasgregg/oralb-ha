@@ -37,6 +37,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
+from .availability import resolve_toothbrush_entity_availability
 from .const import (
     DOMAIN,
     SIGNAL_CHARGER_DISCOVERED,
@@ -427,6 +428,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         self.coordinator = coordinator
         self.entity_description: OralBSensorDescription = description
         self._attr_unique_id = f"{coordinator.address}-{description.key}"
+        self._attr_native_value = coordinator.data.get(description.data_key)
         self._last_device_identity: tuple[Any, ...] | None = None
         self._attr_device_info = self._device_info(coordinator.data)
 
@@ -668,9 +670,19 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
     @property
     def available(self) -> bool:
         if self.entity_description.restore:
-            # Restored values stay readable even when the brush is away.
+            # Restored values stay readable even before fresh brush data arrives.
             return True
-        return self.coordinator.available
+        available, _assumed = resolve_toothbrush_entity_availability(
+            self.coordinator.available, self._attr_native_value is not None
+        )
+        return available
+
+    @property
+    def assumed_state(self) -> bool:
+        _available, assumed = resolve_toothbrush_entity_availability(
+            self.coordinator.available, self._attr_native_value is not None
+        )
+        return assumed
 
 
 class IOSenseSensor(SensorEntity):

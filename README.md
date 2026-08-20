@@ -146,6 +146,11 @@ The state entity exposes the active `data_source` so the path is always visible:
 Sources are selected automatically inside the chosen connection option.
 Entity IDs stay the same when the source changes.
 
+The toothbrush is a sleepy Bluetooth device and can stop advertising while it
+is docked or otherwise inactive. Oral-B Live keeps the last valid toothbrush
+values available in that situation and marks them as assumed until a fresh
+advertisement, direct connection or charger update arrives.
+
 Completed sessions are saved immediately from the live or passive stream. The
 brush retains one authoritative summary containing exact duration, mode,
 pressure totals, event counts and ending battery. Through the charger it
