@@ -87,7 +87,8 @@ OPTIONAL_NOTIFY_CHARS = (
 
 # --- Advertisement payload (manufacturer data 0x00DC, 11 bytes) --------------
 # [0] protocol  [1] model  [2] firmware  [3] state  [4] pressure/flags
-# [5..6] brush time [minutes, seconds]  [7] mode  [8] sector
+# [5..6] brush time [minutes, seconds]  [7] mode
+# [8] sector (bits 0..2) / display face (bits 3..5)
 # [9] sector timer  [10] number of sectors
 ADV_IDX_PROTOCOL = 0
 ADV_IDX_MODEL = 1

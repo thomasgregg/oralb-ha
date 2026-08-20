@@ -101,6 +101,7 @@ from .protocol import (
     advance_pacer_progress,
     advance_session_timer_evidence,
     decode_charger_sector,
+    decode_display_face,
     decode_sector,
     derive_pacer_progress,
     parse_available_modes,
@@ -339,6 +340,9 @@ class OralBLiveCoordinator:
             self._track_session_time(self.data["time"], confirm_session=track_session)
             self._track_session_pressure(self.data["pressure"])
             self._apply_mode(payload[ADV_IDX_MODE])
+            self._apply_smiley(
+                bytes((decode_display_face(payload[ADV_IDX_SECTOR]),))
+            )
             self._apply_sector(
                 payload[ADV_IDX_SECTOR],
                 (

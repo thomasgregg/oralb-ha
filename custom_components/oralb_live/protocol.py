@@ -246,6 +246,11 @@ def decode_sector(
     return f"sector_{quadrant}", quadrant, decoded_total
 
 
+def decode_display_face(raw: int) -> int:
+    """Decode the three-bit display face carried beside the sector value."""
+    return (raw & 0x38) >> 3
+
+
 def decode_charger_sector(
     raw: int, total: int | None, configured_total: int | None
 ) -> tuple[str, int | None, int | None]:

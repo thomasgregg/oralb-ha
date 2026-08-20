@@ -204,6 +204,20 @@ class ProtocolDecoderTests(unittest.TestCase):
             ("sector_3", 3, 4),
         )
 
+    def test_display_face_from_sector_byte(self) -> None:
+        expected = ["off", "standard"] + [
+            f"special_{face}" for face in range(2, 8)
+        ]
+        for face, name in enumerate(expected):
+            # Sector and unrelated high bits must not leak into the face.
+            raw = 0xC0 | (face << 3) | 0x05
+            decoded = protocol.decode_display_face(raw)
+            self.assertEqual(face, decoded)
+            self.assertEqual(name, const.SMILEYS[decoded])
+
+        # Captured session-end byte: face 6 plus last-sector sentinel 7.
+        self.assertEqual(6, protocol.decode_display_face(0x37))
+
     def test_sector_sentinels(self) -> None:
         self.assertEqual(
             protocol.decode_sector(0xF0, None, 4),

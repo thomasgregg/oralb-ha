@@ -250,13 +250,20 @@ value is:
 | `4` | pressure/status flags |
 | `5..6` | brushing time as `[minutes, seconds]` |
 | `7` | brushing mode |
-| `8` | sector; low three bits contain the sector value |
+| `8` | sector in bits 0–2; display face in bits 3–5 |
 | `9` | seconds elapsed in the current sector |
 | `10` | configured number of sectors |
 
 Advertisements provide the passive fallback and are the data source used by
 Home Assistant's built-in Oral-B integration. They are unavailable while any
 client owns the toothbrush connection slot.
+
+The display face is decoded as `(payload[8] & 0x38) >> 3` and uses the same
+numbering as `FF0A`: `0` is `off`, `1` is `standard` and `2..7` are
+`special_2` through `special_7`. The three-bit advertisement field cannot
+represent the additional values available through FF0A. The face remains
+useful outside the running state because the brush advertises its session
+result after brushing, while the low sector bits are decoded independently.
 
 ## iO Sense advertisement
 

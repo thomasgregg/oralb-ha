@@ -173,7 +173,7 @@ reconciliation.
 | Pacer sector timer | Elapsed seconds in the current pacer interval while brushing; `unknown` outside an active session |
 | Pacer sector count | Configured pacer interval count |
 | Target duration | Sum of configured per-sector times |
-| Smiley | Current brush display face |
+| Smiley | Current brush display face, decoded passively from advertisements or read from FF0A over GATT |
 | Battery | Brush battery percentage |
 | Battery diagnostics | Estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
 | Brush-head diagnostics | Estimated calendar days and active brushing hours remaining where supported |
@@ -189,6 +189,10 @@ The **Pacer sector timer** counts elapsed seconds within that pacer sector. In
 charger/app-compatible mode both pacer entities advance locally at 1 Hz from
 the brush's configured schedule, while regular brush reads correct them to the
 toothbrush's authoritative state.
+
+The **Smiley** entity follows the face currently shown by the brush. Passive
+advertisements carry faces `off` through `special_7`; direct and iO Sense FF0A
+reads can additionally expose newer face values supported by the firmware.
 
 The entities used by Toothbrush Card deliberately retain the same meanings as
 Home Assistant's built-in Oral-B integration. In particular, the `sector`
