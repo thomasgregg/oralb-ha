@@ -270,7 +270,9 @@ class OralBLiveCoordinator:
             # The brush stops advertising while a client (for example an
             # iO Sense charger) holds its single slot, so advertisements
             # alone are not a reliable trigger. Poll for a connection.
-            self._reconnect_task = self.hass.async_create_task(self._reconnect_loop())
+            self._reconnect_task = self.hass.async_create_background_task(
+                self._reconnect_loop(), "oralb_live_reconnect_loop"
+            )
 
     async def async_stop(self) -> None:
         self._stopping = True
