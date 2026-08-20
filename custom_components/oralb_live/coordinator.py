@@ -327,9 +327,9 @@ class OralBLiveCoordinator:
             self._push()
             return
         state_raw = payload[ADV_IDX_STATE]
-        self._apply_state(state_raw, track_session=track_session)
         # While live notifications flow, they are fresher than adverts.
-        if not self.data["live"]:
+        adv_live = self.data["live"]
+        if not adv_live:
             self.data["data_source"] = DATA_SOURCE_ADVERTISEMENT
             self.data["time"] = _decode_time(
                 payload[ADV_IDX_TIME_HI], payload[ADV_IDX_TIME_LO]
@@ -337,6 +337,22 @@ class OralBLiveCoordinator:
             self.data["pressure"] = PRESSURE_FROM_ADV.get(
                 payload[ADV_IDX_PRESSURE], "normal"
             )
+            # The advertisement that first reports a quiet state still carries
+            # the timer of the session that just ended, and it is the highest
+            # value the brush ever shows for it. Sampled after _apply_state it
+            # is dropped, because the session is closed by then and
+            # _track_session_time only accepts values while one is active - so
+            # the recorded duration would stay at the last value seen while the
+            # brush was still advertising as running, up to a full advertising
+            # interval short of what the brush displayed.
+            self._track_session_time(self.data["time"], confirm_session=track_session)
+        self._apply_state(state_raw, track_session=track_session)
+        if not adv_live:
+            # The other side of the same transition: a session that begins with
+            # this advertisement was not active when the sample above was
+            # offered, so its first value needs the second chance. Repeating it
+            # is safe - the tracker keeps a maximum, and the timer evidence it
+            # collects only ever counts a value that moved forward.
             self._track_session_time(self.data["time"], confirm_session=track_session)
             self._track_session_pressure(self.data["pressure"])
             self._apply_mode(payload[ADV_IDX_MODE])
