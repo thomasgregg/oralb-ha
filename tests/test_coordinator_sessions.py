@@ -312,5 +312,53 @@ class SessionSyncRetryTests(unittest.TestCase):
         c.hass.async_create_background_task.assert_not_called()
 
 
+class LiveSectorNumberingTests(unittest.TestCase):
+    """FF09 counts its quadrants from zero, the advertisement from one."""
+
+    def _coordinator(self):
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        c = coordinator.OralBLiveCoordinator(
+            MagicMock(), "AA:BB:CC:DD:EE:FF", "test", const.CONNECTION_MODE_LIVE
+        )
+        c._maybe_schedule_sync = lambda *args, **kwargs: None
+        c._schedule_connect = lambda *args, **kwargs: None
+        c.data["state_raw"] = const.RUNNING_STATE
+        return c
+
+    def _notify(self, c, quadrant: int, total: int = 4) -> None:
+        """Hand the coordinator one FF09 notification."""
+        char = types.SimpleNamespace(uuid=const.CHAR_SECTOR)
+        c._on_notify(char, bytearray([quadrant, 0, total]))
+
+    def test_the_first_quadrant_is_reported_as_a_sector(self) -> None:
+        """Zero means the first zone, not the absence of one.
+
+        Read as an advertisement value it means "no sector defined", which
+        is why the opening half minute of every session showed no zone at
+        all.
+        """
+        c = self._coordinator()
+        self._notify(c, 0)
+
+        self.assertEqual(c.data["sector"], "sector_1")
+
+    def test_each_quadrant_keeps_its_own_number(self) -> None:
+        """A whole four-zone session, one notification per zone."""
+        c = self._coordinator()
+        for quadrant, expected in enumerate(
+            ("sector_1", "sector_2", "sector_3", "sector_4")
+        ):
+            self._notify(c, quadrant)
+            self.assertEqual(c.data["sector"], expected)
+
+    def test_the_advertisement_still_counts_from_one(self) -> None:
+        """The other wire format is untouched: its 1 is the first zone."""
+        c = self._coordinator()
+        c.data["live"] = False
+        c._parse_advertisement(_advertisement(_payload(3, 10, sector=1)))
+
+        self.assertEqual(c.data["sector"], "sector_1")
+
+
 if __name__ == "__main__":
     unittest.main()

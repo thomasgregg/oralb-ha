@@ -102,8 +102,8 @@ from .const import (
 from .protocol import (
     advance_pacer_progress,
     advance_session_timer_evidence,
-    decode_charger_sector,
     decode_display_face,
+    decode_ff09_sector,
     decode_sector,
     derive_pacer_progress,
     parse_available_modes,
@@ -503,7 +503,7 @@ class OralBLiveCoordinator:
         elif uuid == CHAR_MODE and payload:
             self._apply_mode(payload[0])
         elif uuid == CHAR_SECTOR and payload:
-            self._apply_sector(
+            self._apply_ff09_sector(
                 payload[0],
                 payload[2] if len(payload) >= 3 else None,
                 payload[1] if len(payload) >= 2 else None,
@@ -567,7 +567,7 @@ class OralBLiveCoordinator:
             self._track_session_time(seconds, confirm_session=True)
             self._update_pacer_progress()
         elif short_uuid == "FF09" and len(raw) >= 3:
-            self._apply_charger_sector(raw[0], raw[2], raw[1])
+            self._apply_ff09_sector(raw[0], raw[2], raw[1])
         elif short_uuid == "FF0A":
             self._apply_smiley(raw)
         elif short_uuid == "FF0B" and raw:
@@ -1337,12 +1337,12 @@ class OralBLiveCoordinator:
             self.data["number_of_sectors"] = decoded_total
         self._apply_pacer_anchor(quadrant, sector_timer)
 
-    def _apply_charger_sector(
+    def _apply_ff09_sector(
         self, raw: int, total: int | None, sector_timer: int | None = None
     ) -> None:
-        """Apply the zero-based quadrant value returned by charger reads."""
+        """Apply a zero-based quadrant value from FF09."""
         self.data["sector_raw"] = raw
-        sector, quadrant, decoded_total = decode_charger_sector(
+        sector, quadrant, decoded_total = decode_ff09_sector(
             raw,
             total,
             self.data.get("number_of_sectors"),

@@ -171,12 +171,11 @@ reads. Unknown future values remain visible as their raw face number.
 `FF08` is elapsed time for the active brushing session. It is unrelated to the
 estimated battery runtime carried by `FF05`.
 
-For the observed direct `FF09` representation, the low three bits carry the
-pacer-sector value. Zero means no sector and `7` represents the configured last
-sector. Charger passthrough uses the zero-based representation documented
-under [Pacer numbering](#pacer-numbering). The sector is the brush's configured
-pacer prompt, not a spatial measurement of where the brush is in the mouth.
-It normally notifies only when the pacer advances at the intervals configured
+For the observed `FF09` representation, direct notifications and charger
+passthrough both carry the zero-based pacer-sector value documented under
+[Pacer numbering](#pacer-numbering). The sector is the brush's configured pacer
+prompt, not a spatial measurement of where the brush is in the mouth. It
+normally notifies only when the pacer advances at the intervals configured
 through `FF26`; a short session can therefore report only one sector.
 
 ### Motion data and mouth-position inference
@@ -504,13 +503,13 @@ entities.
 
 ### Pacer numbering
 
-Direct toothbrush notifications and charger passthrough use different
-presentation rules in the observed payloads. Charger `FF09` pacer IDs are
-zero-based: raw `0` is `sector_1`, raw `3` is `sector_4`, and `0xFF` denotes
-the configured last sector. `0xF0` means that no sector is defined. The
-three-byte value is `[sector, elapsed sector seconds, configured sector count]`.
-Oral-B Live advances this pacer state locally from the `FF26` schedule between
-reads and treats each `FF09` response as an authoritative correction.
+Direct toothbrush notifications and charger passthrough use the same `FF09`
+presentation rules in the observed payloads. Pacer IDs are zero-based: raw `0`
+is `sector_1`, raw `3` is `sector_4`, and `0xFF` denotes the configured last
+sector. `0xF0` means that no sector is defined. The three-byte value is
+`[sector, elapsed sector seconds, configured sector count]`. Oral-B Live
+advances this pacer state locally from the `FF26` schedule between reads and
+treats each `FF09` response as an authoritative correction.
 
 ## Sustained polling benchmark
 
@@ -667,7 +666,7 @@ For that reason Oral-B Live:
 | --- | --- |
 | `charger_protocol.py` | pure advertisement, native packet and passthrough decoders/builders |
 | `charger.py` | automatic pairing, connection lifecycle, serial request scheduler and charger diagnostics |
-| `protocol.py` | pure toothbrush payload decoders including exact `FF29` and zero-based charger zones |
+| `protocol.py` | pure toothbrush payload decoders including exact `FF29` and zero-based `FF09` pacer sectors |
 | `coordinator.py` | source selection, live state, timer/pacer extrapolation, sampled pressure tracking and retained-session reconciliation |
 | `sensor.py` | toothbrush entities plus a separate matched iO Sense device |
 | `tests/test_protocol.py` | captured-packet regression tests with no Home Assistant dependency |

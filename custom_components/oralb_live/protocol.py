@@ -261,10 +261,10 @@ def decode_display_face(raw: int) -> int:
     return (raw & 0x38) >> 3
 
 
-def decode_charger_sector(
+def decode_ff09_sector(
     raw: int, total: int | None, configured_total: int | None
 ) -> tuple[str, int | None, int | None]:
-    """Decode the zero-based FF09 pacer sector returned by charger passthrough."""
+    """Decode the zero-based FF09 pacer sector."""
     decoded_total = total if total and 1 <= total <= 8 else configured_total
     if raw == 0xF0:
         return "no_sector", None, decoded_total

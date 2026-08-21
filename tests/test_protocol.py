@@ -248,17 +248,17 @@ class ProtocolDecoderTests(unittest.TestCase):
             ("sector_6", 6, 6),
         )
 
-    def test_charger_sector_is_zero_based(self) -> None:
+    def test_ff09_sector_is_zero_based(self) -> None:
         self.assertEqual(
-            protocol.decode_charger_sector(0, 6, None),
+            protocol.decode_ff09_sector(0, 6, None),
             ("sector_1", 1, 6),
         )
         self.assertEqual(
-            protocol.decode_charger_sector(3, None, 6),
+            protocol.decode_ff09_sector(3, None, 6),
             ("sector_4", 4, 6),
         )
         self.assertEqual(
-            protocol.decode_charger_sector(0xF0, None, 6),
+            protocol.decode_ff09_sector(0xF0, None, 6),
             ("no_sector", None, 6),
         )
 
