@@ -11,6 +11,18 @@ summary. It provides live timer, pressure, pacer and mode entities, keeps a
 persistent brushing log, and exposes supported battery, brush-head, display
 and charger diagnostics without using the Oral-B cloud.
 
+<p align="center">
+  <img src="docs/images/toothbrush-device.png" alt="Oral-B Live toothbrush device page in Home Assistant" width="900">
+  <br>
+  <sub>Toothbrush entities and session activity</sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/io-sense-charger-device.png" alt="Oral-B Live iO Sense charger device page in Home Assistant" width="900">
+  <br>
+  <sub>iO Sense charger entities and diagnostics</sub>
+</p>
+
 ## Contents
 
 - [How it works](#how-it-works)
