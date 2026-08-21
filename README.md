@@ -33,10 +33,10 @@ and charger diagnostics without using the Oral-B cloud.
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Requirements](#requirements)
-- [iO Sense diagnostic probe](#io-sense-diagnostic-probe)
 - [Protocol reference](#protocol-reference)
 - [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
+  - [iO Sense diagnostic probe](#io-sense-diagnostic-probe)
 
 ## How it works
 
@@ -389,23 +389,6 @@ bluetooth_proxy:
   active: true
 ```
 
-## iO Sense diagnostic probe
-
-If a powered iO Sense is not discovered, `tools/iosense_probe.py` can find a
-likely charger with a computer's local Bluetooth adapter, capture its complete
-advertisement, enumerate its GATT layout and request a small identity snapshot
-using GET operations only. It is intended for unsupported-device and discovery
-reports, including possible newer charger hardware revisions.
-
-The tool runs independently of Home Assistant and does not use ESPHome or
-Shelly Bluetooth proxies. It never sends POST/SET commands. A scan-only mode is
-available when no connection or GATT write should occur. The standalone script
-is attached to each GitHub release as `iosense_probe.py`.
-
-See the [complete diagnostic-probe guide](tools/README.md#io-sense-diagnostic-probe)
-for prerequisites, virtual-environment setup, safety details, commands, report
-contents, troubleshooting and how to attach a capture to an issue.
-
 ## Protocol reference
 
 See [the full protocol reference](docs/protocol.md) for all UUIDs, packet
@@ -444,6 +427,23 @@ kept there rather than duplicated in this user guide.
 - Wake the brush once so the charger advertises its paired/connection state.
 - Check the toothbrush state entity's `charger_address` and `data_source`
   attributes.
+
+### iO Sense diagnostic probe
+
+If those checks do not find a powered iO Sense, `tools/iosense_probe.py` can
+find a likely charger with a computer's local Bluetooth adapter, capture its
+complete advertisement, enumerate its GATT layout and request a small identity
+snapshot using GET operations only. It is intended for unsupported-device and
+discovery reports, including possible newer charger hardware revisions.
+
+The tool runs independently of Home Assistant and does not use ESPHome or
+Shelly Bluetooth proxies. It never sends POST/SET commands. A scan-only mode is
+available when no connection or GATT write should occur. The standalone script
+is attached to each GitHub release as `iosense_probe.py`.
+
+See the [complete diagnostic-probe guide](tools/README.md#io-sense-diagnostic-probe)
+for prerequisites, virtual-environment setup, safety details, commands, report
+contents, troubleshooting and how to attach a capture to an issue.
 
 ### Live values use advertisements
 
