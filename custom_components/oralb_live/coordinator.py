@@ -648,7 +648,9 @@ class OralBLiveCoordinator:
         )
         if not due:
             return
-        self._sync_task = self.hass.async_create_task(self._async_sync_sequence())
+        self._sync_task = self.hass.async_create_background_task(
+            self._async_sync_sequence(), "oralb_live_sync_sequence"
+        )
 
     async def _async_sync_sequence(self) -> None:
         """Sync every session generation, including back-to-back sessions."""
@@ -848,13 +850,6 @@ class OralBLiveCoordinator:
                 bytes(record).hex(" "),
             )
             return "invalid"
-        battery_end = parsed.get("battery_end")
-        if isinstance(battery_end, int):
-            # The retained record remains a useful last-known battery reading
-            # even when this session was already counted before a restart.
-            self.data["battery"] = battery_end
-            self.data["battery_updated_at"] = dt_util.utcnow()
-            self.data["battery_source"] = DATA_SOURCE_SESSION
         session_ts = int(parsed["session_timestamp"])
         duration = int(parsed["duration"])
         mode_raw = int(parsed["mode_raw"])
@@ -867,6 +862,13 @@ class OralBLiveCoordinator:
                 bytes(record).hex(" "),
             )
             return "invalid"
+        battery_end = parsed.get("battery_end")
+        if isinstance(battery_end, int):
+            # The retained record remains a useful last-known battery reading
+            # even when this session was already counted before a restart.
+            self.data["battery"] = battery_end
+            self.data["battery_updated_at"] = dt_util.utcnow()
+            self.data["battery_source"] = DATA_SOURCE_SESSION
         if self._last_synced_session_ts is None:
             stored = await self._store.async_load() or {}
             self._last_synced_session_ts = stored.get("last_session_ts", 0)

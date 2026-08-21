@@ -52,6 +52,40 @@ class CoordinatorTaskSchedulingTests(unittest.TestCase):
         self.assertIsInstance(call.args[1], ast.Constant)
         self.assertEqual(call.args[1].value, "oralb_live_reconnect_loop")
 
+    def test_sync_sequence_is_a_named_background_task(self) -> None:
+        """A settling or retrying session sync must not delay startup."""
+        module = ast.parse(COORDINATOR_PATH.read_text(encoding="utf-8"))
+        coordinator = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "OralBLiveCoordinator"
+        )
+        maybe_schedule_sync = next(
+            node
+            for node in coordinator.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_maybe_schedule_sync"
+        )
+        sync_assignment = next(
+            node
+            for node in ast.walk(maybe_schedule_sync)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Attribute) and target.attr == "_sync_task"
+                for target in node.targets
+            )
+        )
+
+        self.assertIsInstance(sync_assignment.value, ast.Call)
+        call = sync_assignment.value
+        assert isinstance(call, ast.Call)
+        self.assertIsInstance(call.func, ast.Attribute)
+        assert isinstance(call.func, ast.Attribute)
+        self.assertEqual(call.func.attr, "async_create_background_task")
+        self.assertGreaterEqual(len(call.args), 2)
+        self.assertIsInstance(call.args[1], ast.Constant)
+        self.assertEqual(call.args[1].value, "oralb_live_sync_sequence")
+
 
 if __name__ == "__main__":
     unittest.main()

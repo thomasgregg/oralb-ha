@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import pathlib
 import sys
@@ -96,6 +97,33 @@ class PassiveSessionDurationTests(unittest.TestCase):
             c._parse_advertisement(_advertisement(_payload(2, 0)))
 
         self.assertIsNone(c.data["last_session_duration"])
+
+    def test_invalid_session_record_does_not_overwrite_battery(self) -> None:
+        """An uncommitted all-zero FF29 buffer is not a battery reading."""
+        c = self._coordinator()
+        c.data["battery"] = 76
+        c.data["battery_updated_at"] = "previous-update"
+        c.data["battery_source"] = const.DATA_SOURCE_DIRECT
+
+        result = asyncio.run(c._async_apply_session_record(bytes(21), None))
+
+        self.assertEqual(result, "invalid")
+        self.assertEqual(c.data["battery"], 76)
+        self.assertEqual(c.data["battery_updated_at"], "previous-update")
+        self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_DIRECT)
+
+    def test_valid_duplicate_session_record_refreshes_battery(self) -> None:
+        """A previously counted real record remains useful for battery state."""
+        c = self._coordinator()
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+        c._last_synced_session_ts = int.from_bytes(record[0:4], "little")
+
+        result = asyncio.run(c._async_apply_session_record(record, None))
+
+        self.assertEqual(result, "duplicate")
+        self.assertEqual(c.data["battery"], 94)
+        self.assertIsNotNone(c.data["battery_updated_at"])
+        self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_SESSION)
 
 
 if __name__ == "__main__":
