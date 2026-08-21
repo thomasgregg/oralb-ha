@@ -187,7 +187,7 @@ reconciliation.
 | Pacer sector count | Configured pacer interval count |
 | Target duration | Sum of configured per-sector times |
 | Smiley | Current brush display face, decoded passively from advertisements or read from FF0A over GATT |
-| SmartRing color | Configured handle SmartRing color as `#RRGGBB`; restored across Home Assistant restarts and refreshed through direct or charger-mediated brush reads where supported |
+| SmartRing color | Configured handle SmartRing LED drive levels as raw `#RRGGBB`; restored across Home Assistant restarts and refreshed through direct or charger-mediated brush reads where supported |
 | Battery | Brush battery percentage |
 | Battery diagnostics | Estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
 | Brush-head diagnostics | Estimated calendar days and active brushing hours remaining where supported |
@@ -227,6 +227,14 @@ configured/default `FF2B` accent and never writes it. During brushing, the
 physical SmartRing can temporarily show pressure feedback, such as red for
 high pressure. Those transient indications are represented by the Pressure
 entity and do not change the configured `FF2B` value.
+
+The first three `FF2B` bytes are the raw drive levels for the ring's red,
+green and blue LEDs, not a screen-calibrated RGB colour. The sensor deliberately
+keeps those device bytes as its state so the contract remains exact and stable
+across models. Display consumers may apply a model-appropriate correction once;
+Toothbrush Card does this for Oral-B entities. The measured calibration and
+current model-scope limitation are documented in the
+[protocol reference](docs/protocol.md#smartring-led-drive-levels).
 
 The **Battery** entity keeps its last valid percentage across Home Assistant
 restarts and exposes `last_read` and `source` attributes. A fresh brush reading

@@ -102,7 +102,7 @@ The configuration service is:
 | `FF22` | read, write | Brush real-time clock |
 | `FF25` | read, write | Available brushing modes |
 | `FF26` | read, write | Per-sector pacer times |
-| `FF2B` | read, write | Handle SmartRing colour as RGB plus one uninterpreted byte; read only by Oral-B Live |
+| `FF2B` | read, write | Three handle SmartRing LED drive levels plus one uninterpreted byte; read only by Oral-B Live |
 | `FF2D` | read, write | Brush-head state, remaining days and brushing seconds |
 
 Service `A0F0FF80-5047-4D53-8208-4F72616C2D42` is the firmware-update channel.
@@ -486,6 +486,44 @@ the charger's short forwarding window when left behind the slower session and
 diagnostic reads or when the handle is docked. Giving `FF2B` second priority
 preserves the toothbrush entity's colour without adding another request to the
 timing-sensitive one-second live loop.
+
+### SmartRing LED drive levels
+
+The first three `FF2B` bytes are the drive levels for the SmartRing's red,
+green and blue LEDs. They are not screen-calibrated RGB values: unequal channel
+levels are required to make the physical ring appear white. Oral-B Live keeps
+the exact three device bytes as the sensor's `#RRGGBB` state and exposes the
+fourth byte separately without assigning it a meaning. It does not apply a
+display conversion.
+
+Two tested iO handles returned the same drive levels for all six named colours:
+
+| Name shown on handle | Raw `FF2B` | Display colour after measured correction |
+| --- | --- | --- |
+| White | `#44CF63` | `#FFFFFF` |
+| Yellow | `#80FF00` | `#FFFF00` |
+| Orange | `#FC7000` | `#FF8A00` |
+| Blue | `#0F5BCC` | `#3870FF` |
+| Turquoise | `#00FF3D` | `#00FF9D` |
+| Pink | `#B2091A` | `#FF0B43` |
+
+Using the raw white value as the per-channel calibration, a display-only
+conversion is:
+
+```text
+display[channel] = min(255, round(raw[channel] * 255 / white[channel]))
+white = [0x44, 0xCF, 0x63]
+```
+
+The other five named colours land at their expected hues using factors derived
+only from white. That supports interpreting the values as LED drive levels,
+but the calibration has not yet been verified across every iO model. Consumers
+that display the colour may apply this correction once for confirmed Oral-B
+values; they must not apply it to a value that has already been converted.
+Toothbrush Card 0.33.0 performs that single Oral-B-specific conversion. A
+future explicitly named derived display-colour attribute can be considered if
+the calibration is confirmed more broadly; the raw sensor state will remain
+unchanged.
 
 ### Pressure payload
 
