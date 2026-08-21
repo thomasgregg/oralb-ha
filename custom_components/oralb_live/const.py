@@ -304,12 +304,15 @@ CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS = 5.0
 CHARGER_IDLE_PROBE_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SNAPSHOT_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SESSION_SYNC_INTERVAL_SECONDS = 60.0
-# Read values that remain useful in quiet states before optional retained
-# session fields. Some brush firmware rejects FF29 and FF22 until the retained
-# record has settled; those failures must not prevent battery or identity from
-# refreshing.
+# Read values with the shortest useful window before optional retained session
+# fields. Keep battery first. Hardware testing confirmed that FF2B succeeds via
+# iO Sense passthrough while the handle remains off the charger, but can miss
+# its response when attempted at the end of this sequence after normal docking.
+# Some brush firmware also rejects FF29 and FF22 until the retained record has
+# settled; those failures must not prevent current values from refreshing.
 CHARGER_POST_SESSION_READS = (
     "FF05",
+    "FF2B",
     "FF2D",
     "FF02",
     "FF0A",
@@ -317,7 +320,6 @@ CHARGER_POST_SESSION_READS = (
     "FF26",
     "FF29",
     "FF22",
-    "FF2B",
 )
 
 # --- Connection management (live mode) ---------------------------------------

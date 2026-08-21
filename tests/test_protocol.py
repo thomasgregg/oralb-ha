@@ -112,7 +112,13 @@ class ProtocolDecoderTests(unittest.TestCase):
         self.assertEqual(10, const.MIN_PASSIVE_SESSION_SECONDS)
 
     def test_charger_refreshes_current_values_before_retained_session(self) -> None:
-        self.assertEqual(("FF05", "FF2D"), const.CHARGER_POST_SESSION_READS[:2])
+        self.assertEqual(
+            ("FF05", "FF2B", "FF2D"), const.CHARGER_POST_SESSION_READS[:3]
+        )
+        self.assertLess(
+            const.CHARGER_POST_SESSION_READS.index("FF2B"),
+            const.CHARGER_POST_SESSION_READS.index("FF29"),
+        )
         self.assertLess(
             const.CHARGER_POST_SESSION_READS.index("FF2D"),
             const.CHARGER_POST_SESSION_READS.index("FF29"),
@@ -129,7 +135,6 @@ class ProtocolDecoderTests(unittest.TestCase):
             const.CHARGER_POST_SESSION_READS.index("FF0A"),
             const.CHARGER_POST_SESSION_READS.index("FF29"),
         )
-        self.assertEqual("FF2B", const.CHARGER_POST_SESSION_READS[-1])
         self.assertEqual(30, const.CHARGER_BATTERY_EVERY_TICKS)
         self.assertEqual(5, const.CHARGER_BRUSH_STATUS_EVERY_TICKS)
 
