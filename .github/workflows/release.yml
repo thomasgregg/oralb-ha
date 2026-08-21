@@ -9,7 +9,7 @@ permissions: {}
 
 jobs:
   release-zip:
-    name: Publish HACS ZIP asset
+    name: Publish release assets
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -23,8 +23,12 @@ jobs:
       - name: Build integration ZIP
         run: git archive --format=zip --output="$RUNNER_TEMP/oralb_live.zip" HEAD:custom_components/oralb_live
 
-      - name: Upload integration ZIP
+      - name: Upload integration ZIP and diagnostic probe
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/oralb_live.zip" --clobber
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          "$RUNNER_TEMP/oralb_live.zip"
+          tools/iosense_probe.py
+          --clobber
