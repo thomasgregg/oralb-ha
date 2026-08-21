@@ -312,10 +312,6 @@ class SessionSyncRetryTests(unittest.TestCase):
         c.hass.async_create_background_task.assert_not_called()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LiveSectorNumberingTests(unittest.TestCase):
     """FF09 counts its quadrants from zero, the advertisement from one."""
 
@@ -362,3 +358,7 @@ class LiveSectorNumberingTests(unittest.TestCase):
         c._parse_advertisement(_advertisement(_payload(3, 10, sector=1)))
 
         self.assertEqual(c.data["sector"], "sector_1")
+
+
+if __name__ == "__main__":
+    unittest.main()
