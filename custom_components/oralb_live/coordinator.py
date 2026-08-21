@@ -53,6 +53,7 @@ from .const import (
     CHAR_PACER,
     CHAR_PRESSURE,
     CHAR_REFILL_REMAINDER,
+    CHAR_RING_COLOR,
     CHAR_RTC,
     CHAR_SECTOR,
     CHAR_SESSION_DATA,
@@ -109,6 +110,7 @@ from .protocol import (
     parse_device_info,
     parse_pacer,
     parse_refill_remainder,
+    parse_ring_color,
     parse_session_record,
 )
 
@@ -158,6 +160,8 @@ class OralBLiveCoordinator:
             "refill_days": None,
             "refill_brushing_time": None,
             "refill_brushing_time_hours": None,
+            "ring_color": None,
+            "ring_color_fourth_byte": None,
             "model_id": None,
             "model_name": None,
             "protocol_version": None,
@@ -462,6 +466,9 @@ class OralBLiveCoordinator:
         refill = await self._async_sync_read(
             client, CHAR_REFILL_REMAINDER, "refill remainder"
         )
+        ring_color = await self._async_sync_read(
+            client, CHAR_RING_COLOR, "SmartRing color"
+        )
         smiley = await self._async_sync_read(client, CHAR_SMILEY, "smiley")
         pressure = await self._async_sync_read(client, CHAR_PRESSURE, "pressure")
         brushing_time = await self._async_sync_read(
@@ -473,6 +480,7 @@ class OralBLiveCoordinator:
         self._apply_pacer(pacer)
         self._apply_available_modes(available_modes)
         self._apply_refill(refill)
+        self._apply_ring_color(ring_color)
         self._apply_smiley(smiley)
         self._apply_pressure(pressure, DATA_SOURCE_DIRECT)
         if brushing_time is not None and len(brushing_time) >= 2:
@@ -570,6 +578,8 @@ class OralBLiveCoordinator:
             self._apply_pacer(raw)
         elif short_uuid == "FF29":
             self._charger_session_record = raw
+        elif short_uuid == "FF2B":
+            self._apply_ring_color(raw)
         elif short_uuid == "FF2D":
             self._apply_refill(raw)
 
@@ -775,6 +785,9 @@ class OralBLiveCoordinator:
                     if self.data["available_modes"] is None
                     else None
                 )
+                ring_color = await self._async_sync_read(
+                    client, CHAR_RING_COLOR, "SmartRing color"
+                )
             finally:
                 try:
                     await client.disconnect()
@@ -786,6 +799,7 @@ class OralBLiveCoordinator:
         self._apply_device_info(model_info)
         self._apply_pacer(pacer)
         self._apply_available_modes(available_modes)
+        self._apply_ring_color(ring_color)
         if state:
             self._apply_state(state[0])
         result = "missing"
@@ -805,6 +819,7 @@ class OralBLiveCoordinator:
                 model_info,
                 pacer,
                 available_modes,
+                ring_color,
             )
         ):
             self._last_sync_ok = time.monotonic()
@@ -1371,6 +1386,10 @@ class OralBLiveCoordinator:
             self.data["refill_state"] = REFILL_STATES.get(
                 state_raw, f"state_{state_raw}"
             )
+
+    def _apply_ring_color(self, payload: bytes | bytearray | None) -> None:
+        if payload is not None:
+            self.data.update(parse_ring_color(payload))
 
     def _apply_smiley(self, payload: bytes | bytearray | None) -> None:
         if not payload:

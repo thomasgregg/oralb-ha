@@ -70,6 +70,7 @@ CHAR_RTC = "a0f0ff22-5047-4d53-8208-4f72616c2d42"  # seconds, brush epoch
 CHAR_AVAILABLE_MODES = "a0f0ff25-5047-4d53-8208-4f72616c2d42"
 CHAR_PACER = "a0f0ff26-5047-4d53-8208-4f72616c2d42"  # per-sector seconds
 CHAR_SESSION_DATA = "a0f0ff29-5047-4d53-8208-4f72616c2d42"  # last session
+CHAR_RING_COLOR = "a0f0ff2b-5047-4d53-8208-4f72616c2d42"  # RGB + extra byte
 CHAR_REFILL_REMAINDER = "a0f0ff2d-5047-4d53-8208-4f72616c2d42"
 
 NOTIFY_CHARS = (
@@ -307,6 +308,7 @@ CHARGER_POST_SESSION_READS = (
     "FF26",
     "FF29",
     "FF22",
+    "FF2B",
 )
 
 # --- Connection management (live mode) ---------------------------------------

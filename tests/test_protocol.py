@@ -129,6 +129,7 @@ class ProtocolDecoderTests(unittest.TestCase):
             const.CHARGER_POST_SESSION_READS.index("FF0A"),
             const.CHARGER_POST_SESSION_READS.index("FF29"),
         )
+        self.assertEqual("FF2B", const.CHARGER_POST_SESSION_READS[-1])
         self.assertEqual(30, const.CHARGER_BATTERY_EVERY_TICKS)
         self.assertEqual(5, const.CHARGER_BRUSH_STATUS_EVERY_TICKS)
 
@@ -174,6 +175,20 @@ class ProtocolDecoderTests(unittest.TestCase):
                 "refill_brushing_time": 600,
             },
         )
+
+    def test_ring_color(self) -> None:
+        self.assertEqual(
+            {
+                "ring_color": "#44CF63",
+                "ring_color_fourth_byte": 0,
+            },
+            protocol.parse_ring_color(bytes.fromhex("44 cf 63 00")),
+        )
+        self.assertEqual(
+            "#44CF63",
+            protocol.parse_ring_color(bytes.fromhex("44 cf 63 00 aa"))["ring_color"],
+        )
+        self.assertEqual({}, protocol.parse_ring_color(bytes.fromhex("44 cf 63")))
 
     def test_session_timer_requires_forward_progress(self) -> None:
         baseline, confirmed = protocol.advance_session_timer_evidence(None, 77)
@@ -443,6 +458,13 @@ class ChargerProtocolTests(unittest.TestCase):
             bytes.fromhex("08ff0100"),
             charger_protocol.build_passthrough_read("ff08"),
         )
+
+        color_packet = charger_protocol.decode_charger_read(
+            bytes.fromhex("37c12bff01010444cf6300")
+        )
+        self.assertEqual("FF2B", color_packet.value[0]["short_uuid"])
+        self.assertTrue(color_packet.value[0]["success"])
+        self.assertEqual(bytes.fromhex("44cf6300"), color_packet.value[0]["data"])
 
     def test_normalize_mac(self) -> None:
         self.assertEqual(

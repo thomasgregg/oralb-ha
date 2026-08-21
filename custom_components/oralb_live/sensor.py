@@ -171,6 +171,14 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     OralBSensorDescription(
+        key="ring_color",
+        translation_key="ring_color",
+        name="SmartRing color",
+        data_key="ring_color",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        restore=True,
+    ),
+    OralBSensorDescription(
         key="battery_voltage",
         translation_key="battery_voltage",
         name="Battery voltage",
@@ -649,6 +657,10 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         elif self.entity_description.key == "smiley":
             self._attr_extra_state_attributes = {
                 "smiley_raw": data.get("smiley_raw"),
+            }
+        elif self.entity_description.key == "ring_color":
+            self._attr_extra_state_attributes = {
+                "fourth_byte": data.get("ring_color_fourth_byte"),
             }
         elif self.entity_description.key == "pressure":
             self._attr_extra_state_attributes = {

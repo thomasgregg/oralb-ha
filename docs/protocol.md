@@ -102,6 +102,7 @@ The configuration service is:
 | `FF22` | read, write | Brush real-time clock |
 | `FF25` | read, write | Available brushing modes |
 | `FF26` | read, write | Per-sector pacer times |
+| `FF2B` | read, write | Handle SmartRing colour as RGB plus one uninterpreted byte; read only by Oral-B Live |
 | `FF2D` | read, write | Brush-head state, remaining days and brushing seconds |
 
 Service `A0F0FF80-5047-4D53-8208-4F72616C2D42` is the firmware-update channel.
@@ -349,7 +350,7 @@ command surface:
 | `0x31` | clock display mode | 12/24-hour setting |
 | `0x33` | brush status | not connected/pre-run/idle/charging/run |
 | `0x34` | brush connection policy | allowed/temporarily forbidden/forbidden |
-| `0x36` | ring colour | RGB colour |
+| `0x36` | charger ring colour | RGB colour for the iO Sense ring/night light; separate from the handle's `FF2B` SmartRing colour |
 | `0x37` | brush passthrough | forwarded brush-characteristic operation |
 | `0x39` | brush data | paired-brush identity and firmware metadata |
 | `0x3A` | session status | inactive/active-running/active-idle |
@@ -476,6 +477,12 @@ read, before the charger disconnect delay. This matters because tested charger
 firmware stops forwarding brush reads shortly after it releases the private
 brush connection. Home Assistant retains the last valid percentage across
 restarts because a quiet, disconnected brush cannot provide a fresh `FF05`.
+
+The production post-session sequence also attempts `FF2B` after the confirmed
+session and diagnostic reads. This preserves the handle SmartRing colour for
+the toothbrush entity without adding an unverified request to the timing-
+sensitive one-second live loop. Charger passthrough support for `FF2B` remains
+provisional until confirmed on hardware.
 
 ### Pressure payload
 

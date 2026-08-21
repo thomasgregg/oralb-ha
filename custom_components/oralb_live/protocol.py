@@ -173,6 +173,16 @@ def parse_refill_remainder(payload: bytes | bytearray) -> dict[str, int]:
     return result
 
 
+def parse_ring_color(payload: bytes | bytearray) -> dict[str, int | str]:
+    """Decode the handle SmartRing colour returned by ff2b."""
+    if len(payload) < 4:
+        return {}
+    return {
+        "ring_color": f"#{payload[0]:02X}{payload[1]:02X}{payload[2]:02X}",
+        "ring_color_fourth_byte": payload[3],
+    }
+
+
 def parse_available_modes(payload: bytes | bytearray) -> list[int]:
     """Return unique mode identifiers from ff25, preserving brush order."""
     modes: list[int] = []

@@ -174,6 +174,7 @@ reconciliation.
 | Pacer sector count | Configured pacer interval count |
 | Target duration | Sum of configured per-sector times |
 | Smiley | Current brush display face, decoded passively from advertisements or read from FF0A over GATT |
+| SmartRing color | Configured handle SmartRing color as `#RRGGBB`; restored across Home Assistant restarts and refreshed through direct or charger-mediated brush reads where supported |
 | Battery | Brush battery percentage |
 | Battery diagnostics | Estimated brushing runtime remaining on the current charge, voltage, signed current and temperature where supported |
 | Brush-head diagnostics | Estimated calendar days and active brushing hours remaining where supported |
@@ -206,6 +207,10 @@ Advanced battery, brush-head and pacer diagnostics are populated only after a
 successful brush read. They remain `unknown` until the charger or direct brush
 connection has returned the corresponding characteristic; Oral-B Live does not
 invent placeholder values for unsupported or not-yet-read fields.
+
+The **SmartRing color** entity belongs to the toothbrush and is distinct from
+the iO Sense charger's own Ring color entity. Oral-B Live reads the handle's
+`FF2B` configuration only; it never changes the configured color.
 
 The **Battery** entity keeps its last valid percentage across Home Assistant
 restarts and exposes `last_read` and `source` attributes. A fresh brush reading
