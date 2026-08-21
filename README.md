@@ -332,8 +332,8 @@ The main entities follow the structure expected by
 | Battery | Battery device class |
 | Routine target | `routine_length` translation key, reported in seconds |
 
-Toothbrush Card 0.27.0 does not yet list the `oralb_live` domain in its visual
-device picker. An explicit device ID can use the generic entity mapping now:
+Toothbrush Card 0.28.0 and newer support Oral-B Live directly, including device
+selection in the visual editor. The equivalent YAML configuration is:
 
 ```yaml
 type: custom:toothbrush-card
@@ -342,11 +342,10 @@ show_subtitle: true
 show_header: false
 ```
 
-For full visual-editor support, Toothbrush Card only needs to add
-`oralb_live: { translationKey: 'toothbrush_state' }` to its supported
-integrations. No physical-position or revisit handling is required: Oral-B
-Live intentionally presents the same sequential pacer semantics as the
-built-in Oral-B integration.
+The card recognizes the `oralb_live` domain through the `toothbrush_state`
+translation key. Oral-B Live intentionally presents the same sequential pacer
+semantics as the built-in Oral-B integration; its sector entity is not a
+physical mouth-position reading.
 
 A simple session log:
 
