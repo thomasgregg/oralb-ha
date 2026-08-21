@@ -152,7 +152,7 @@ export default function Home() {
     <main className="dashboard-shell" id="top">
       <header className="site-header">
         <a className="brand" href="#top" aria-label="Oral-B Live analytics home">
-          <img className="brand-mark" src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" aria-hidden="true" />
+          <img className="brand-mark" src={`${import.meta.env.BASE_URL}favicon.svg?v=blue-tiles`} alt="" aria-hidden="true" />
           <span>
             <strong>Oral-B Live</strong>
             <small>Integration analytics</small>
