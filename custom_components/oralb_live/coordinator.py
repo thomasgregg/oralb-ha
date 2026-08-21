@@ -503,7 +503,7 @@ class OralBLiveCoordinator:
         elif uuid == CHAR_MODE and payload:
             self._apply_mode(payload[0])
         elif uuid == CHAR_SECTOR and payload:
-            self._apply_sector(
+            self._apply_charger_sector(
                 payload[0],
                 payload[2] if len(payload) >= 3 else None,
                 payload[1] if len(payload) >= 2 else None,
