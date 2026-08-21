@@ -1,5 +1,6 @@
 {
+  "filename": "oralb_live.zip",
   "name": "Oral-B Live",
-  "render_readme": true
+  "render_readme": true,
+  "zip_release": true
 }
-

@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions: {}
+
+jobs:
+  release-zip:
+    name: Publish HACS ZIP asset
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Build integration ZIP
+        run: git archive --format=zip --output="$RUNNER_TEMP/oralb_live.zip" HEAD:custom_components/oralb_live
+
+      - name: Upload integration ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/oralb_live.zip" --clobber
