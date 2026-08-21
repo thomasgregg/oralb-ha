@@ -464,11 +464,13 @@ not force the charger to establish that private connection.
 | `FF25` | available modes | confirmed |
 | `FF26` | per-zone pacer configuration | confirmed |
 | `FF29` | retained latest-session summary | confirmed |
+| `FF2B` | configured handle SmartRing colour | `#9BFF00` with fourth byte `0` confirmed post-session |
 | `FF2D` | brush-head/refill remainder | days and brushing seconds confirmed |
 
-All 13 reads completed sequentially in one active charger-managed session.
-That proves feature breadth, but the bridge is polled request/response rather
-than a notification-rate stream.
+The original 13-characteristic benchmark completed all reads sequentially in
+one active charger-managed session. `FF2B` was confirmed later in a separate
+post-session hardware test. Together they prove feature breadth, but the bridge
+is polled request/response rather than a notification-rate stream.
 
 In production the charger bridge reads `FF05` at session start and then every
 30 seconds in place of one alternating timer/pacer request. When native session

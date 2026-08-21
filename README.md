@@ -210,7 +210,10 @@ invent placeholder values for unsupported or not-yet-read fields.
 
 The **SmartRing color** entity belongs to the toothbrush and is distinct from
 the iO Sense charger's own Ring color entity. Oral-B Live reads the handle's
-`FF2B` configuration only; it never changes the configured color.
+configured/default `FF2B` accent and never writes it. During brushing, the
+physical SmartRing can temporarily show pressure feedback, such as red for
+high pressure. Those transient indications are represented by the Pressure
+entity and do not change the configured `FF2B` value.
 
 The **Battery** entity keeps its last valid percentage across Home Assistant
 restarts and exposes `last_read` and `source` attributes. A fresh brush reading
