@@ -87,6 +87,7 @@ from .const import (
     SESSION_RECONCILE_WINDOW_SECONDS,
     SESSION_RECORD_SETTLE_SECONDS,
     SESSION_SEEN_STATES,
+    SESSION_SYNC_RETRY_BACKOFF_SECONDS,
     SIGNAL_UPDATE,
     SMILEYS,
     STALE_CONNECTION_SECONDS,
@@ -236,6 +237,8 @@ class OralBLiveCoordinator:
         self._last_synced_session_ts: int | None = None
         self._session_generation = 0
         self._processed_session_generation = 0
+        self._session_sync_retry_count = 0
+        self._session_sync_retry_not_before = 0.0
         self._charger_timer_anchor: tuple[int, float] | None = None
         self._charger_tick_task: asyncio.Task | None = None
         self._pacer_anchor: tuple[int, int, int] | None = None
@@ -598,6 +601,7 @@ class OralBLiveCoordinator:
                 self.data["last_session_source"] = DATA_SOURCE_SESSION
                 self._session_pending_sync = False
                 self._processed_session_generation = self._session_generation
+                self._reset_session_sync_retry()
                 self._last_sync_ok = time.monotonic()
         self._push()
 
@@ -642,6 +646,29 @@ class OralBLiveCoordinator:
             pass
 
     # ------------------------------------------------- charger-priority sync
+    def _reset_session_sync_retry(self) -> None:
+        """Reset deferred retry state after success or a new generation."""
+        self._session_sync_retry_count = 0
+        self._session_sync_retry_not_before = 0.0
+
+    def _session_sync_resolved(self) -> bool:
+        """Return whether the current observed generation was applied."""
+        return (
+            self._session_generation > 0
+            and self._processed_session_generation >= self._session_generation
+        )
+
+    def _charger_handles_session_sync(self, generation: int) -> bool:
+        """Return whether a verified iO Sense now owns session recovery."""
+        if not self.charger or not self.charger.address:
+            return False
+        _LOGGER.debug(
+            "%s: leaving session generation %s pending for the iO Sense",
+            self.name,
+            generation,
+        )
+        return True
+
     def _maybe_schedule_sync(self) -> None:
         """Rate-limited trigger for a post-session / periodic sync."""
         if self.charger and self.charger.address:
@@ -650,6 +677,8 @@ class OralBLiveCoordinator:
             return
         now = time.monotonic()
         if now - self._last_sync_attempt < SYNC_MIN_INTERVAL_SECONDS:
+            return
+        if now < self._session_sync_retry_not_before:
             return
         due = (
             self._session_pending_sync
@@ -667,10 +696,15 @@ class OralBLiveCoordinator:
         while not self._stopping:
             target_generation = self._session_generation
             session_observed = target_generation > self._processed_session_generation
-            attempts = SYNC_RETRY_ATTEMPTS if session_observed else 1
+            deferred_retry = session_observed and self._session_sync_retry_count > 0
+            attempts = (
+                1
+                if deferred_retry
+                else SYNC_RETRY_ATTEMPTS if session_observed else 1
+            )
             result = "failed"
 
-            if session_observed:
+            if session_observed and not deferred_retry:
                 _LOGGER.debug(
                     "%s: waiting %ss for session generation %s to settle",
                     self.name,
@@ -679,20 +713,47 @@ class OralBLiveCoordinator:
                 )
                 await asyncio.sleep(SESSION_RECORD_SETTLE_SECONDS)
 
+            # The iO Sense can finish the same generation while this task is
+            # settling. It can also be verified after the direct task was
+            # scheduled. Re-check both facts before touching the brush slot.
+            if self._session_sync_resolved():
+                self._session_pending_sync = False
+                self._reset_session_sync_retry()
+                return
+            if self._session_generation > target_generation:
+                continue
+            if self._charger_handles_session_sync(target_generation):
+                return
+
             for attempt in range(1, attempts + 1):
                 # A newer brushing session can begin during the settle/retry
                 # window. Never connect until the latest advertisement is
                 # quiet again.
                 while (
-                    not self._stopping and self.data.get("state_raw") not in SYNC_STATES
+                    not self._stopping
+                    and self._session_generation == target_generation
+                    and not self._session_sync_resolved()
+                    and not (self.charger and self.charger.address)
+                    and self.data.get("state_raw") not in SYNC_STATES
                 ):
                     await asyncio.sleep(1)
                 if self._stopping:
                     return
+                if self._session_generation > target_generation:
+                    break
+                if self._session_sync_resolved():
+                    break
+                if self._charger_handles_session_sync(target_generation):
+                    return
 
                 self._last_sync_attempt = time.monotonic()
                 result = await self._async_sync_once()
-                if result == "new" or not session_observed:
+                if (
+                    result == "new"
+                    or not session_observed
+                    or self._processed_session_generation >= target_generation
+                    or self._session_generation > target_generation
+                ):
                     break
                 if attempt < attempts:
                     _LOGGER.debug(
@@ -706,16 +767,19 @@ class OralBLiveCoordinator:
                     )
                     await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
 
-            if session_observed:
-                self._processed_session_generation = target_generation
-                if result != "new":
-                    _LOGGER.debug(
-                        "%s: no new record for session generation %s after "
-                        "%s attempts; keeping the passive session",
-                        self.name,
-                        target_generation,
-                        attempts,
-                    )
+            if result == "new":
+                self._processed_session_generation = max(
+                    self._processed_session_generation, target_generation
+                )
+                self._reset_session_sync_retry()
+
+            # A concurrent charger passthrough can turn the direct read into a
+            # duplicate. Trust the generation marker the charger advanced,
+            # rather than resurrecting an already resolved pending sync.
+            if self._session_sync_resolved():
+                self._session_pending_sync = False
+                self._reset_session_sync_retry()
+                return
 
             if self._session_generation > target_generation:
                 _LOGGER.debug(
@@ -727,7 +791,30 @@ class OralBLiveCoordinator:
                 )
                 continue
 
-            self._session_pending_sync = False
+            if not session_observed:
+                self._session_pending_sync = False
+                return
+
+            retry_index = min(
+                self._session_sync_retry_count,
+                len(SESSION_SYNC_RETRY_BACKOFF_SECONDS) - 1,
+            )
+            retry_delay = SESSION_SYNC_RETRY_BACKOFF_SECONDS[retry_index]
+            self._session_sync_retry_count = min(
+                self._session_sync_retry_count + 1,
+                len(SESSION_SYNC_RETRY_BACKOFF_SECONDS),
+            )
+            self._session_sync_retry_not_before = time.monotonic() + retry_delay
+            self._session_pending_sync = True
+            _LOGGER.debug(
+                "%s: session generation %s record %s after %s attempts; "
+                "leaving it pending for a later advertisement in %ss",
+                self.name,
+                target_generation,
+                result,
+                attempts,
+                retry_delay,
+            )
             return
 
     async def _async_sync_once(self) -> str:
@@ -1033,6 +1120,7 @@ class OralBLiveCoordinator:
         ):
             self._session_generation += 1
             self._session_pending_sync = True
+            self._reset_session_sync_retry()
             _LOGGER.debug(
                 "%s: observed session generation %s in state %s",
                 self.name,

@@ -160,6 +160,15 @@ SYNC_RETRY_ATTEMPTS = 4
 SESSION_RECONCILE_WINDOW_SECONDS = 2 * 60
 # Refresh battery/state at least this often even without a session.
 PERIODIC_SYNC_INTERVAL_SECONDS = 6 * 3600
+# After the immediate settle/retry sequence, retry an unresolved generation
+# only on later quiet advertisements. The final value matches the normal
+# maintenance cadence so an ambiguous menu-only observation cannot create a
+# connection storm.
+SESSION_SYNC_RETRY_BACKOFF_SECONDS = (
+    SYNC_MIN_INTERVAL_SECONDS,
+    5 * 60,
+    PERIODIC_SYNC_INTERVAL_SECONDS,
+)
 # Sanity bound for a session duration parsed from the ff29 record.
 MAX_SESSION_SECONDS = 7200
 

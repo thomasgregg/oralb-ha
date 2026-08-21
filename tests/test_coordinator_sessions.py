@@ -8,7 +8,7 @@ import pathlib
 import sys
 import types
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 COMPONENT_PATH = (
     pathlib.Path(__file__).parents[1] / "custom_components" / "oralb_live"
@@ -98,6 +98,16 @@ class PassiveSessionDurationTests(unittest.TestCase):
 
         self.assertIsNone(c.data["last_session_duration"])
 
+    def test_menu_only_observation_remains_provisional(self) -> None:
+        """Opening the mode menu without timer progress is not brushing."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(8, 0)))
+        c._parse_advertisement(_advertisement(_payload(4, 0)))
+
+        self.assertIsNone(c.data["last_session_duration"])
+        self.assertEqual(c._session_generation, 1)
+        self.assertTrue(c._session_pending_sync)
+
     def test_invalid_session_record_does_not_overwrite_battery(self) -> None:
         """An uncommitted all-zero FF29 buffer is not a battery reading."""
         c = self._coordinator()
@@ -124,6 +134,182 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertEqual(c.data["battery"], 94)
         self.assertIsNotNone(c.data["battery_updated_at"])
         self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_SESSION)
+
+
+class SessionSyncRetryTests(unittest.TestCase):
+    """Unresolved generations remain recoverable without connection storms."""
+
+    def _coordinator(self):
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        c = coordinator.OralBLiveCoordinator(
+            MagicMock(), "AA:BB:CC:DD:EE:FF", "test", const.CONNECTION_MODE_CHARGER
+        )
+        c.data["state_raw"] = 2
+        return c
+
+    def _run_sequence(self, c) -> None:
+        with (
+            patch.object(coordinator, "SESSION_RECORD_SETTLE_SECONDS", 0),
+            patch.object(coordinator, "SYNC_RETRY_DELAY_SECONDS", 0),
+            patch.object(
+                coordinator,
+                "SESSION_SYNC_RETRY_BACKOFF_SECONDS",
+                (60, 300, 21600),
+            ),
+            patch.object(coordinator.time, "monotonic", return_value=1000.0),
+        ):
+            asyncio.run(c._async_sync_sequence())
+
+    def test_failed_generation_stays_pending_and_unprocessed(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._async_sync_once = AsyncMock(return_value="failed")
+
+        self._run_sequence(c)
+
+        self.assertEqual(c._async_sync_once.await_count, const.SYNC_RETRY_ATTEMPTS)
+        self.assertEqual(c._processed_session_generation, 0)
+        self.assertTrue(c._session_pending_sync)
+        self.assertEqual(c._session_sync_retry_count, 1)
+        self.assertEqual(c._session_sync_retry_not_before, 1060.0)
+
+    def test_deferred_retry_uses_one_attempt_and_advances_backoff(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._session_sync_retry_count = 1
+        c._async_sync_once = AsyncMock(return_value="duplicate")
+
+        self._run_sequence(c)
+
+        c._async_sync_once.assert_awaited_once()
+        self.assertEqual(c._processed_session_generation, 0)
+        self.assertTrue(c._session_pending_sync)
+        self.assertEqual(c._session_sync_retry_count, 2)
+        self.assertEqual(c._session_sync_retry_not_before, 1300.0)
+
+    def test_retry_backoff_caps_at_periodic_interval(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._session_sync_retry_count = 3
+        c._async_sync_once = AsyncMock(return_value="invalid")
+
+        self._run_sequence(c)
+
+        c._async_sync_once.assert_awaited_once()
+        self.assertEqual(c._session_sync_retry_count, 3)
+        self.assertEqual(c._session_sync_retry_not_before, 22600.0)
+
+    def test_new_record_resolves_generation_and_retry_state(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._session_sync_retry_count = 2
+        c._session_sync_retry_not_before = 999.0
+        c._async_sync_once = AsyncMock(return_value="new")
+
+        self._run_sequence(c)
+
+        c._async_sync_once.assert_awaited_once()
+        self.assertEqual(c._processed_session_generation, 1)
+        self.assertFalse(c._session_pending_sync)
+        self.assertEqual(c._session_sync_retry_count, 0)
+        self.assertEqual(c._session_sync_retry_not_before, 0.0)
+
+    def test_concurrent_charger_resolution_does_not_resurrect_pending(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+
+        async def _charger_wins():
+            c._processed_session_generation = 1
+            c._session_pending_sync = False
+            return "duplicate"
+
+        c._async_sync_once = AsyncMock(side_effect=_charger_wins)
+
+        self._run_sequence(c)
+
+        c._async_sync_once.assert_awaited_once()
+        self.assertEqual(c._processed_session_generation, 1)
+        self.assertFalse(c._session_pending_sync)
+        self.assertEqual(c._session_sync_retry_count, 0)
+        self.assertEqual(c._session_sync_retry_not_before, 0.0)
+
+    def test_newer_generation_is_processed_before_deferring(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+
+        async def _new_generation_then_record():
+            if c._session_generation == 1:
+                c._session_generation = 2
+                c._session_sync_retry_count = 0
+                c._session_sync_retry_not_before = 0.0
+                return "failed"
+            return "new"
+
+        c._async_sync_once = AsyncMock(side_effect=_new_generation_then_record)
+
+        self._run_sequence(c)
+
+        self.assertEqual(c._async_sync_once.await_count, 2)
+        self.assertEqual(c._processed_session_generation, 2)
+        self.assertFalse(c._session_pending_sync)
+        self.assertEqual(c._session_sync_retry_count, 0)
+
+    def test_verified_charger_hands_off_without_consuming_retry(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c.charger.address = "11:22:33:44:55:66"
+        c._async_sync_once = AsyncMock(return_value="failed")
+
+        self._run_sequence(c)
+
+        c._async_sync_once.assert_not_awaited()
+        self.assertEqual(c._processed_session_generation, 0)
+        self.assertTrue(c._session_pending_sync)
+        self.assertEqual(c._session_sync_retry_count, 0)
+
+    def test_new_generation_resets_deferred_retry(self) -> None:
+        c = self._coordinator()
+        c._tracked_state_raw = 2
+        c._session_sync_retry_count = 3
+        c._session_sync_retry_not_before = 999.0
+
+        c._apply_state(8)
+
+        self.assertEqual(c._session_generation, 1)
+        self.assertTrue(c._session_pending_sync)
+        self.assertEqual(c._session_sync_retry_count, 0)
+        self.assertEqual(c._session_sync_retry_not_before, 0.0)
+
+    def test_startup_seed_still_performs_one_probe(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 0
+        c._processed_session_generation = 0
+        c._session_pending_sync = True
+        c._async_sync_once = AsyncMock(return_value="duplicate")
+
+        self._run_sequence(c)
+
+        c._async_sync_once.assert_awaited_once()
+        self.assertFalse(c._session_pending_sync)
+
+    def test_scheduler_honours_deferred_retry_time(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._last_sync_attempt = 0.0
+        c._session_sync_retry_not_before = 200.0
+
+        with patch.object(coordinator.time, "monotonic", return_value=100.0):
+            c._maybe_schedule_sync()
+
+        c.hass.async_create_background_task.assert_not_called()
 
 
 if __name__ == "__main__":
