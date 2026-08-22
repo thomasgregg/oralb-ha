@@ -388,8 +388,11 @@ cards:
 ## Requirements
 
 - Home Assistant 2024.4 or newer.
-- A connectable Bluetooth adapter or ESPHome Bluetooth proxy near the brush or
-  iO Sense charger, depending on the selected connection path.
+- A connectable Bluetooth adapter or ESPHome Bluetooth proxy with reliable
+  coverage near the iO Sense charger in **Charger/app compatible** mode, or
+  near the brush in **Home Assistant direct** mode. A scanner being marked
+  `connectable` describes its capability; it does not guarantee that it can
+  receive a particular device from its current location.
 - An iO Sense charger for charger-bridge data; the integration still operates
   without one through its other local sources.
 
@@ -402,9 +405,12 @@ bluetooth_proxy:
   active: true
 ```
 
-The default ESPHome scan parameters are recommended. Oral-B Live needs an
-active-capable proxy for direct GATT and charger-bridge connections, but does
-not require an aggressive full-duty scan window.
+The default ESPHome scan parameters, including active and continuous scanning,
+are recommended. Oral-B Live needs an active-capable proxy for direct GATT and
+charger-bridge connections, but does not require custom `interval`, `window`
+or `continuous` values. If an existing configuration explicitly sets the BLE
+tracker's `active: false`, remove that override or set it to `true` so scan
+response data remains available.
 
 ## Protocol reference
 
@@ -438,12 +444,42 @@ kept there rather than duplicated in this user guide.
 
 ### Charger is not discovered
 
-- Confirm the entry uses **Charger/app compatible**.
-- Keep the iO Sense powered and within active Bluetooth range.
-- Confirm the proxy has `active: true`.
-- Wake the brush once so the charger advertises its paired/connection state.
-- Check the toothbrush state entity's `charger_address` and `data_source`
-  attributes.
+`charger_address: null` does not by itself mean that the charger is
+unsupported or that Home Assistant received no advertisement. Oral-B Live sets
+the address only after it receives a matching advertisement, finds a
+connectable route, establishes GATT, reads the paired-brush identity and
+verifies that the charger belongs to the configured brush.
+
+First confirm that the entry uses **Charger/app compatible**, the iO Sense is
+powered, the Oral-B phone app is closed and at least one ESPHome proxy has
+`bluetooth_proxy.active: true`. Wake the brush once so the charger advertises
+its paired and charging state.
+
+#### Test proxy coverage
+
+1. In Home Assistant, open **Settings → Bluetooth → Adapters**. Choose a
+   movable ESPHome scanner that supports active connections (`connectable:
+   true`). Do not choose a Shelly scanner for this test because Shelly can
+   forward advertisements but cannot establish the required GATT connection.
+2. Move that proxy within one or two metres of the iO Sense, power it again and
+   wait until Home Assistant shows it online with a working network connection.
+   Do not change its scan timing for this test.
+3. Open the
+   [Bluetooth Advertisement Monitor](https://my.home-assistant.io/redirect/bluetooth_advertisement_monitor),
+   tap the iO Sense control, wake the brush and wait 30–60 seconds. Search for
+   `iO Sense`, the charger address, or service UUID
+   `a0f03e00-5047-4d53-8208-4f72616c2d42`. Note the receiving scanner and RSSI.
+4. If the charger appears, open **Settings → Devices & services →
+   Integrations**, find **Oral-B Live**, select **Reload** from its three-dot
+   menu, wake the brush again and wait approximately one minute.
+5. Open **Developer tools → States**, select the main toothbrush state entity
+   and inspect its `charger_address` attribute.
+
+If the address populates only with the proxy nearby, improve permanent proxy
+placement or antenna coverage. If a nearby connectable proxy clearly receives
+the charger but the address remains `null`, collect the Advertisement Monitor
+scanner/RSSI details and an iO Sense diagnostic report for an integration
+issue.
 
 ### iO Sense diagnostic probe
 
