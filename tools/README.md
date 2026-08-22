@@ -1,8 +1,10 @@
 # Standalone tools
 
-These tools run independently of Home Assistant. They require a computer with
-a local Bluetooth adapter; they cannot route connections through Home
-Assistant's ESPHome, Shelly or other remote Bluetooth proxies.
+These tools run independently of Home Assistant. Live discovery and GATT
+operations require a computer with a local Bluetooth adapter; they cannot route
+connections through Home Assistant's ESPHome, Shelly or other remote Bluetooth
+proxies. The night-light tester's `frames` subcommand is entirely offline and
+requires neither Bluetooth nor Bleak.
 
 ## iO Sense diagnostic probe
 
@@ -43,7 +45,7 @@ protocol, use `--no-protocol`.
 
 ### Prerequisites
 
-- Python 3.9 or newer on Windows and Linux.
+- Python 3.10 or newer on Windows and Linux.
 - Python 3.12 on current macOS systems. Do not use Apple's bundled
   `/usr/bin/python3` when it reports Python 3.9: current PyObjC packages cannot
   be installed successfully with that interpreter.
@@ -122,7 +124,7 @@ still in the home directory, running `tools/iosense_probe.py` would produce a
 
 | Error | Cause and correction |
 | --- | --- |
-| `Failed building wheel for pyobjc-core` on macOS | The environment was created with Apple's Python 3.9. Recreate it with `python3.12 -m venv .venv-iosense`. |
+| `Failed building wheel for pyobjc-core` on macOS, or a package reports that it requires a newer Python | The environment was created with an unsupported Python version. Recreate it with Python 3.12 on macOS or Python 3.10 or newer on Windows/Linux. |
 | `can't open file .../tools/iosense_probe.py` | A source-checkout command was run outside the cloned repository. Change to the `oralb-ha` directory, or use the recommended release download and run `iosense_probe.py` directly. |
 | `No module named bleak` | Bleak was installed into a different Python. Run `.venv-iosense/bin/python -m pip install bleak` and invoke the probe with that same Python path. |
 | Bluetooth permission or authorization error on macOS | Enable Bluetooth access for Terminal, iTerm or the application hosting the shell in System Settings, then reopen it. |
@@ -272,17 +274,26 @@ two reconstructed charger commands:
 - `0x42`: night-light mode (`disabled`, `solid`, `breathing`, `rainbow`,
   `cool`, or `custom`)
 
-Stop Home Assistant, or at least disable/reload the integration, before a live
-test so that two processes do not compete for the same BLE charger connection.
-Install the one runtime dependency in a virtual environment if needed:
+This maintainer-only tester is not attached to releases. Run it from a source
+checkout, and create its virtual environment from the repository root:
 
 ```bash
-/opt/homebrew/bin/python3.12 -m venv .venv-night-light
-.venv-night-light/bin/python -m pip install bleak
+git clone https://github.com/thomasgregg/oralb-ha.git  # omit if already cloned
+cd oralb-ha
+test -f tools/iosense_night_light.py && echo "oralb-ha repository found"
+python3.12 -m venv .venv-night-light
+.venv-night-light/bin/python -m pip install --upgrade pip bleak
 ```
 
-Python 3.12 is used here because Apple's system Python 3.9 cannot build the
-current PyObjC dependency with the installed macOS SDK.
+On Windows, use `py -3.12 -m venv .venv-night-light` and replace
+`.venv-night-light/bin/python` in the examples below with
+`.venv-night-light\Scripts\python.exe`. Python 3.12 is used here because
+Apple's system Python 3.9 is unsupported by the current Bleak/PyObjC
+dependencies.
+
+Stop Home Assistant or disable the Oral-B Live config entry before a live test
+so that two processes do not compete for the same BLE charger connection.
+Reloading the entry is not sufficient because it reconnects afterward.
 
 ## Protocol-state validation
 
@@ -297,8 +308,7 @@ night-light control.
 A subsequent read found command `0x43` (weekly night-light schedule) set to
 `FF FF` for all seven days. The schedule may gate the mode, but the meaning and
 units of its start/end bytes must be established before attempting a schedule
-write. Command `0x36` may instead be the brush smart-ring colour mirrored by
-the charger and only become visible in an active brushing/pressure context.
+write.
 
 A second roundtrip on 2026-08-01 used `#FF0000` with mode `custom` (`0x05`).
 The complete charger ring visibly illuminated red for several seconds. The
@@ -319,9 +329,10 @@ Read the current values without changing anything:
 .venv-night-light/bin/python tools/iosense_night_light.py status
 ```
 
-Mutation commands are live dry runs unless `--apply` is supplied. The safest
-first write test applies a colour and active mode briefly, verifies both, and
-then automatically restores the original values:
+Mutation commands are live dry runs unless `--apply` is supplied: they scan,
+connect and read the current settings, but issue no POST/write operation. The
+safest first write test applies a colour and active mode briefly, verifies
+both, and then automatically restores the original values:
 
 ```bash
 .venv-night-light/bin/python tools/iosense_night_light.py roundtrip \
@@ -347,7 +358,7 @@ current colour and mode. Restore one explicitly with:
 
 ```bash
 .venv-night-light/bin/python tools/iosense_night_light.py restore \
-  iosense-night-light-backup-YYYYMMDD-HHMMSS.json --apply
+  iosense-night-light-backup-YYYYMMDD-HHMMSS-ffffff.json --apply
 ```
 
 If more than one charger is found, or macOS discovery needs a stable target,
@@ -355,5 +366,6 @@ place `--address ADDRESS_OR_COREBLUETOOTH_UUID` before the subcommand.
 
 The default delays are intentionally conservative because the charger has
 previously acknowledged a setting before safely applying its payload. Every
-write requires a success status, waits one second, and then performs a GET
-read-back comparison.
+write requires a success status and performs a GET read-back comparison. By
+default it waits one second before that read-back; maintainers can adjust the
+delay with `--settle-delay` when investigating timing.

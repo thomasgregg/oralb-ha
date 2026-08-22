@@ -181,7 +181,7 @@ reconciliation.
 | --- | --- |
 | Toothbrush state | `idle`, `running`, `charging`, `selection_menu`, summaries and diagnostic states |
 | Time | Current brushing duration; locally advanced between charger timer anchors |
-| Pressure | `low`, `normal` or `high`; charger reads also expose raw force as an attribute |
+| Pressure | `low`, `normal` or `high`; direct and charger-forwarded reads also expose raw force as an attribute when available |
 | Mode | Daily clean, sensitive, gum care, whiten, intense, super sensitive, tongue clean, Smart Adapt, gentle white and supported unknown values |
 | Pacer sector | Current sequential pacer interval (`sector_1` … `sector_8`), advanced locally from the configured schedule and corrected by the brush |
 | Pacer sector timer | Elapsed seconds in the current pacer interval while brushing; `unknown` outside an active session |

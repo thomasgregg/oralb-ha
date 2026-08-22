@@ -123,10 +123,11 @@ At connection setup, Oral-B Live subscribes to:
 - `FF0B` pressure;
 - optional `FF05` battery and `FF0A` smiley notifications.
 
-It also performs initial reads of `FF02`, `FF05`, `FF08`, `FF0A`, `FF25`,
-`FF26` and `FF2D`. These populate identity, battery diagnostics, current timer,
-display face, mode availability, target/pacer configuration and brush-head
-remainder without waiting for each value to change.
+It also performs initial reads of `FF02`, `FF05`, `FF08`, `FF0A`, `FF0B`,
+`FF25`, `FF26`, `FF2B` and `FF2D`. These populate identity, battery
+diagnostics, current timer and pressure, display face, mode availability,
+target/pacer configuration, SmartRing LED drive levels and brush-head remainder
+without waiting for each value to change.
 
 `FF02` and the corresponding advertisement bytes identify the protocol model,
 not necessarily the marketing model printed on the brush. In the reconstructed
@@ -152,10 +153,11 @@ their bytes are present.
 `FF06` is the button characteristic, not pressure. Pressure is `FF0B`; its
 first byte is `0` low, `1` normal or `2` high. A captured protocol-8/9 payload
 also contains a timestamp, force, motor angle, motor target and identifier.
-Oral-B Live exposes the pressure state and, for charger-forwarded values, raw
-force as an attribute. A direct `FF06` read during hard brushing returned
-`00 00 00 00`; that capture helped confirm that a constant zero there is a
-button state, not a failed pressure sensor.
+Oral-B Live exposes the pressure state and, when the longer payload is
+available, raw force as an attribute for both direct and charger-forwarded
+`FF0B` values. A direct `FF06` read during hard brushing returned `00 00 00 00`;
+that capture helped confirm that a constant zero there is a button state, not a
+failed pressure sensor.
 
 The recognized `FF0A` display-face values are:
 
@@ -461,9 +463,9 @@ not force the charger to establish that private connection.
 | `FF0D` | motion | timestamped motion and gyroscope snapshots confirmed; local research tooling demonstrated the inference pipeline described above |
 | `FF22` | brush real-time clock | confirmed |
 | `FF25` | available modes | confirmed |
-| `FF26` | per-zone pacer configuration | confirmed |
+| `FF26` | per-sector pacer configuration | confirmed |
 | `FF29` | retained latest-session summary | confirmed |
-| `FF2B` | configured handle SmartRing colour | `#9BFF00` with fourth byte `0` confirmed post-session |
+| `FF2B` | configured handle SmartRing LED drive levels | raw `#9BFF00` with fourth byte `0` confirmed post-session |
 | `FF2D` | brush-head/refill remainder | days and brushing seconds confirmed |
 
 The original 13-characteristic benchmark completed all reads sequentially in
@@ -481,11 +483,11 @@ restarts because a quiet, disconnected brush cannot provide a fresh `FF05`.
 
 The production post-session sequence attempts `FF2B` immediately after the
 first `FF05` battery read. Hardware testing confirmed that the iO Sense can
-forward the handle SmartRing colour, but also showed that the request can miss
-the charger's short forwarding window when left behind the slower session and
-diagnostic reads or when the handle is docked. Giving `FF2B` second priority
-preserves the toothbrush entity's colour without adding another request to the
-timing-sensitive one-second live loop.
+forward the handle SmartRing LED drive levels, but also showed that the request
+can miss the charger's short forwarding window when left behind the slower
+session and diagnostic reads or when the handle is docked. Giving `FF2B` second
+priority preserves the toothbrush entity's raw value without adding another
+request to the timing-sensitive one-second live loop.
 
 ### SmartRing LED drive levels
 
@@ -688,8 +690,11 @@ the integration's runtime design.
 
 The charger firmware is timing-sensitive. A controlled same-value brightness
 write showed that a success status can acknowledge transport before a setting
-is applied as intended. The value was restored during research, and write
-tooling was removed.
+is applied as intended. The value was restored during research. Write support
+is not part of the Home Assistant integration; a separate guarded
+[maintainer-only night-light tester](../tools/README.md#io-sense-night-light-tester)
+preserves the two audited write experiments, requires an explicit `--apply`
+flag and verifies changes by reading them back.
 
 For that reason Oral-B Live:
 
@@ -710,3 +715,5 @@ For that reason Oral-B Live:
 | `coordinator.py` | source selection, live state, timer/pacer extrapolation, sampled pressure tracking and retained-session reconciliation |
 | `sensor.py` | toothbrush entities plus a separate matched iO Sense device |
 | `tests/test_protocol.py` | captured-packet regression tests with no Home Assistant dependency |
+| `tools/iosense_probe.py` | standalone read-only advertisement, GATT and identity capture |
+| `tools/iosense_night_light.py` | guarded maintainer-only tester for two audited charger settings |
