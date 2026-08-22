@@ -37,19 +37,32 @@ type GitHubRelease = {
   }>;
 };
 
-const FALLBACK_RELEASES: ReleaseMetric[] = [
-  { version: 'v0.7.29', downloads: 8, publishedAt: '2026-08-21T19:59:28Z', size: 132757, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.29' },
-  { version: 'v0.7.28', downloads: 9, publishedAt: '2026-08-21T19:13:28Z', size: 132769, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.28' },
-  { version: 'v0.7.27', downloads: 58, publishedAt: '2026-08-21T13:29:19Z', size: 132769, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.27' },
-  { version: 'v0.7.26', downloads: 3, publishedAt: '2026-08-21T13:19:23Z', size: 132769, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.26' },
-  { version: 'v0.7.24', downloads: 0, publishedAt: '2026-08-21T11:46:44Z', size: 132769, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.24' },
-  { version: 'v0.7.23', downloads: 0, publishedAt: '2026-08-21T10:26:11Z', size: 132667, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.23' },
-  { version: 'v0.7.22', downloads: 0, publishedAt: '2026-08-21T09:15:17Z', size: 131808, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.22' },
-  { version: 'v0.7.21', downloads: 0, publishedAt: '2026-08-21T09:04:35Z', size: 131545, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.21' },
-  { version: 'v0.7.20', downloads: 0, publishedAt: '2026-08-20T19:53:04Z', size: 131529, url: 'https://github.com/thomasgregg/oralb-ha/releases/tag/v0.7.20' },
-];
+type DashboardSnapshot = {
+  releases: ReleaseMetric[];
+  updatedAt: string;
+};
 
 const API_URL = 'https://api.github.com/repos/thomasgregg/oralb-ha/releases?per_page=100';
+const CACHE_KEY = 'oralb-live-analytics-snapshot-v1';
+
+function readCachedSnapshot(): DashboardSnapshot | null {
+  try {
+    const cached = window.localStorage.getItem(CACHE_KEY);
+    if (!cached) return null;
+    const snapshot = JSON.parse(cached) as DashboardSnapshot;
+    if (!Array.isArray(snapshot.releases) || !snapshot.releases.length || Number.isNaN(Date.parse(snapshot.updatedAt))) return null;
+    const isValid = snapshot.releases.every((release) => (
+      typeof release.version === 'string'
+      && typeof release.downloads === 'number'
+      && typeof release.publishedAt === 'string'
+      && typeof release.size === 'number'
+      && typeof release.url === 'string'
+    ));
+    return isValid ? snapshot : null;
+  } catch {
+    return null;
+  }
+}
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat('en').format(value);
@@ -69,16 +82,20 @@ function formatDate(value: string) {
 }
 
 function timeAgo(date: Date | null) {
-  if (!date) return 'Using recent snapshot';
+  if (!date) return 'Waiting for GitHub';
   const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
   if (seconds < 10) return 'Just now';
   if (seconds < 60) return `${seconds}s ago`;
-  return `${Math.floor(seconds / 60)}m ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
-function StatCard({ label, value, note, icon, primary = false }: { label: string; value: string; note: ReactNode; icon: ReactNode; primary?: boolean }) {
+function StatCard({ label, value, note, icon, primary = false, loading = false }: { label: string; value: string; note: ReactNode; icon: ReactNode; primary?: boolean; loading?: boolean }) {
   return (
-    <article className={`stat-card${primary ? ' stat-primary' : ''}`}>
+    <article className={`stat-card${primary ? ' stat-primary' : ''}${loading ? ' is-loading' : ''}`} aria-busy={loading}>
       <div className="stat-topline">
         <span className="stat-label">{label}</span>
         <span className="stat-icon" aria-hidden="true">{icon}</span>
@@ -90,10 +107,10 @@ function StatCard({ label, value, note, icon, primary = false }: { label: string
 }
 
 export default function Home() {
-  const [releases, setReleases] = useState(FALLBACK_RELEASES);
+  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(() => readCachedSnapshot());
   const [status, setStatus] = useState<'loading' | 'ready' | 'stale'>('loading');
   const [refreshState, setRefreshState] = useState<'idle' | 'refreshing' | 'updated' | 'error'>('idle');
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(() => snapshot ? new Date(snapshot.updatedAt) : null);
   const [range, setRange] = useState<'all' | 'recent'>('all');
 
   const refresh = useCallback(async () => {
@@ -118,8 +135,15 @@ export default function Home() {
         }];
       });
       if (metrics.length === 0) throw new Error('No tracked assets found');
-      setReleases(metrics);
-      setLastUpdated(new Date());
+      const updatedAt = new Date().toISOString();
+      const nextSnapshot = { releases: metrics, updatedAt };
+      setSnapshot(nextSnapshot);
+      setLastUpdated(new Date(updatedAt));
+      try {
+        window.localStorage.setItem(CACHE_KEY, JSON.stringify(nextSnapshot));
+      } catch {
+        // The live dashboard still works when storage is unavailable.
+      }
       setStatus('ready');
       setRefreshState('updated');
     } catch {
@@ -140,7 +164,10 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [refreshState]);
 
+  const releases = snapshot?.releases ?? [];
+
   const summary = useMemo(() => {
+    if (!releases.length) return null;
     const total = releases.reduce((sum, release) => sum + release.downloads, 0);
     const leader = [...releases].sort((a, b) => b.downloads - a.downloads)[0];
     const activeCount = Math.max(1, releases.filter((release) => release.downloads > 0).length);
@@ -158,6 +185,8 @@ export default function Home() {
     return [...selected].reverse();
   }, [range, releases]);
   const maxDownloads = Math.max(1, ...chartReleases.map((release) => release.downloads));
+  const isInitialLoad = !summary && status === 'loading';
+  const emptyNote = isInitialLoad ? 'Loading live GitHub data…' : 'GitHub data is temporarily unavailable';
 
   return (
     <main className="dashboard-shell" id="top">
@@ -171,7 +200,7 @@ export default function Home() {
         </a>
         <div className="header-actions">
           <span className={`live-pill status-${status}`}>
-            <i /> {status === 'stale' ? 'Recent snapshot' : status === 'loading' ? 'Connecting…' : 'Live from GitHub'}
+            <i /> {status === 'stale' ? (summary ? 'Recent snapshot' : 'Data unavailable') : status === 'loading' ? 'Connecting…' : 'Live from GitHub'}
           </span>
           <a className="github-button" href="https://github.com/thomasgregg/oralb-ha" target="_blank" rel="noreferrer">
             <GitBranch size={14} aria-hidden="true" /> <span className="github-label">Repository</span> <ExternalLink size={12} aria-hidden="true" />
@@ -212,10 +241,10 @@ export default function Home() {
       </section>
 
       <section className="stats-grid" aria-label="Download summary">
-        <StatCard primary label="Total downloads" value={formatNumber(summary.total)} icon={<Download size={18} />} note={<>Across {releases.length} tracked releases</>} />
-        <StatCard label="Latest release" value={formatNumber(summary.latest.downloads)} icon={<Activity size={18} />} note={<><span className="version-chip">{summary.latest.version}</span> asset downloads</>} />
-        <StatCard label="Most downloaded" value={formatNumber(summary.leader.downloads)} icon={<TrendingUp size={18} />} note={<><span className="version-chip">{summary.leader.version}</span> · {summary.leaderShare}% of total</>} />
-        <StatCard label="Active-release avg." value={formatNumber(summary.average)} icon={<BarChart3 size={18} />} note={<>Average among downloaded versions</>} />
+        <StatCard primary loading={isInitialLoad} label="Total downloads" value={summary ? formatNumber(summary.total) : '—'} icon={<Download size={18} />} note={summary ? <>Across {releases.length} tracked releases</> : emptyNote} />
+        <StatCard loading={isInitialLoad} label="Latest release" value={summary ? formatNumber(summary.latest.downloads) : '—'} icon={<Activity size={18} />} note={summary ? <><span className="version-chip">{summary.latest.version}</span> asset downloads</> : emptyNote} />
+        <StatCard loading={isInitialLoad} label="Most downloaded" value={summary ? formatNumber(summary.leader.downloads) : '—'} icon={<TrendingUp size={18} />} note={summary ? <><span className="version-chip">{summary.leader.version}</span> · {summary.leaderShare}% of total</> : emptyNote} />
+        <StatCard loading={isInitialLoad} label="Active-release avg." value={summary ? formatNumber(summary.average) : '—'} icon={<BarChart3 size={18} />} note={summary ? <>Average among downloaded versions</> : emptyNote} />
       </section>
 
       <section className="analytics-grid">
@@ -234,6 +263,7 @@ export default function Home() {
             <span className="grid-line grid-line-100" />
             <span className="grid-line grid-line-50" />
             <div className="bar-chart" role="img" aria-label="Bar chart showing ZIP downloads by release version">
+              {!summary && <div className={`data-placeholder${isInitialLoad ? ' is-loading' : ''}`}>{emptyNote}</div>}
               {chartReleases.map((release) => (
                 <a className="bar-column" href={release.url} target="_blank" rel="noreferrer" key={release.version} aria-label={`${release.version}: ${release.downloads} downloads`}>
                   <span className="bar-value">{release.downloads || '–'}</span>
@@ -256,23 +286,25 @@ export default function Home() {
             </div>
             <Package size={18} aria-hidden="true" />
           </div>
-          <div className="donut-wrap">
-            <div className="donut" style={{ '--share': `${summary.leaderShare * 3.6}deg` } as CSSProperties}>
-              <div><strong>{summary.leaderShare}%</strong><span>top version</span></div>
+          {summary ? <>
+            <div className="donut-wrap">
+              <div className="donut" style={{ '--share': `${summary.leaderShare * 3.6}deg` } as CSSProperties}>
+                <div><strong>{summary.leaderShare}%</strong><span>top version</span></div>
+              </div>
             </div>
-          </div>
-          <div className="leader-row">
-            <span><i /> {summary.leader.version}</span>
-            <strong>{formatNumber(summary.leader.downloads)}</strong>
-          </div>
-          <div className="leader-row secondary">
-            <span><i /> Other releases</span>
-            <strong>{formatNumber(summary.total - summary.leader.downloads)}</strong>
-          </div>
-          <div className="insight-note">
-            <TrendingUp size={16} />
-            <p><strong>{summary.leader.version}</strong> currently drives most tracked download activity.</p>
-          </div>
+            <div className="leader-row">
+              <span><i /> {summary.leader.version}</span>
+              <strong>{formatNumber(summary.leader.downloads)}</strong>
+            </div>
+            <div className="leader-row secondary">
+              <span><i /> Other releases</span>
+              <strong>{formatNumber(summary.total - summary.leader.downloads)}</strong>
+            </div>
+            <div className="insight-note">
+              <TrendingUp size={16} />
+              <p><strong>{summary.leader.version}</strong> currently drives most tracked download activity.</p>
+            </div>
+          </> : <div className={`insight-placeholder${isInitialLoad ? ' is-loading' : ''}`}>{emptyNote}</div>}
         </aside>
       </section>
 
@@ -290,8 +322,9 @@ export default function Home() {
               <tr><th>Version</th><th>Published</th><th>Asset size</th><th>Share</th><th className="align-right">Downloads</th><th><span className="sr-only">Open</span></th></tr>
             </thead>
             <tbody>
+              {!summary && <tr className="empty-row"><td colSpan={6}>{emptyNote}</td></tr>}
               {releases.map((release, index) => {
-                const share = summary.total ? Math.round((release.downloads / summary.total) * 100) : 0;
+                const share = summary?.total ? Math.round((release.downloads / summary.total) * 100) : 0;
                 return (
                   <tr key={release.version}>
                     <td><span className="release-version">{release.version}</span>{index === 0 && <span className="latest-tag">Latest</span>}</td>
