@@ -7,9 +7,10 @@
 
 Oral-B Live combines passive Bluetooth updates, a direct toothbrush
 connection, an iO Sense charger bridge, and the brush's retained session
-summary. It provides live timer, pressure, pacer and mode entities, keeps a
-persistent brushing log, and exposes supported battery, brush-head, display
-and charger diagnostics without using the Oral-B cloud.
+summary. It provides live timer, pressure, pacer and mode entities, persists
+the latest-session summary and daily session count, and exposes
+supported battery, brush-head, display and charger diagnostics without using
+the Oral-B cloud.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/thomasgregg/oralb-ha/main/docs/images/toothbrush-device.png" alt="Oral-B Live toothbrush device page in Home Assistant" width="900">
@@ -221,6 +222,10 @@ successful brush read. They remain `unknown` until the charger or direct brush
 connection has returned the corresponding characteristic; Oral-B Live does not
 invent placeholder values for unsupported or not-yet-read fields.
 
+Battery voltage, current and temperature, plus both brush-head remainder
+entities, are disabled by default. Enable them from the toothbrush device's
+entity list if those diagnostics are needed.
+
 The **SmartRing color** entity belongs to the toothbrush and is distinct from
 the iO Sense charger's own Ring color entity. Oral-B Live reads the handle's
 configured/default `FF2B` accent and never writes it. During brushing, the
@@ -232,8 +237,8 @@ The first three `FF2B` bytes are the raw drive levels for the ring's red,
 green and blue LEDs, not a screen-calibrated RGB colour. The sensor deliberately
 keeps those device bytes as its state so the contract remains exact and stable
 across models. Display consumers may apply a model-appropriate correction once;
-Toothbrush Card does this for Oral-B entities. The measured calibration and
-current model-scope limitation are documented in the
+Toothbrush Card 0.33.0 and newer do this for Oral-B entities. The measured
+calibration and current model-scope limitation are documented in the
 [protocol reference](docs/protocol.md#smartring-led-drive-levels).
 
 The **Battery** entity keeps its last valid percentage across Home Assistant
@@ -382,23 +387,24 @@ cards:
 
 ## Requirements
 
-- Home Assistant 2024.1 or newer.
-- A connectable Bluetooth adapter or ESPHome Bluetooth proxy near the brush.
+- Home Assistant 2024.4 or newer.
+- A connectable Bluetooth adapter or ESPHome Bluetooth proxy near the brush or
+  iO Sense charger, depending on the selected connection path.
 - An iO Sense charger for charger-bridge data; the integration still operates
   without one through its other local sources.
 
-Recommended ESPHome proxy configuration:
+Recommended ESP32 ESPHome proxy configuration:
 
 ```yaml
 esp32_ble_tracker:
-  scan_parameters:
-    interval: 320ms
-    window: 320ms
-    continuous: true
 
 bluetooth_proxy:
   active: true
 ```
+
+The default ESPHome scan parameters are recommended. Oral-B Live needs an
+active-capable proxy for direct GATT and charger-bridge connections, but does
+not require an aggressive full-duty scan window.
 
 ## Protocol reference
 
