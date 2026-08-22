@@ -244,6 +244,7 @@ used as a local fallback when a current reading is unavailable.
 The **Last session** attributes can include:
 
 - duration and brushing mode;
+- the result display face captured from the ending advertisement;
 - source and session identifier;
 - configured target and sectors covered;
 - high/low-pressure event counts and durations;
@@ -253,7 +254,9 @@ The **Last session** attributes can include:
 Live sessions immediately save the observed mode and a locally sampled
 pressure summary. When the brush later exposes its retained `FF29` result,
 Oral-B Live replaces those estimates with the brush's exact pressure totals,
-event counts and ending battery without creating a second session.
+event counts and ending battery without creating a second session. The
+captured display face remains attached to that session because `FF29` does not
+contain it.
 
 ### iO Sense Charger device
 

@@ -628,7 +628,9 @@ twice.
 
 `FF29` belongs to the brush and retains its latest summary. It is not a dump
 of a charger queue and does not contain per-second pressure distribution or
-per-zone pressure time.
+per-zone pressure time. It also has no display-face field, so Oral-B Live keeps
+the face decoded from the session-ending advertisement with the matching Home
+Assistant session record.
 
 ### Availability after a session
 

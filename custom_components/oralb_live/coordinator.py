@@ -180,6 +180,7 @@ class OralBLiveCoordinator:
             "last_session_start": None,
             "last_session_duration": None,
             "last_session_mode": None,
+            "last_session_display_face": None,
             "last_session_sectors": None,
             "last_session_high_pressure": None,
             "last_session_low_pressure": None,
@@ -353,7 +354,9 @@ class OralBLiveCoordinator:
             # brush was still advertising as running, up to a full advertising
             # interval short of what the brush displayed.
             self._track_session_time(self.data["time"], confirm_session=track_session)
-        self._apply_state(state_raw, track_session=track_session)
+        session_recorded = self._apply_state(
+            state_raw, track_session=track_session
+        )
         if not adv_live:
             # The other side of the same transition: a session that begins with
             # this advertisement was not active when the sample above was
@@ -366,6 +369,8 @@ class OralBLiveCoordinator:
             self._apply_smiley(
                 bytes((decode_display_face(payload[ADV_IDX_SECTOR]),))
             )
+            if session_recorded:
+                self.data["last_session_display_face"] = self.data["smiley"]
             self._apply_sector(
                 payload[ADV_IDX_SECTOR],
                 (
@@ -1033,6 +1038,10 @@ class OralBLiveCoordinator:
             or start >= previous_start
         )
         if updates_latest_session:
+            if not reconciles_passive_session:
+                # FF29 has no display-face field. A genuinely newer retained
+                # session must not inherit the face captured for its predecessor.
+                self.data["last_session_display_face"] = None
             self.data["last_session_start"] = start
             self.data["last_session_duration"] = duration
             self.data["last_session_mode"] = MODES.get(mode_raw, f"mode_{mode_raw}")
@@ -1085,7 +1094,9 @@ class OralBLiveCoordinator:
         *,
         track_session: bool = True,
         confirm_session: bool | None = None,
-    ) -> None:
+    ) -> bool:
+        """Apply brush state and report whether it recorded a completed session."""
+        session_recorded = False
         previous_tracked = self._tracked_state_raw
         self.data["state_raw"] = raw
         self.data["state"] = STATES.get(raw, f"unknown_state_{raw}")
@@ -1105,7 +1116,7 @@ class OralBLiveCoordinator:
             elif raw in session_states and confirms_brushing:
                 self._confirm_session()
             elif raw not in session_states and previous_tracked in session_states:
-                self._end_session()
+                session_recorded = self._end_session()
 
         if raw != RUNNING_STATE:
             self.data["sector"] = "no_sector"
@@ -1127,6 +1138,7 @@ class OralBLiveCoordinator:
                 self._session_generation,
                 self.data["state"],
             )
+        return session_recorded
 
     # ---------------------------------------------------------- sessions
     def _begin_session(self, *, confirmed: bool = False) -> None:
@@ -1157,7 +1169,7 @@ class OralBLiveCoordinator:
             self._session_confirmed = True
             _LOGGER.debug("%s: session confirmed by brush data", self.name)
 
-    def _end_session(self) -> None:
+    def _end_session(self) -> bool:
         """A brushing session just finished; record the result.
 
         Prefer the brush's advertised/notified timer. If it stays at
@@ -1166,7 +1178,7 @@ class OralBLiveCoordinator:
         later reconciled with ff29 if that record becomes available.
         """
         if not self._session_active:
-            return
+            return False
         self._accumulate_session_pressure_time(time.monotonic())
         self._session_active = False
         self._cancel_charger_ticker()
@@ -1176,7 +1188,7 @@ class OralBLiveCoordinator:
                 "%s: provisional session ended without brush evidence; ignored",
                 self.name,
             )
-            return
+            return False
         duration = self._session_max_time or 0
         duration_source = "brush timer"
         if duration <= 0 and self._session_started_monotonic is not None:
@@ -1185,14 +1197,14 @@ class OralBLiveCoordinator:
         self._session_started_monotonic = None
         if duration <= 0:
             _LOGGER.debug("%s: session ended with no duration; ignored", self.name)
-            return
+            return False
         if duration > MAX_SESSION_SECONDS:
             _LOGGER.debug(
                 "%s: session duration %ss exceeds the maximum; ignored",
                 self.name,
                 duration,
             )
-            return
+            return False
         if (
             duration_source == "passive elapsed time"
             and duration < MIN_PASSIVE_SESSION_SECONDS
@@ -1203,7 +1215,7 @@ class OralBLiveCoordinator:
                 duration,
                 MIN_PASSIVE_SESSION_SECONDS,
             )
-            return
+            return False
 
         today = dt_util.now().date()
         previous_start = self.data.get("last_session_start")
@@ -1217,6 +1229,10 @@ class OralBLiveCoordinator:
         self.data["last_session_start"] = self._session_start
         self.data["last_session_duration"] = duration
         self.data["last_session_mode"] = self._session_mode or self.data.get("mode")
+        # The result face arrives after the state transition on the passive
+        # advertisement path. Clear the predecessor now so another source can
+        # never make a new session inherit a face that does not belong to it.
+        self.data["last_session_display_face"] = None
         self.data["last_session_sectors"] = len(self._session_sectors)
         has_pressure_samples = self._session_pressure_samples > 0
         self.data["last_session_high_pressure"] = (
@@ -1256,6 +1272,7 @@ class OralBLiveCoordinator:
             len(self._session_sectors),
             self._session_high_pressure,
         )
+        return True
 
     def _track_session_time(
         self, seconds: int, *, confirm_session: bool = False

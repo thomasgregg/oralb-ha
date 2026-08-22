@@ -506,6 +506,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 restored_attributes = {
                     "last_session_duration": last.attributes.get("duration_seconds"),
                     "last_session_mode": last.attributes.get("mode"),
+                    "last_session_display_face": last.attributes.get("display_face"),
                     "last_session_sectors": last.attributes.get("quadrants_covered"),
                     "last_session_high_pressure": last.attributes.get(
                         "high_pressure_events"
@@ -567,6 +568,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             self._attr_extra_state_attributes = {
                 "duration_seconds": data.get("last_session_duration"),
                 "mode": data.get("last_session_mode"),
+                "display_face": data.get("last_session_display_face"),
                 "quadrants_covered": data.get("last_session_sectors"),
                 "high_pressure_events": data.get("last_session_high_pressure"),
                 "low_pressure_events": data.get("last_session_low_pressure"),

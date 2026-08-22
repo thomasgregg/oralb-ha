@@ -8,6 +8,7 @@ import pathlib
 import sys
 import types
 import unittest
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 COMPONENT_PATH = (
@@ -23,6 +24,7 @@ sys.modules.setdefault("oralb_live", _PACKAGE)
 try:
     const = importlib.import_module("oralb_live.const")
     coordinator = importlib.import_module("oralb_live.coordinator")
+    sensor = importlib.import_module("oralb_live.sensor")
 except ImportError as err:  # pragma: no cover - environment without HA
     raise unittest.SkipTest(f"Home Assistant is not importable: {err}") from err
 
@@ -36,7 +38,7 @@ def _advertisement(payload: bytes):
     )
 
 
-def _payload(state: int, seconds: int, sector: int = 1) -> bytes:
+def _payload(state: int, seconds: int, sector: int = 1, face: int = 0) -> bytes:
     """Build a protocol 6 advertisement carrying a state and a timer."""
     return bytes(
         [
@@ -48,7 +50,7 @@ def _payload(state: int, seconds: int, sector: int = 1) -> bytes:
             seconds // 256,
             seconds % 256,
             0x00,  # mode
-            sector,
+            sector | (face << 3),
             0x00,  # total sectors
             0x00,  # sector timer
         ]
@@ -89,6 +91,62 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c._parse_advertisement(_advertisement(_payload(2, 42)))
 
         self.assertEqual(c.data["last_session_duration"], 42)
+
+    def test_ending_advertisement_keeps_face_with_session(self) -> None:
+        """The result face belongs to the session that just ended."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 60)))
+        c._parse_advertisement(_advertisement(_payload(2, 69, face=5)))
+
+        self.assertEqual(c.data["smiley"], "special_5")
+        self.assertEqual(c.data["last_session_display_face"], "special_5")
+
+    def test_later_live_face_does_not_overwrite_session_result(self) -> None:
+        """Waking the selection menu changes Smiley, not Last session."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 60)))
+        c._parse_advertisement(_advertisement(_payload(2, 69, face=5)))
+
+        c._parse_advertisement(_advertisement(_payload(8, 0, face=0)))
+        c._parse_advertisement(_advertisement(_payload(2, 0, face=0)))
+
+        self.assertEqual(c.data["smiley"], "off")
+        self.assertEqual(c.data["last_session_display_face"], "special_5")
+
+    def test_ignored_provisional_session_does_not_replace_result_face(self) -> None:
+        """A menu-only transition cannot attach its face to the last session."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 30)))
+        c._parse_advertisement(_advertisement(_payload(2, 30, face=4)))
+
+        c._parse_advertisement(_advertisement(_payload(8, 0, face=2)))
+        c._parse_advertisement(_advertisement(_payload(4, 0, face=2)))
+
+        self.assertEqual(c.data["last_session_display_face"], "special_4")
+
+    def test_back_to_back_sessions_keep_only_the_latest_result_face(self) -> None:
+        """A newly completed session replaces the previous session's face."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 30)))
+        c._parse_advertisement(_advertisement(_payload(2, 30, face=4)))
+        c._parse_advertisement(_advertisement(_payload(3, 45)))
+        c._parse_advertisement(_advertisement(_payload(2, 45, face=7)))
+
+        self.assertEqual(c.data["last_session_display_face"], "special_7")
+
+    def test_new_session_without_correlated_face_clears_previous_result(self) -> None:
+        """A direct session must not inherit an older advertisement result."""
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        c = coordinator.OralBLiveCoordinator(
+            MagicMock(), "AA:BB:CC:DD:EE:FF", "test", const.CONNECTION_MODE_LIVE
+        )
+        c.data["last_session_display_face"] = "special_5"
+
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(30, confirm_session=True)
+        c._apply_state(2)
+
+        self.assertIsNone(c.data["last_session_display_face"])
 
     def test_a_quiet_brush_does_not_invent_a_session(self) -> None:
         """Idle advertisements on their own record nothing."""
@@ -134,6 +192,49 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertEqual(c.data["battery"], 94)
         self.assertIsNotNone(c.data["battery_updated_at"])
         self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_SESSION)
+
+    def test_retained_record_preserves_face_when_reconciling_same_session(self) -> None:
+        """FF29 refines a passive record but has no replacement face."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 110)))
+        c._parse_advertisement(_advertisement(_payload(2, 120, face=6)))
+        passive_start = c.data["last_session_start"]
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+        c._last_synced_session_ts = 0
+        c._store.async_save = AsyncMock()
+
+        result = asyncio.run(
+            c._async_apply_session_record(
+                record,
+                record[:4],
+                rtc_sampled_at=passive_start,
+            )
+        )
+
+        self.assertEqual(result, "new")
+        self.assertEqual(c.data["last_session_source"], const.DATA_SOURCE_SESSION)
+        self.assertEqual(c.data["last_session_display_face"], "special_6")
+
+    def test_new_retained_record_does_not_inherit_previous_face(self) -> None:
+        """A newer FF29-only session has an unknown face, not a stale one."""
+        c = self._coordinator()
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+        c._last_synced_session_ts = 0
+        c._store.async_save = AsyncMock()
+        now = coordinator.dt_util.utcnow()
+        c.data["last_session_start"] = now - timedelta(hours=1)
+        c.data["last_session_display_face"] = "special_5"
+
+        result = asyncio.run(
+            c._async_apply_session_record(
+                record,
+                record[:4],
+                rtc_sampled_at=now,
+            )
+        )
+
+        self.assertEqual(result, "new")
+        self.assertIsNone(c.data["last_session_display_face"])
 
 
 class SessionSyncRetryTests(unittest.TestCase):
@@ -358,6 +459,55 @@ class LiveSectorNumberingTests(unittest.TestCase):
         c._parse_advertisement(_advertisement(_payload(3, 10, sector=1)))
 
         self.assertEqual(c.data["sector"], "sector_1")
+
+
+class LastSessionDisplayFaceSensorTests(unittest.IsolatedAsyncioTestCase):
+    """The session face is exposed and restored with Last session."""
+
+    def _entity(self):
+        coordinator_instance = MagicMock()
+        coordinator_instance.address = "AA:BB:CC:DD:EE:FF"
+        coordinator_instance.available = True
+        coordinator_instance.data = {
+            "last_session_start": coordinator.dt_util.utcnow(),
+            "last_session_display_face": "special_5",
+        }
+        description = next(
+            item for item in sensor.SENSORS if item.key == "last_session"
+        )
+        return (
+            coordinator_instance,
+            sensor.OralBLiveSensor(coordinator_instance, description),
+        )
+
+    def test_last_session_exposes_display_face_attribute(self) -> None:
+        coordinator_instance, entity = self._entity()
+
+        with patch.object(entity, "async_write_ha_state"):
+            entity._handle_update(coordinator_instance.data)
+
+        self.assertEqual(entity.extra_state_attributes["display_face"], "special_5")
+
+    async def test_last_session_restores_display_face_after_restart(self) -> None:
+        coordinator_instance, entity = self._entity()
+        coordinator_instance.data["last_session_display_face"] = None
+        restored = types.SimpleNamespace(
+            state=coordinator_instance.data["last_session_start"].isoformat(),
+            attributes={"display_face": "special_6"},
+        )
+        entity.hass = MagicMock()
+        entity.async_get_last_state = AsyncMock(return_value=restored)
+
+        with (
+            patch.object(sensor, "async_dispatcher_connect", return_value=lambda: None),
+            patch.object(entity, "async_write_ha_state"),
+        ):
+            await entity.async_added_to_hass()
+
+        self.assertEqual(
+            coordinator_instance.data["last_session_display_face"], "special_6"
+        )
+        self.assertEqual(entity.extra_state_attributes["display_face"], "special_6")
 
 
 if __name__ == "__main__":
