@@ -4,6 +4,7 @@ import {
   Activity,
   BarChart3,
   CalendarDays,
+  Check,
   Download,
   ExternalLink,
   GitBranch,
@@ -91,11 +92,13 @@ function StatCard({ label, value, note, icon, primary = false }: { label: string
 export default function Home() {
   const [releases, setReleases] = useState(FALLBACK_RELEASES);
   const [status, setStatus] = useState<'loading' | 'ready' | 'stale'>('loading');
+  const [refreshState, setRefreshState] = useState<'idle' | 'refreshing' | 'updated' | 'error'>('idle');
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [range, setRange] = useState<'all' | 'recent'>('all');
 
   const refresh = useCallback(async () => {
-    setStatus((current) => current === 'ready' ? 'ready' : 'loading');
+    setStatus('loading');
+    setRefreshState('refreshing');
     try {
       const response = await fetch(API_URL, {
         cache: 'no-store',
@@ -118,8 +121,10 @@ export default function Home() {
       setReleases(metrics);
       setLastUpdated(new Date());
       setStatus('ready');
+      setRefreshState('updated');
     } catch {
       setStatus('stale');
+      setRefreshState('error');
     }
   }, []);
 
@@ -128,6 +133,12 @@ export default function Home() {
     const timer = window.setInterval(() => void refresh(), 300_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (refreshState !== 'updated') return;
+    const timer = window.setTimeout(() => setRefreshState('idle'), 2_400);
+    return () => window.clearTimeout(timer);
+  }, [refreshState]);
 
   const summary = useMemo(() => {
     const total = releases.reduce((sum, release) => sum + release.downloads, 0);
@@ -177,8 +188,25 @@ export default function Home() {
         <div className="hero-refresh">
           <span>Last refreshed</span>
           <strong>{timeAgo(lastUpdated)}</strong>
-          <button type="button" onClick={() => void refresh()} aria-label="Refresh GitHub download data">
-            <RefreshCw size={14} className={status === 'loading' ? 'is-spinning' : ''} /> Refresh data
+          <button
+            type="button"
+            className={`refresh-button state-${refreshState}`}
+            onClick={() => void refresh()}
+            aria-label="Refresh GitHub download data"
+            disabled={refreshState === 'refreshing'}
+          >
+            {refreshState === 'updated'
+              ? <Check size={14} aria-hidden="true" />
+              : <RefreshCw size={14} className={refreshState === 'refreshing' ? 'is-spinning' : ''} aria-hidden="true" />}
+            <span aria-live="polite">
+              {refreshState === 'refreshing'
+                ? 'Refreshing…'
+                : refreshState === 'updated'
+                  ? 'Updated'
+                  : refreshState === 'error'
+                    ? 'Try again'
+                    : 'Refresh data'}
+            </span>
           </button>
         </div>
       </section>
