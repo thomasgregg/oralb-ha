@@ -289,9 +289,8 @@ the tool removes every successful subscription before disconnecting.
 
 ### Download and run it
 
-The reporter does not need a repository checkout. After a release containing
-tool version 2 or later is published, these macOS/Linux commands download a
-fresh standalone copy and run the complete capture:
+The reporter does not need a repository checkout. These macOS/Linux commands
+download the current standalone release and run the complete capture:
 
 ```bash
 mkdir -p "$HOME/oralb-pacer-test"
