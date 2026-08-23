@@ -38,7 +38,6 @@ the Oral-B cloud.
 - [Protocol reference](#protocol-reference)
 - [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
-  - [iO Sense diagnostic probe](#io-sense-diagnostic-probe)
 
 ## How it works
 
