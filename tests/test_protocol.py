@@ -113,7 +113,7 @@ class ProtocolDecoderTests(unittest.TestCase):
 
     def test_charger_refreshes_current_values_before_retained_session(self) -> None:
         self.assertEqual(
-            ("FF05", "FF2B", "FF2D"), const.CHARGER_POST_SESSION_READS[:3]
+            ("FF05", "FF0A", "FF2B"), const.CHARGER_POST_SESSION_READS[:3]
         )
         self.assertLess(
             const.CHARGER_POST_SESSION_READS.index("FF2B"),

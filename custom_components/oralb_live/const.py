@@ -171,6 +171,18 @@ SESSION_SYNC_RETRY_BACKOFF_SECONDS = (
 )
 # Sanity bound for a session duration parsed from the ff29 record.
 MAX_SESSION_SECONDS = 7200
+# A result face is transient and can arrive on a different characteristic from
+# the state transition. Keep association narrow enough that a later menu wake
+# cannot be mistaken for the completed session.
+SESSION_DISPLAY_FACE_CAPTURE_WINDOW_SECONDS = 15.0
+SESSION_DISPLAY_FACE_PRE_END_GRACE_SECONDS = 2.0
+# Direct FF0A notifications are optional and demonstrably inconsistent across
+# sessions. Read without releasing the brush slot, then retry briefly while the
+# result would still be on the handle display.
+SESSION_DISPLAY_FACE_READ_RETRY_DELAYS = (0.0, 0.5, 1.0, 2.0)
+# 0 is display-off and 1 is the everyday/standard face. Neither is a brushing
+# verdict; only special and unknown future result values belong to a session.
+SESSION_DISPLAY_FACE_RESULT_MIN_RAW = 2
 
 STORAGE_VERSION = 1
 
@@ -305,17 +317,18 @@ CHARGER_IDLE_PROBE_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SNAPSHOT_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SESSION_SYNC_INTERVAL_SECONDS = 60.0
 # Read values with the shortest useful window before optional retained session
-# fields. Keep battery first. Hardware testing confirmed that FF2B succeeds via
-# iO Sense passthrough while the handle remains off the charger, but can miss
-# its response when attempted at the end of this sequence after normal docking.
+# fields. Keep battery first and the transient result face second. Hardware
+# testing confirmed that FF2B succeeds via iO Sense passthrough while the handle
+# remains off the charger, but can miss its response when attempted at the end
+# of this sequence after normal docking.
 # Some brush firmware also rejects FF29 and FF22 until the retained record has
 # settled; those failures must not prevent current values from refreshing.
 CHARGER_POST_SESSION_READS = (
     "FF05",
+    "FF0A",
     "FF2B",
     "FF2D",
     "FF02",
-    "FF0A",
     "FF25",
     "FF26",
     "FF29",

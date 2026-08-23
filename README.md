@@ -249,7 +249,7 @@ used as a local fallback when a current reading is unavailable.
 The **Last session** attributes can include:
 
 - duration and brushing mode;
-- the result display face captured from the ending advertisement;
+- the result display face captured from an ending advertisement or FF0A;
 - source and session identifier;
 - configured target and sectors covered;
 - high/low-pressure event counts and durations;
@@ -261,7 +261,10 @@ pressure summary. When the brush later exposes its retained `FF29` result,
 Oral-B Live replaces those estimates with the brush's exact pressure totals,
 event counts and ending battery without creating a second session. The
 captured display face remains attached to that session because `FF29` does not
-contain it.
+contain it. Direct connections also make a few short FF0A reads immediately
+after the session because optional notifications can be missed; the connection
+is retained throughout. If the handle exposes no result, `display_face` remains
+`null` rather than substituting `off`, `standard` or an older session's face.
 
 ### iO Sense Charger device
 

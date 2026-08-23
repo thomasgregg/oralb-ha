@@ -84,6 +84,10 @@ from .const import (
     RELEASE_GRACE_SECONDS,
     RELEASE_STATES,
     RUNNING_STATE,
+    SESSION_DISPLAY_FACE_CAPTURE_WINDOW_SECONDS,
+    SESSION_DISPLAY_FACE_PRE_END_GRACE_SECONDS,
+    SESSION_DISPLAY_FACE_READ_RETRY_DELAYS,
+    SESSION_DISPLAY_FACE_RESULT_MIN_RAW,
     SESSION_RECONCILE_WINDOW_SECONDS,
     SESSION_RECORD_SETTLE_SECONDS,
     SESSION_SEEN_STATES,
@@ -226,6 +230,18 @@ class OralBLiveCoordinator:
         self._session_mode: str | None = None
         self._last_pressure: str | None = None
         self._pending_passive_sessions: list[Any] = []
+        # FF0A and FF04 are independent characteristics, and advertisements
+        # carry both fields in one packet only on the passive path. Correlate a
+        # transient result with exactly one completed session regardless of
+        # which transport delivers it.
+        self._session_face_generation = 0
+        self._pending_session_face_generation: int | None = None
+        self._pending_session_face_deadline = 0.0
+        self._last_smiley_sample_raw: int | None = None
+        self._last_smiley_sample_monotonic: float | None = None
+        self._last_smiley_sample_generation: int | None = None
+        self._last_smiley_sample_source: str | None = None
+        self._session_face_read_task: asyncio.Task | None = None
         # Keep session-edge tracking separate from the displayed last-known
         # state.  A cached advertisement may seed the latter after restart,
         # but must not consume the next genuine state transition.
@@ -289,12 +305,14 @@ class OralBLiveCoordinator:
             self._reconnect_task,
             self._sync_task,
             self._charger_tick_task,
+            self._session_face_read_task,
         ):
             if task:
                 task.cancel()
         self._reconnect_task = None
         self._sync_task = None
         self._charger_tick_task = None
+        self._session_face_read_task = None
         if self._unsub_bluetooth:
             self._unsub_bluetooth()
             self._unsub_bluetooth = None
@@ -354,9 +372,7 @@ class OralBLiveCoordinator:
             # brush was still advertising as running, up to a full advertising
             # interval short of what the brush displayed.
             self._track_session_time(self.data["time"], confirm_session=track_session)
-        session_recorded = self._apply_state(
-            state_raw, track_session=track_session
-        )
+        self._apply_state(state_raw, track_session=track_session)
         if not adv_live:
             # The other side of the same transition: a session that begins with
             # this advertisement was not active when the sample above was
@@ -367,10 +383,9 @@ class OralBLiveCoordinator:
             self._track_session_pressure(self.data["pressure"])
             self._apply_mode(payload[ADV_IDX_MODE])
             self._apply_smiley(
-                bytes((decode_display_face(payload[ADV_IDX_SECTOR]),))
+                bytes((decode_display_face(payload[ADV_IDX_SECTOR]),)),
+                source=DATA_SOURCE_ADVERTISEMENT,
             )
-            if session_recorded:
-                self.data["last_session_display_face"] = self.data["smiley"]
             self._apply_sector(
                 payload[ADV_IDX_SECTOR],
                 (
@@ -489,7 +504,7 @@ class OralBLiveCoordinator:
         self._apply_available_modes(available_modes)
         self._apply_refill(refill)
         self._apply_ring_color(ring_color)
-        self._apply_smiley(smiley)
+        self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
         self._apply_pressure(pressure, DATA_SOURCE_DIRECT)
         if brushing_time is not None and len(brushing_time) >= 2:
             self.data["time"] = _decode_time(brushing_time[0], brushing_time[1])
@@ -518,7 +533,7 @@ class OralBLiveCoordinator:
         elif uuid == CHAR_STATUS_BLOB:
             self._apply_battery_status(payload, DATA_SOURCE_DIRECT)
         elif uuid == CHAR_SMILEY:
-            self._apply_smiley(payload)
+            self._apply_smiley(payload, source=DATA_SOURCE_DIRECT)
         self._push()
 
     # ------------------------------------------------------ iO Sense bridge
@@ -574,7 +589,7 @@ class OralBLiveCoordinator:
         elif short_uuid == "FF09" and len(raw) >= 3:
             self._apply_ff09_sector(raw[0], raw[2], raw[1])
         elif short_uuid == "FF0A":
-            self._apply_smiley(raw)
+            self._apply_smiley(raw, source=DATA_SOURCE_CHARGER)
         elif short_uuid == "FF0B" and raw:
             self._apply_pressure(raw, DATA_SOURCE_CHARGER)
         elif short_uuid == "FF22" and len(raw) >= 4:
@@ -886,7 +901,7 @@ class OralBLiveCoordinator:
                 except (BleakError, TimeoutError):
                     pass
         self._apply_battery_status(status, DATA_SOURCE_DIRECT)
-        self._apply_smiley(smiley)
+        self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
         self._apply_refill(refill)
         self._apply_device_info(model_info)
         self._apply_pacer(pacer)
@@ -1041,6 +1056,9 @@ class OralBLiveCoordinator:
             if not reconciles_passive_session:
                 # FF29 has no display-face field. A genuinely newer retained
                 # session must not inherit the face captured for its predecessor.
+                self._invalidate_session_display_face_capture(
+                    advance_generation=True
+                )
                 self.data["last_session_display_face"] = None
             self.data["last_session_start"] = start
             self.data["last_session_duration"] = duration
@@ -1141,8 +1159,139 @@ class OralBLiveCoordinator:
         return session_recorded
 
     # ---------------------------------------------------------- sessions
+    def _cancel_session_display_face_read(self) -> None:
+        """Cancel a direct FF0A retry sequence without closing association."""
+        task = self._session_face_read_task
+        if task and not task.done():
+            task.cancel()
+        self._session_face_read_task = None
+
+    def _invalidate_session_display_face_capture(
+        self, *, advance_generation: bool = False
+    ) -> None:
+        """Prevent delayed face data from attaching to the wrong session."""
+        self._cancel_session_display_face_read()
+        if advance_generation:
+            self._session_face_generation += 1
+        self._pending_session_face_generation = None
+        self._pending_session_face_deadline = 0.0
+
+    def _session_display_face_capture_is_open(
+        self, generation: int, *, now: float | None = None
+    ) -> bool:
+        """Return whether a result can still belong to this session token."""
+        if self._pending_session_face_generation != generation:
+            return False
+        observed_at = time.monotonic() if now is None else now
+        if observed_at > self._pending_session_face_deadline:
+            self._pending_session_face_generation = None
+            self._pending_session_face_deadline = 0.0
+            return False
+        return True
+
+    def _capture_session_display_face(
+        self,
+        raw: int,
+        *,
+        generation: int,
+        source: str | None,
+        observed_at: float | None = None,
+    ) -> bool:
+        """Attach one real result face to its still-current completed session."""
+        if raw < SESSION_DISPLAY_FACE_RESULT_MIN_RAW:
+            return False
+        now = time.monotonic() if observed_at is None else observed_at
+        if not self._session_display_face_capture_is_open(generation, now=now):
+            return False
+        self.data["last_session_display_face"] = SMILEYS.get(raw, f"face_{raw}")
+        self._pending_session_face_generation = None
+        self._pending_session_face_deadline = 0.0
+        _LOGGER.debug(
+            "%s: attached display face %s to session generation %s from %s",
+            self.name,
+            self.data["last_session_display_face"],
+            generation,
+            source or "unknown source",
+        )
+        return True
+
+    def _open_session_display_face_capture(self) -> None:
+        """Open the bounded result window for the session just recorded."""
+        generation = self._session_face_generation
+        now = time.monotonic()
+        self._pending_session_face_generation = generation
+        self._pending_session_face_deadline = (
+            now + SESSION_DISPLAY_FACE_CAPTURE_WINDOW_SECONDS
+        )
+
+        # Notifications from different GATT characteristics have no ordering
+        # guarantee. Accept a special face sampled just before the quiet-state
+        # edge, but only if it was observed during this exact session.
+        if (
+            self._last_smiley_sample_raw is not None
+            and self._last_smiley_sample_generation == generation
+            and self._last_smiley_sample_monotonic is not None
+            and 0.0
+            <= now - self._last_smiley_sample_monotonic
+            <= SESSION_DISPLAY_FACE_PRE_END_GRACE_SECONDS
+            and self._capture_session_display_face(
+                self._last_smiley_sample_raw,
+                generation=generation,
+                source=self._last_smiley_sample_source,
+                observed_at=now,
+            )
+        ):
+            return
+
+        client = self._client
+        if (
+            self.mode == CONNECTION_MODE_LIVE
+            and client is not None
+            and client.is_connected
+        ):
+            self._session_face_read_task = self.hass.async_create_background_task(
+                self._async_read_session_display_face(generation, client),
+                "oralb_live_session_display_face",
+            )
+
+    async def _async_read_session_display_face(
+        self,
+        generation: int,
+        client: BleakClientWithServiceCache,
+    ) -> None:
+        """Best-effort direct FF0A reads while retaining the brush connection."""
+        current_task = asyncio.current_task()
+        try:
+            for delay in SESSION_DISPLAY_FACE_READ_RETRY_DELAYS:
+                if delay:
+                    await asyncio.sleep(delay)
+                if (
+                    self._stopping
+                    or client is not self._client
+                    or not client.is_connected
+                    or not self._session_display_face_capture_is_open(generation)
+                ):
+                    return
+                smiley = await self._async_sync_read(
+                    client, CHAR_SMILEY, "post-session smiley"
+                )
+                # Re-check after I/O: a new session may have started while the
+                # BLE read was outstanding.
+                if not self._session_display_face_capture_is_open(generation):
+                    return
+                self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
+                self._push()
+                if self._pending_session_face_generation != generation:
+                    return
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._session_face_read_task is current_task:
+                self._session_face_read_task = None
+
     def _begin_session(self, *, confirmed: bool = False) -> None:
         """A brushing session just started."""
+        self._invalidate_session_display_face_capture(advance_generation=True)
         self._session_active = True
         self._session_confirmed = confirmed
         self._session_timer_baseline = None
@@ -1262,6 +1411,7 @@ class OralBLiveCoordinator:
         self.data["last_session_source"] = self.data.get("data_source")
         self._pending_passive_sessions.append(self._session_start)
         self._pending_passive_sessions = self._pending_passive_sessions[-10:]
+        self._open_session_display_face_capture()
         _LOGGER.debug(
             "%s: session ended from %s: %ss, mode %s, %s quadrants, "
             "%s high-pressure events",
@@ -1496,12 +1646,33 @@ class OralBLiveCoordinator:
         if payload is not None:
             self.data.update(parse_ring_color(payload))
 
-    def _apply_smiley(self, payload: bytes | bytearray | None) -> None:
+    def _apply_smiley(
+        self,
+        payload: bytes | bytearray | None,
+        *,
+        source: str | None = None,
+    ) -> None:
+        """Apply the live display and correlate a real result when bounded."""
         if not payload:
             return
         raw = payload[0]
+        observed_at = time.monotonic()
         self.data["smiley_raw"] = raw
         self.data["smiley"] = SMILEYS.get(raw, f"face_{raw}")
+        self._last_smiley_sample_raw = raw
+        self._last_smiley_sample_monotonic = observed_at
+        self._last_smiley_sample_generation = (
+            self._session_face_generation if self._session_active else None
+        )
+        self._last_smiley_sample_source = source or self.data.get("data_source")
+        pending_generation = self._pending_session_face_generation
+        if pending_generation is not None:
+            self._capture_session_display_face(
+                raw,
+                generation=pending_generation,
+                source=self._last_smiley_sample_source,
+                observed_at=observed_at,
+            )
 
     def _apply_pressure(
         self,
@@ -1566,6 +1737,7 @@ class OralBLiveCoordinator:
         self._disconnect_task = self.hass.async_create_task(_release())
 
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
+        self._cancel_session_display_face_read()
         self._direct_available = False
         self.data["live"] = False
         self._client = None
@@ -1582,6 +1754,7 @@ class OralBLiveCoordinator:
             self.hass.loop.call_soon_threadsafe(self._schedule_connect)
 
     async def _async_disconnect(self) -> None:
+        self._cancel_session_display_face_read()
         client, self._client = self._client, None
         self._direct_available = False
         self.data["live"] = False

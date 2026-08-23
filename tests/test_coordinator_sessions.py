@@ -101,6 +101,24 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertEqual(c.data["smiley"], "special_5")
         self.assertEqual(c.data["last_session_display_face"], "special_5")
 
+    def test_ending_advertisement_without_result_keeps_face_unknown(self) -> None:
+        """Display-off is not a substitute for a missing session verdict."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 60)))
+        c._parse_advertisement(_advertisement(_payload(2, 69, face=0)))
+
+        self.assertEqual(c.data["smiley"], "off")
+        self.assertIsNone(c.data["last_session_display_face"])
+
+    def test_result_on_next_quiet_advertisement_is_still_captured(self) -> None:
+        """The result may appear one packet after the state-ending packet."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 60)))
+        c._parse_advertisement(_advertisement(_payload(2, 69, face=0)))
+        c._parse_advertisement(_advertisement(_payload(2, 69, face=5)))
+
+        self.assertEqual(c.data["last_session_display_face"], "special_5")
+
     def test_later_live_face_does_not_overwrite_session_result(self) -> None:
         """Waking the selection menu changes Smiley, not Last session."""
         c = self._coordinator()
@@ -133,6 +151,16 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c._parse_advertisement(_advertisement(_payload(2, 45, face=7)))
 
         self.assertEqual(c.data["last_session_display_face"], "special_7")
+
+    def test_back_to_back_session_without_result_does_not_inherit_face(self) -> None:
+        """The next passive session stays unknown when it has no verdict."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 30)))
+        c._parse_advertisement(_advertisement(_payload(2, 30, face=4)))
+        c._parse_advertisement(_advertisement(_payload(3, 45)))
+        c._parse_advertisement(_advertisement(_payload(2, 45, face=0)))
+
+        self.assertIsNone(c.data["last_session_display_face"])
 
     def test_new_session_without_correlated_face_clears_previous_result(self) -> None:
         """A direct session must not inherit an older advertisement result."""
@@ -215,6 +243,28 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertEqual(c.data["last_session_source"], const.DATA_SOURCE_SESSION)
         self.assertEqual(c.data["last_session_display_face"], "special_6")
 
+    def test_reconciled_record_keeps_window_open_for_late_face(self) -> None:
+        """FF29 may arrive before FF0A without losing same-session association."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 110)))
+        c._parse_advertisement(_advertisement(_payload(2, 120, face=0)))
+        passive_start = c.data["last_session_start"]
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+        c._last_synced_session_ts = 0
+        c._store.async_save = AsyncMock()
+
+        result = asyncio.run(
+            c._async_apply_session_record(
+                record,
+                record[:4],
+                rtc_sampled_at=passive_start,
+            )
+        )
+        c._apply_smiley(b"\x06", source=const.DATA_SOURCE_CHARGER)
+
+        self.assertEqual(result, "new")
+        self.assertEqual(c.data["last_session_display_face"], "special_6")
+
     def test_new_retained_record_does_not_inherit_previous_face(self) -> None:
         """A newer FF29-only session has an unknown face, not a stale one."""
         c = self._coordinator()
@@ -235,6 +285,299 @@ class PassiveSessionDurationTests(unittest.TestCase):
 
         self.assertEqual(result, "new")
         self.assertIsNone(c.data["last_session_display_face"])
+
+    def test_new_retained_record_closes_old_face_capture_window(self) -> None:
+        """Delayed FF0A for a predecessor cannot modify a newer FF29 record."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 60)))
+        c._parse_advertisement(_advertisement(_payload(2, 60, face=0)))
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+        c._last_synced_session_ts = 0
+        c._store.async_save = AsyncMock()
+        newer_wall_time = c.data["last_session_start"] + timedelta(minutes=10)
+
+        result = asyncio.run(
+            c._async_apply_session_record(
+                record,
+                record[:4],
+                rtc_sampled_at=newer_wall_time,
+            )
+        )
+        c._apply_smiley(b"\x06", source=const.DATA_SOURCE_DIRECT)
+
+        self.assertEqual(result, "new")
+        self.assertIsNone(c.data["last_session_display_face"])
+
+
+class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
+    """Reproduce display-face loss on connected delivery paths from issue 18."""
+
+    def _coordinator(self, mode: str):
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        c = coordinator.OralBLiveCoordinator(
+            MagicMock(), "AA:BB:CC:DD:EE:FF", "test", mode
+        )
+        c._maybe_schedule_sync = lambda *args, **kwargs: None
+        c._schedule_connect = lambda *args, **kwargs: None
+        c.data["data_source"] = (
+            const.DATA_SOURCE_DIRECT
+            if mode == const.CONNECTION_MODE_LIVE
+            else const.DATA_SOURCE_CHARGER
+        )
+        return c
+
+    @staticmethod
+    def _notify(c, uuid: str, payload: bytes) -> None:
+        char = types.SimpleNamespace(uuid=uuid)
+        c._on_notify(char, bytearray(payload))
+
+    def _complete_session(self, c) -> None:
+        self._notify(c, const.CHAR_STATE, bytes((const.RUNNING_STATE,)))
+        self._notify(c, const.CHAR_BRUSH_TIME, b"\x00\x3e")
+        self._notify(c, const.CHAR_STATE, b"\x02")
+
+    def test_direct_ff0a_notification_is_attached_to_completed_session(self) -> None:
+        """Match the reported special_3 notification at the direct idle edge."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        self._complete_session(c)
+        self._notify(c, const.CHAR_SMILEY, b"\x03")
+
+        self.assertEqual(c.data["smiley"], "special_3")
+        self.assertEqual(c.data["last_session_display_face"], "special_3")
+
+    def test_direct_session_without_ff0a_remains_unknown(self) -> None:
+        """No notification is a normal unavailable result, not a placeholder."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+        c._apply_smiley(b"\x00")
+
+        self._complete_session(c)
+
+        self.assertEqual(c.data["smiley"], "off")
+        self.assertIsNone(c.data["last_session_display_face"])
+
+    def test_standard_face_is_not_used_as_a_session_placeholder(self) -> None:
+        """The everyday face means no verdict was captured for the recap."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        self._complete_session(c)
+        self._notify(c, const.CHAR_SMILEY, b"\x01")
+
+        self.assertEqual(c.data["smiley"], "standard")
+        self.assertIsNone(c.data["last_session_display_face"])
+
+    def test_result_notification_just_before_idle_is_still_correlated(self) -> None:
+        """FF0A and FF04 ordering cannot decide whether the result is kept."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        with patch.object(coordinator.time, "monotonic", return_value=100.0):
+            self._notify(c, const.CHAR_STATE, bytes((const.RUNNING_STATE,)))
+            self._notify(c, const.CHAR_BRUSH_TIME, b"\x00\x3e")
+            self._notify(c, const.CHAR_SMILEY, b"\x06")
+        with patch.object(coordinator.time, "monotonic", return_value=101.0):
+            self._notify(c, const.CHAR_STATE, b"\x02")
+
+        self.assertEqual(c.data["last_session_display_face"], "special_6")
+
+    def test_old_in_session_face_is_not_mistaken_for_the_result(self) -> None:
+        """Only a sample close to the state edge may cross notification order."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        with patch.object(coordinator.time, "monotonic", return_value=100.0):
+            self._notify(c, const.CHAR_STATE, bytes((const.RUNNING_STATE,)))
+            self._notify(c, const.CHAR_BRUSH_TIME, b"\x00\x3e")
+            self._notify(c, const.CHAR_SMILEY, b"\x06")
+        with patch.object(coordinator.time, "monotonic", return_value=103.0):
+            self._notify(c, const.CHAR_STATE, b"\x02")
+
+        self.assertIsNone(c.data["last_session_display_face"])
+
+    def test_first_result_is_frozen_against_later_display_changes(self) -> None:
+        """A captured verdict cannot become another face or display-off."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        self._complete_session(c)
+        self._notify(c, const.CHAR_SMILEY, b"\x03")
+        self._notify(c, const.CHAR_SMILEY, b"\x04")
+        self._notify(c, const.CHAR_SMILEY, b"\x00")
+
+        self.assertEqual(c.data["smiley"], "off")
+        self.assertEqual(c.data["last_session_display_face"], "special_3")
+
+    def test_result_after_capture_window_is_not_attached(self) -> None:
+        """A later menu face must not leak into the completed session."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        with patch.object(coordinator.time, "monotonic", return_value=100.0):
+            self._complete_session(c)
+        with patch.object(
+            coordinator.time,
+            "monotonic",
+            return_value=(
+                100.0 + const.SESSION_DISPLAY_FACE_CAPTURE_WINDOW_SECONDS + 0.1
+            ),
+        ):
+            self._notify(c, const.CHAR_SMILEY, b"\x05")
+
+        self.assertEqual(c.data["smiley"], "special_5")
+        self.assertIsNone(c.data["last_session_display_face"])
+
+    def test_new_session_invalidates_previous_capture_window(self) -> None:
+        """A delayed result from a predecessor cannot attach after a new start."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        self._complete_session(c)
+        self._notify(c, const.CHAR_STATE, bytes((const.RUNNING_STATE,)))
+        self._notify(c, const.CHAR_SMILEY, b"\x05")
+
+        self.assertIsNone(c.data["last_session_display_face"])
+
+    def test_charger_forwarded_ff0a_is_attached_to_completed_session(self) -> None:
+        """The iO Sense FF0A path must associate the same way as direct GATT."""
+        c = self._coordinator(const.CONNECTION_MODE_CHARGER)
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(62, confirm_session=True)
+        c._apply_state(2)
+
+        asyncio.run(c._async_apply_charger_passthrough("FF0A", b"\x04"))
+
+        self.assertEqual(c.data["smiley"], "special_4")
+        self.assertEqual(c.data["last_session_display_face"], "special_4")
+
+
+class ConnectedSessionDisplayFaceReadTests(unittest.IsolatedAsyncioTestCase):
+    """Verify the best-effort direct read fallback and its safety bounds."""
+
+    def _coordinator(self):
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        tasks: list[asyncio.Task] = []
+        hass = MagicMock()
+
+        def _create_background_task(coro, name):
+            task = asyncio.create_task(coro, name=name)
+            tasks.append(task)
+            return task
+
+        hass.async_create_background_task.side_effect = _create_background_task
+        c = coordinator.OralBLiveCoordinator(
+            hass,
+            "AA:BB:CC:DD:EE:FF",
+            "test",
+            const.CONNECTION_MODE_LIVE,
+        )
+        c.data["data_source"] = const.DATA_SOURCE_DIRECT
+        return c, tasks
+
+    @staticmethod
+    def _notify(c, uuid: str, payload: bytes) -> None:
+        char = types.SimpleNamespace(uuid=uuid)
+        c._on_notify(char, bytearray(payload))
+
+    def _complete_session(self, c) -> None:
+        self._notify(c, const.CHAR_STATE, bytes((const.RUNNING_STATE,)))
+        self._notify(c, const.CHAR_BRUSH_TIME, b"\x00\x3e")
+        self._notify(c, const.CHAR_STATE, b"\x02")
+
+    async def test_reads_retry_from_off_to_result_without_disconnect(self) -> None:
+        """Reproduce missing notifications and recover the transient by FF0A read."""
+        c, tasks = self._coordinator()
+        client = MagicMock()
+        client.is_connected = True
+        client.read_gatt_char = AsyncMock(side_effect=(b"\x00", b"\x03"))
+        client.disconnect = AsyncMock()
+        c._client = client
+
+        with patch.object(
+            coordinator, "SESSION_DISPLAY_FACE_READ_RETRY_DELAYS", (0.0, 0.0, 0.0)
+        ):
+            self._complete_session(c)
+            await tasks[-1]
+
+        self.assertEqual(client.read_gatt_char.await_count, 2)
+        self.assertEqual(c.data["smiley"], "special_3")
+        self.assertEqual(c.data["last_session_display_face"], "special_3")
+        client.disconnect.assert_not_awaited()
+
+    async def test_failed_and_non_result_reads_leave_literal_null(self) -> None:
+        """Retry exhaustion is expected unavailability, not a fabricated face."""
+        c, tasks = self._coordinator()
+        client = MagicMock()
+        client.is_connected = True
+        client.read_gatt_char = AsyncMock(
+            side_effect=(coordinator.BleakError("missed"), b"\x00", b"\x01")
+        )
+        client.disconnect = AsyncMock()
+        c._client = client
+
+        with patch.object(
+            coordinator, "SESSION_DISPLAY_FACE_READ_RETRY_DELAYS", (0.0, 0.0, 0.0)
+        ):
+            self._complete_session(c)
+            await tasks[-1]
+
+        self.assertEqual(client.read_gatt_char.await_count, 3)
+        self.assertEqual(c.data["smiley"], "standard")
+        self.assertIsNone(c.data["last_session_display_face"])
+        client.disconnect.assert_not_awaited()
+
+    async def test_notification_closes_capture_before_fallback_reads(self) -> None:
+        """A delivered FF0A notification makes active reads unnecessary."""
+        c, tasks = self._coordinator()
+        client = MagicMock()
+        client.is_connected = True
+        client.read_gatt_char = AsyncMock(return_value=b"\x07")
+        c._client = client
+
+        with patch.object(
+            coordinator, "SESSION_DISPLAY_FACE_READ_RETRY_DELAYS", (0.0,)
+        ):
+            self._complete_session(c)
+            self._notify(c, const.CHAR_SMILEY, b"\x03")
+            await tasks[-1]
+
+        client.read_gatt_char.assert_not_awaited()
+        self.assertEqual(c.data["last_session_display_face"], "special_3")
+
+    async def test_new_session_cancels_predecessor_read_sequence(self) -> None:
+        """Back-to-back sessions cannot leave an old retry task running."""
+        c, tasks = self._coordinator()
+        client = MagicMock()
+        client.is_connected = True
+        client.read_gatt_char = AsyncMock(return_value=b"\x07")
+        c._client = client
+
+        with patch.object(
+            coordinator, "SESSION_DISPLAY_FACE_READ_RETRY_DELAYS", (60.0,)
+        ):
+            self._complete_session(c)
+            old_task = tasks[-1]
+            self._notify(c, const.CHAR_STATE, bytes((const.RUNNING_STATE,)))
+            with self.assertRaises(asyncio.CancelledError):
+                await old_task
+
+        client.read_gatt_char.assert_not_awaited()
+        self.assertIsNone(c.data["last_session_display_face"])
+
+    async def test_stop_cancels_pending_read_sequence(self) -> None:
+        """Integration shutdown leaves no FF0A background task behind."""
+        c, tasks = self._coordinator()
+        client = MagicMock()
+        client.is_connected = True
+        client.read_gatt_char = AsyncMock(return_value=b"\x07")
+        client.disconnect = AsyncMock()
+        c._client = client
+
+        with patch.object(
+            coordinator, "SESSION_DISPLAY_FACE_READ_RETRY_DELAYS", (60.0,)
+        ):
+            self._complete_session(c)
+            read_task = tasks[-1]
+            await c.async_stop()
+            with self.assertRaises(asyncio.CancelledError):
+                await read_task
+
+        self.assertTrue(read_task.done())
+        client.read_gatt_char.assert_not_awaited()
 
 
 class SessionSyncRetryTests(unittest.TestCase):
@@ -508,6 +851,30 @@ class LastSessionDisplayFaceSensorTests(unittest.IsolatedAsyncioTestCase):
             coordinator_instance.data["last_session_display_face"], "special_6"
         )
         self.assertEqual(entity.extra_state_attributes["display_face"], "special_6")
+
+    async def test_older_restored_face_cannot_fill_newer_session_null(self) -> None:
+        """Restore attributes only when their session timestamp also matches."""
+        coordinator_instance, entity = self._entity()
+        current_start = coordinator_instance.data["last_session_start"]
+        coordinator_instance.data["last_session_display_face"] = None
+        restored = types.SimpleNamespace(
+            state=(current_start - timedelta(hours=1)).isoformat(),
+            attributes={"display_face": "special_6"},
+        )
+        entity.hass = MagicMock()
+        entity.async_get_last_state = AsyncMock(return_value=restored)
+
+        with (
+            patch.object(sensor, "async_dispatcher_connect", return_value=lambda: None),
+            patch.object(entity, "async_write_ha_state"),
+        ):
+            await entity.async_added_to_hass()
+
+        self.assertEqual(
+            coordinator_instance.data["last_session_start"], current_start
+        )
+        self.assertIsNone(coordinator_instance.data["last_session_display_face"])
+        self.assertIsNone(entity.extra_state_attributes["display_face"])
 
 
 if __name__ == "__main__":

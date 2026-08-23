@@ -129,6 +129,12 @@ diagnostics, current timer and pressure, display face, mode availability,
 target/pacer configuration, SmartRing LED drive levels and brush-head remainder
 without waiting for each value to change.
 
+When a directly connected session ends, Oral-B Live also reads `FF0A`
+immediately with a few short retries. The optional notification is not reliable
+on every observed session. These reads retain the existing brush connection;
+the integration does not disconnect to force an advertisement and risk losing
+the brush's single connection slot.
+
 `FF02` and the corresponding advertisement bytes identify the protocol model,
 not necessarily the marketing model printed on the brush. In the reconstructed
 model map, `0x34` and `0x35` identify iO Series 4 and 5 respectively, while
@@ -631,8 +637,11 @@ twice.
 `FF29` belongs to the brush and retains its latest summary. It is not a dump
 of a charger queue and does not contain per-second pressure distribution or
 per-zone pressure time. It also has no display-face field, so Oral-B Live keeps
-the face decoded from the session-ending advertisement with the matching Home
-Assistant session record.
+a transient result delivered by the ending advertisement, direct `FF0A`
+notification/read or charger-forwarded `FF0A` with the matching Home Assistant
+session record. Association is bounded to the completed session: `off` and
+`standard` are not verdicts, a later display change cannot overwrite a captured
+result, and an unavailable result remains `null`.
 
 ### Availability after a session
 

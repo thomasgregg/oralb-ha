@@ -501,7 +501,11 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 self.coordinator.data["battery_source"] = (
                     last.attributes.get("source") or "restored"
                 )
-            elif self.entity_description.key == "last_session":
+            elif (
+                self.entity_description.key == "last_session"
+                and self.coordinator.data.get(self.entity_description.data_key)
+                == self._attr_native_value
+            ):
                 self._attr_extra_state_attributes = dict(last.attributes or {})
                 restored_attributes = {
                     "last_session_duration": last.attributes.get("duration_seconds"),
