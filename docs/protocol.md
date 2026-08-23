@@ -487,12 +487,14 @@ firmware stops forwarding brush reads shortly after it releases the private
 brush connection. Home Assistant retains the last valid percentage across
 restarts because a quiet, disconnected brush cannot provide a fresh `FF05`.
 
-The production post-session sequence attempts `FF2B` immediately after the
-first `FF05` battery read. Hardware testing confirmed that the iO Sense can
-forward the handle SmartRing LED drive levels, but also showed that the request
-can miss the charger's short forwarding window when left behind the slower
-session and diagnostic reads or when the handle is docked. Giving `FF2B` second
-priority preserves the toothbrush entity's raw value without adding another
+The production post-session sequence reads the transient `FF0A` result
+immediately after the first `FF05` battery read, then attempts `FF2B` third.
+Giving `FF0A` second priority improves result-face capture before the handle
+display changes. Hardware testing confirmed that the iO Sense can forward the
+handle SmartRing LED drive levels, but also showed that the request can miss the
+charger's short forwarding window when left behind the slower session and
+diagnostic reads or when the handle is docked. Keeping `FF2B` immediately after
+`FF0A` preserves the toothbrush entity's raw value without adding another
 request to the timing-sensitive one-second live loop.
 
 ### SmartRing LED drive levels

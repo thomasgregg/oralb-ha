@@ -206,8 +206,9 @@ the brush's configured schedule, while regular brush reads correct them to the
 toothbrush's authoritative state.
 
 The **Smiley** entity follows the face currently shown by the brush. Passive
-advertisements carry faces `off` through `special_7`; direct and iO Sense FF0A
-reads can additionally expose newer face values supported by the firmware.
+advertisements carry faces `off` through `special_7`; direct FF0A notifications
+and reads, plus iO Sense charger-forwarded FF0A reads, can additionally expose
+newer face values supported by the firmware.
 
 The entities used by Toothbrush Card deliberately retain the same meanings as
 Home Assistant's built-in Oral-B integration. In particular, the `sector`
