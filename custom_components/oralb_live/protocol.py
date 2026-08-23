@@ -94,6 +94,31 @@ def parse_battery_status(
     return result
 
 
+def parse_pressure_sample(
+    payload: bytes | bytearray,
+) -> dict[str, int | None]:
+    """Decode the length-gated fields in an FF0B pressure/motor sample.
+
+    The motor words are intentionally kept as raw unsigned integers. Their
+    units and relationship to the brush's operating modes are not yet known.
+    """
+    if not payload:
+        return {}
+
+    return {
+        "pressure_state_raw": payload[0],
+        "pressure_force": (
+            int.from_bytes(payload[3:5], "little") if len(payload) >= 5 else None
+        ),
+        "motor_angle_raw": (
+            int.from_bytes(payload[5:7], "little") if len(payload) >= 7 else None
+        ),
+        "motor_target_raw": (
+            int.from_bytes(payload[7:9], "little") if len(payload) >= 9 else None
+        ),
+    }
+
+
 def parse_device_info(payload: bytes | bytearray) -> dict[str, int]:
     """Decode ff02, ordered as model, protocol and firmware revision."""
     if len(payload) < 3:

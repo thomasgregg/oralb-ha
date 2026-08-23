@@ -71,6 +71,30 @@ class ProtocolDecoderTests(unittest.TestCase):
             -702, protocol.parse_battery_status(payload)["battery_current"]
         )
 
+    def test_pressure_sample_protocol_8_motor_fields(self) -> None:
+        payload = bytes.fromhex("02 34 12 78 56 bc 9a f0 de aa")
+        self.assertEqual(
+            protocol.parse_pressure_sample(payload),
+            {
+                "pressure_state_raw": 2,
+                "pressure_force": 0x5678,
+                "motor_angle_raw": 0x9ABC,
+                "motor_target_raw": 0xDEF0,
+            },
+        )
+
+    def test_pressure_sample_short_payload_clears_extended_fields(self) -> None:
+        self.assertEqual(
+            protocol.parse_pressure_sample(bytes([1])),
+            {
+                "pressure_state_raw": 1,
+                "pressure_force": None,
+                "motor_angle_raw": None,
+                "motor_target_raw": None,
+            },
+        )
+        self.assertEqual(protocol.parse_pressure_sample(b""), {})
+
     def test_device_info(self) -> None:
         self.assertEqual(
             protocol.parse_device_info(bytes.fromhex("36 08 52")),

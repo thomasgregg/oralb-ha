@@ -545,9 +545,23 @@ The first `FF0B` byte is the pressure state:
 | `1` | normal |
 | `2` | high |
 
-The integration also exposes the captured force word as an attribute. Motor
-and motion fields are decoded by the research tooling but are not separate HA
-entities.
+The observed protocol-8/9 payload is length-gated and little-endian:
+
+| Offset | Field | Encoding |
+| --- | --- | --- |
+| `0` | pressure state | unsigned byte |
+| `1..2` | timestamp | unsigned 16-bit raw value |
+| `3..4` | force | unsigned 16-bit raw value |
+| `5..6` | motor angle | unsigned 16-bit raw value |
+| `7..8` | motor target | unsigned 16-bit raw value |
+| `9` | identifier | unsigned byte |
+
+The integration exposes the captured force word as a Pressure attribute. It
+also exposes the angle and target words as disabled-by-default diagnostic
+sensors named **Motor angle (raw)** and **Motor target (raw)**. Both are
+deliberately unitless: their scale and relationship to brushing modes have not
+yet been validated across models or firmware, so they are not presented as an
+intensity setting.
 
 ### Pacer numbering
 

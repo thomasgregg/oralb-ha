@@ -114,6 +114,7 @@ from .protocol import (
     parse_battery_status,
     parse_device_info,
     parse_pacer,
+    parse_pressure_sample,
     parse_refill_remainder,
     parse_ring_color,
     parse_session_record,
@@ -181,6 +182,8 @@ class OralBLiveCoordinator:
             "charger_address": None,
             "charger_bridge_latency_ms": None,
             "pressure_force": None,
+            "motor_angle_raw": None,
+            "motor_target_raw": None,
             "last_session_start": None,
             "last_session_duration": None,
             "last_session_mode": None,
@@ -1683,11 +1686,15 @@ class OralBLiveCoordinator:
         if not payload:
             return
         raw = bytes(payload)
+        parsed = parse_pressure_sample(raw)
         self.data["pressure_raw"] = raw.hex()
-        self.data["pressure"] = PRESSURE_STATES.get(raw[0], f"pressure_{raw[0]}")
-        self.data["pressure_force"] = (
-            int.from_bytes(raw[3:5], "little") if len(raw) >= 5 else None
+        pressure_state_raw = int(parsed["pressure_state_raw"])
+        self.data["pressure"] = PRESSURE_STATES.get(
+            pressure_state_raw, f"pressure_{pressure_state_raw}"
         )
+        self.data["pressure_force"] = parsed["pressure_force"]
+        self.data["motor_angle_raw"] = parsed["motor_angle_raw"]
+        self.data["motor_target_raw"] = parsed["motor_target_raw"]
         if source:
             self.data["data_source"] = source
         self._track_session_pressure(self.data["pressure"], self.data["pressure_force"])

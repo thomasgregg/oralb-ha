@@ -92,6 +92,25 @@ class PassiveSessionDurationTests(unittest.TestCase):
 
         self.assertEqual(c.data["last_session_duration"], 42)
 
+    def test_pressure_sample_exposes_raw_motor_diagnostics(self) -> None:
+        c = self._coordinator()
+        c._apply_pressure(
+            bytes.fromhex("01 34 12 78 56 bc 9a f0 de aa"),
+            const.DATA_SOURCE_CHARGER,
+        )
+
+        self.assertEqual(c.data["pressure"], "normal")
+        self.assertEqual(c.data["pressure_force"], 0x5678)
+        self.assertEqual(c.data["motor_angle_raw"], 0x9ABC)
+        self.assertEqual(c.data["motor_target_raw"], 0xDEF0)
+
+        c._apply_pressure(bytes([0]), const.DATA_SOURCE_DIRECT)
+
+        self.assertEqual(c.data["pressure"], "low")
+        self.assertIsNone(c.data["pressure_force"])
+        self.assertIsNone(c.data["motor_angle_raw"])
+        self.assertIsNone(c.data["motor_target_raw"])
+
     def test_ending_advertisement_keeps_face_with_session(self) -> None:
         """The result face belongs to the session that just ended."""
         c = self._coordinator()

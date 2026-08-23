@@ -182,6 +182,7 @@ reconciliation.
 | Toothbrush state | `idle`, `running`, `charging`, `selection_menu`, summaries and diagnostic states |
 | Time | Current brushing duration; locally advanced between charger timer anchors |
 | Pressure | `low`, `normal` or `high`; direct and charger-forwarded reads also expose raw force as an attribute when available |
+| Motor diagnostics | Raw motor angle and target words from direct or charger-forwarded pressure samples; disabled by default and intentionally unitless |
 | Mode | Daily clean, sensitive, gum care, whiten, intense, super sensitive, tongue clean, Smart Adapt, gentle white and supported unknown values |
 | Pacer sector | Current sequential pacer interval (`sector_1` … `sector_8`), advanced locally from the configured schedule and corrected by the brush |
 | Pacer sector timer | Elapsed seconds in the current pacer interval while brushing; `unknown` outside an active session |
@@ -223,9 +224,9 @@ successful brush read. They remain `unknown` until the charger or direct brush
 connection has returned the corresponding characteristic; Oral-B Live does not
 invent placeholder values for unsupported or not-yet-read fields.
 
-Battery voltage, current and temperature, plus both brush-head remainder
-entities, are disabled by default. Enable them from the toothbrush device's
-entity list if those diagnostics are needed.
+Battery voltage, current and temperature, raw motor angle and target, plus both
+brush-head remainder entities, are disabled by default. Enable them from the
+toothbrush device's entity list if those diagnostics are needed.
 
 The **SmartRing color** entity belongs to the toothbrush and is distinct from
 the iO Sense charger's own Ring color entity. Oral-B Live reads the handle's
