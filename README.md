@@ -495,11 +495,16 @@ discovery reports, including possible newer charger hardware revisions.
 The tool runs independently of Home Assistant and does not use ESPHome or
 Shelly Bluetooth proxies. It never sends POST/SET commands. A scan-only mode is
 available when no connection or GATT write should occur. The standalone script
-is attached to each GitHub release as `iosense_probe.py`.
+is attached to each GitHub release as `iosense_probe.py`. Its separate
+`--brush-pacer` mode captures raw FF02 plus initial/final FF25/FF26/FF09 reads,
+and one complete stream of FF04/FF07/FF08/FF09 toothbrush notifications for
+sector-count diagnostics.
 
 See the [complete diagnostic-probe guide](tools/README.md#io-sense-diagnostic-probe)
 for prerequisites, virtual-environment setup, safety details, commands, report
-contents, troubleshooting and how to attach a capture to an issue.
+contents, troubleshooting and how to attach a capture to an issue. For a
+sector-count investigation, follow the dedicated
+[toothbrush pacer capture instructions](tools/README.md#toothbrush-pacer-capture).
 
 ### Live values use advertisements
 

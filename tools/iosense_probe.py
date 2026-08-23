@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Discover an iO Sense, capture its advertisement, and probe it read-only.
+"""Capture read-only diagnostics from an Oral-B iO Sense or toothbrush.
 
 The default command connects to the selected charger, enumerates GATT, reads
 characteristics marked readable, attempts read-only descriptor reads, and—if
 the known iO Sense command transport exists—sends a small set of GET requests.
 It never sends POST/SET commands or writes a command payload.
+
+With ``--brush-pacer``, it instead reads the toothbrush's relevant
+characteristics and records raw brush-state, mode, timer, and sector
+notifications for one brushing session. It does not write characteristic
+values or change persistent toothbrush settings. Enabling notifications may
+cause the Bluetooth stack to write temporary Client Characteristic
+Configuration descriptors; those subscriptions are removed before exit.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import sys
 from typing import Any, Iterable
 
 
-TOOL_VERSION = "1"
+TOOL_VERSION = "2"
 ORALB_MANUFACTURER_ID = 220
 IOSENSE_SERVICE_UUID = "a0f03e00-5047-4d53-8208-4f72616c2d42"
 IOSENSE_COMMAND_UUID = "a0f03c00-5047-4d53-8208-4f72616c2d42"
@@ -30,6 +37,32 @@ IOSENSE_WRITE_UUID = "a0f03c02-5047-4d53-8208-4f72616c2d42"
 IOSENSE_STATUS_UUID = "a0f03c03-5047-4d53-8208-4f72616c2d42"
 IOSENSE_PROTOCOL_END = b"\xe0"
 GET_OPERATION = 0xC0
+
+BRUSH_DEVICE_INFO_UUID = "a0f0ff02-5047-4d53-8208-4f72616c2d42"
+BRUSH_STATE_UUID = "a0f0ff04-5047-4d53-8208-4f72616c2d42"
+BRUSH_MODE_UUID = "a0f0ff07-5047-4d53-8208-4f72616c2d42"
+BRUSH_TIME_UUID = "a0f0ff08-5047-4d53-8208-4f72616c2d42"
+BRUSH_SECTOR_UUID = "a0f0ff09-5047-4d53-8208-4f72616c2d42"
+BRUSH_AVAILABLE_MODES_UUID = "a0f0ff25-5047-4d53-8208-4f72616c2d42"
+BRUSH_PACER_UUID = "a0f0ff26-5047-4d53-8208-4f72616c2d42"
+BRUSH_RUNNING_STATE = 3
+BRUSH_NOTIFY_CHARACTERISTICS: tuple[tuple[str, str], ...] = (
+    ("state", BRUSH_STATE_UUID),
+    ("mode", BRUSH_MODE_UUID),
+    ("timer", BRUSH_TIME_UUID),
+    ("sector", BRUSH_SECTOR_UUID),
+)
+BRUSH_INITIAL_READS: tuple[tuple[str, str], ...] = (
+    ("device_info_ff02", BRUSH_DEVICE_INFO_UUID),
+    ("available_modes_ff25", BRUSH_AVAILABLE_MODES_UUID),
+    ("pacer_configuration_ff26", BRUSH_PACER_UUID),
+    ("sector_ff09", BRUSH_SECTOR_UUID),
+)
+BRUSH_FINAL_READS: tuple[tuple[str, str], ...] = (
+    ("available_modes_ff25", BRUSH_AVAILABLE_MODES_UUID),
+    ("pacer_configuration_ff26", BRUSH_PACER_UUID),
+    ("sector_ff09", BRUSH_SECTOR_UUID),
+)
 
 SERVER_MODES = {0: "full", 1: "limited", 2: "wifi_only", 3: "aws_only"}
 
@@ -187,6 +220,19 @@ def build_candidates(discovered: dict[str, tuple[Any, Any]]) -> list[Candidate]:
     return sorted(candidates, key=lambda item: (item.score, item.rssi), reverse=True)
 
 
+def is_toothbrush_candidate(candidate: Candidate) -> bool:
+    """Recognize the normal Oral-B toothbrush advertisement conservatively."""
+    manufacturer_data = dict(
+        getattr(candidate.advertisement, "manufacturer_data", {}) or {}
+    )
+    payload = manufacturer_data.get(ORALB_MANUFACTURER_ID)
+    name = candidate.name.casefold()
+    name_is_brush = "oral-b" in name and (
+        "toothbrush" in name or ("io" in name and "sense" not in name)
+    )
+    return (payload is not None and len(bytes(payload)) == 11) or name_is_brush
+
+
 def advertisement_report(candidate: Candidate) -> dict[str, Any]:
     """Serialize the portable advertisement fields Bleak exposes."""
     advertisement = candidate.advertisement
@@ -339,6 +385,176 @@ class ReadOnlyProtocolProbe:
                 future.cancel()
 
 
+async def read_characteristic(
+    client: Any, uuid: str, *, read_timeout: float
+) -> dict[str, Any]:
+    """Read one characteristic while preserving the exact returned bytes."""
+    try:
+        value = bytes(
+            await asyncio.wait_for(
+                client.read_gatt_char(uuid), timeout=read_timeout
+            )
+        )
+        return {"success": True, "length": len(value), "hex": value.hex()}
+    except Exception as error:
+        return {"success": False, "error": error_text(error)}
+
+
+def annotate_brush_read(name: str, result: dict[str, Any]) -> None:
+    """Add non-authoritative positional hints without replacing raw evidence."""
+    if not result.get("success"):
+        return
+    raw = bytes.fromhex(result["hex"])
+    if name == "device_info_ff02" and len(raw) >= 3:
+        result["positional_hints"] = {
+            "model_id_raw": raw[0],
+            "protocol_version_raw": raw[1],
+            "firmware_revision_raw": raw[2],
+        }
+    elif name == "available_modes_ff25":
+        result["positional_hints"] = {
+            "mode_values_raw": list(raw),
+            "mode_value_count": len(raw),
+        }
+    elif name == "pacer_configuration_ff26":
+        usable = [value for value in raw if 0 < value < 0xFF]
+        result["positional_hints"] = {
+            "byte_values": list(raw),
+            "usable_sector_seconds": usable,
+            "usable_sector_count": len(usable),
+            "target_duration_seconds": sum(usable),
+        }
+    elif name == "sector_ff09" and raw:
+        hints: dict[str, int] = {"sector_raw": raw[0]}
+        if len(raw) >= 2:
+            hints["sector_timer_raw"] = raw[1]
+        if len(raw) >= 3:
+            hints["total_hint_raw"] = raw[2]
+        result["positional_hints"] = hints
+
+
+async def read_brush_snapshot(
+    client: Any,
+    characteristics: tuple[tuple[str, str], ...],
+    *,
+    read_timeout: float,
+) -> dict[str, dict[str, Any]]:
+    """Read and annotate one exact brush configuration snapshot."""
+    snapshot: dict[str, dict[str, Any]] = {}
+    for name, uuid in characteristics:
+        result = await read_characteristic(client, uuid, read_timeout=read_timeout)
+        annotate_brush_read(name, result)
+        snapshot[name] = result
+    return snapshot
+
+
+class BrushPacerCapture:
+    """Record one toothbrush session without writing characteristic values."""
+
+    def __init__(self, client: Any) -> None:
+        self.client = client
+        self.loop = asyncio.get_running_loop()
+        self.started_at = self.loop.time()
+        self.subscribed: list[str] = []
+        self.subscription_errors: dict[str, str] = {}
+        self.unsubscribe_errors: dict[str, str] = {}
+        self.notifications: list[dict[str, Any]] = []
+        self.running_seen = False
+        self.end_state_raw: int | None = None
+        self.finished = asyncio.Event()
+
+    async def start(self) -> None:
+        """Subscribe to all useful session characteristics, including FF09."""
+        for name, uuid in BRUSH_NOTIFY_CHARACTERISTICS:
+            try:
+                await self.client.start_notify(uuid, self._callback(name, uuid))
+                self.subscribed.append(uuid)
+            except Exception as error:
+                self.subscription_errors[name] = error_text(error)
+        required = (
+            ("FF04 state", "state", BRUSH_STATE_UUID),
+            ("FF09 sector", "sector", BRUSH_SECTOR_UUID),
+        )
+        missing = [
+            f"{label}: {self.subscription_errors.get(name, 'unknown error')}"
+            for label, name, uuid in required
+            if uuid not in self.subscribed
+        ]
+        if missing:
+            raise RuntimeError(
+                "required notification subscription(s) failed: " + "; ".join(missing)
+            )
+
+    async def stop(self) -> None:
+        """Remove every notification subscription that was successfully added."""
+        names = {uuid: name for name, uuid in BRUSH_NOTIFY_CHARACTERISTICS}
+        for uuid in reversed(self.subscribed):
+            try:
+                await self.client.stop_notify(uuid)
+            except Exception as error:
+                self.unsubscribe_errors[names[uuid]] = error_text(error)
+
+    def _callback(self, name: str, uuid: str) -> Any:
+        def record(_characteristic: Any, value: bytearray) -> None:
+            raw = bytes(value)
+            item: dict[str, Any] = {
+                "captured_at": utc_now(),
+                "elapsed_seconds": round(self.loop.time() - self.started_at, 3),
+                "characteristic": name,
+                "uuid": uuid,
+                "length": len(raw),
+                "hex": raw.hex(),
+            }
+            # These fields are positional annotations only. The raw value above
+            # remains the evidence and does not depend on integration decoders.
+            if name == "state" and raw:
+                item["state_raw"] = raw[0]
+                if raw[0] == BRUSH_RUNNING_STATE:
+                    self.running_seen = True
+                elif self.running_seen and not self.finished.is_set():
+                    self.end_state_raw = raw[0]
+                    self.finished.set()
+            elif name == "mode" and raw:
+                item["mode_raw"] = raw[0]
+            elif name == "timer" and len(raw) >= 2:
+                item["minutes_raw"] = raw[0]
+                item["seconds_raw"] = raw[1]
+                item["brushing_time_seconds_hint"] = raw[0] * 60 + raw[1]
+            elif name == "sector":
+                if len(raw) >= 1:
+                    item["sector_raw"] = raw[0]
+                if len(raw) >= 2:
+                    item["sector_timer_raw"] = raw[1]
+                if len(raw) >= 3:
+                    item["total_hint_raw"] = raw[2]
+            self.notifications.append(item)
+
+        return record
+
+    async def wait(self, *, session_timeout: float, end_grace: float = 2.0) -> str:
+        """Wait for running-to-not-running, retaining a short notification tail."""
+        try:
+            await asyncio.wait_for(self.finished.wait(), timeout=session_timeout)
+        except asyncio.TimeoutError:
+            return "timeout"
+        if end_grace:
+            await asyncio.sleep(end_grace)
+        return "state_after_running"
+
+    def report(self, ended_reason: str) -> dict[str, Any]:
+        """Return the complete raw capture and minimal session metadata."""
+        return {
+            "running_state_raw": BRUSH_RUNNING_STATE,
+            "running_seen": self.running_seen,
+            "ended_reason": ended_reason,
+            "end_state_raw": self.end_state_raw,
+            "subscribed_characteristics": list(self.subscribed),
+            "subscription_errors": dict(self.subscription_errors),
+            "unsubscribe_errors": dict(self.unsubscribe_errors),
+            "notifications": list(self.notifications),
+        }
+
+
 def characteristic_report(characteristic: Any) -> dict[str, Any]:
     """Return static GATT characteristic metadata."""
     return {
@@ -454,14 +670,114 @@ def choose_candidate(
             print(f"Enter a number from 1 to {len(choices)}.")
 
 
-def default_output_path() -> Path:
+def choose_toothbrush_candidate(
+    candidates: list[Candidate], address: str | None, *, interactive: bool
+) -> Candidate:
+    """Choose only devices that look like toothbrushes unless addressed exactly."""
+    if address:
+        return choose_candidate(candidates, address, interactive=interactive)
+
+    recognized = [
+        candidate for candidate in candidates if is_toothbrush_candidate(candidate)
+    ]
+    if len(recognized) == 1:
+        return recognized[0]
+    if not candidates:
+        raise RuntimeError("no Bluetooth Low Energy devices were found")
+    if not recognized and not interactive:
+        raise RuntimeError(
+            "no Oral-B toothbrush advertisement was found; wake the brush, "
+            "move it nearby, and retry or pass --address"
+        )
+    if recognized and not interactive:
+        raise RuntimeError(
+            "multiple toothbrushes were found; run interactively or pass --address"
+        )
+
+    choices = recognized or candidates[:10]
+    if recognized:
+        print("Multiple possible Oral-B toothbrushes were found:")
+    else:
+        print(
+            "No known toothbrush signature was found. Wake the brush, then select "
+            "the likely nearby device:"
+        )
+    for index, candidate in enumerate(choices, start=1):
+        print(
+            f"  [{index}] {candidate.name}  {candidate.address}  "
+            f"RSSI {candidate.rssi}"
+        )
+    while True:
+        answer = input("Select toothbrush [1]: ").strip() or "1"
+        try:
+            return choices[int(answer) - 1]
+        except (ValueError, IndexError):
+            print(f"Enter a number from 1 to {len(choices)}.")
+
+
+def default_output_path(*, brush_pacer: bool = False) -> Path:
     """Return a timestamped report path."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path(f"iosense-probe-{timestamp}.json")
+    prefix = "oralb-brush-pacer" if brush_pacer else "iosense-probe"
+    return Path(f"{prefix}-{timestamp}.json")
+
+
+def format_brush_read(value: dict[str, Any]) -> str:
+    """Format one exact read without confusing empty data with no capture."""
+    if not value:
+        return "not captured"
+    if not value.get("success"):
+        return f"failed ({value.get('error', 'unknown error')})"
+    return f"{value.get('length', 0)} bytes, hex={value.get('hex', '') or '<empty>'}"
+
+
+def brush_console_summary(report: dict[str, Any]) -> str:
+    """Build a compact, privacy-conscious summary for issue comments."""
+    advertisement = report["advertisement"]
+    brush = report.get("brush_pacer", {})
+    initial_reads = brush.get("initial_reads", {})
+    final_reads = brush.get("final_reads", {})
+    session = brush.get("session", {})
+    sector_changes: list[str] = []
+    for item in session.get("notifications", []):
+        if item.get("characteristic") != "sector":
+            continue
+        value = item["hex"]
+        if not sector_changes or sector_changes[-1] != value:
+            sector_changes.append(value)
+    lines = [
+        "Oral-B brush pacer capture summary",
+        f"  Tool version: {report.get('tool_version', 'unknown')}",
+        f"  Name: {advertisement['name']}",
+        f"  RSSI: {advertisement['rssi']} dBm",
+        "  FF02 initial: "
+        + format_brush_read(initial_reads.get("device_info_ff02", {})),
+        "  FF25 initial -> final: "
+        + format_brush_read(initial_reads.get("available_modes_ff25", {}))
+        + " -> "
+        + format_brush_read(final_reads.get("available_modes_ff25", {})),
+        "  FF26 initial -> final: "
+        + format_brush_read(initial_reads.get("pacer_configuration_ff26", {}))
+        + " -> "
+        + format_brush_read(final_reads.get("pacer_configuration_ff26", {})),
+        "  FF09 initial -> final: "
+        + format_brush_read(initial_reads.get("sector_ff09", {}))
+        + " -> "
+        + format_brush_read(final_reads.get("sector_ff09", {})),
+        f"  Running state observed: {session.get('running_seen', False)}",
+        f"  End reason: {session.get('ended_reason', 'not started')}",
+        f"  Notifications captured: {len(session.get('notifications', []))}",
+        "  FF09 raw changes: " + (", ".join(sector_changes) or "none"),
+    ]
+    if brush.get("error"):
+        lines.append(f"  Capture error: {brush['error']}")
+    return "\n".join(lines)
 
 
 def console_summary(report: dict[str, Any]) -> str:
     """Build a compact issue-friendly summary."""
+    if report.get("mode") == "brush_pacer":
+        return brush_console_summary(report)
     advertisement = report["advertisement"]
     oralb = advertisement.get("oralb_advertisement")
     lines = [
@@ -506,14 +822,19 @@ async def run(args: argparse.Namespace) -> int:
             "bleak is required; install it with: python -m pip install bleak"
         ) from error
 
+    if args.brush_pacer:
+        print(
+            "Disconnect Home Assistant and the Oral-B app, and unplug the iO "
+            "Sense first; the toothbrush normally accepts only one active BLE "
+            "connection."
+        )
     print(f"Scanning for Bluetooth Low Energy devices ({args.scan_timeout:g}s)...")
     discovered = await BleakScanner.discover(
         timeout=args.scan_timeout, return_adv=True
     )
     candidates = build_candidates(discovered)
-    candidate = choose_candidate(
-        candidates, args.address, interactive=sys.stdin.isatty()
-    )
+    chooser = choose_toothbrush_candidate if args.brush_pacer else choose_candidate
+    candidate = chooser(candidates, args.address, interactive=sys.stdin.isatty())
     print(
         f"Selected {candidate.name} ({candidate.address}), RSSI {candidate.rssi} dBm"
     )
@@ -526,6 +847,7 @@ async def run(args: argparse.Namespace) -> int:
         "schema_version": 1,
         "tool": "iosense_probe",
         "tool_version": TOOL_VERSION,
+        "mode": "brush_pacer" if args.brush_pacer else "iosense",
         "captured_at": utc_now(),
         "environment": {
             "platform": platform.platform(),
@@ -535,12 +857,88 @@ async def run(args: argparse.Namespace) -> int:
         "safety": {
             "scan_only": args.scan_only,
             "post_or_set_commands_sent": False,
-            "protocol_operations_allowed": ["GET"],
+            "protocol_operations_allowed": [] if args.brush_pacer else ["GET"],
         },
         "advertisement": advertisement_report(candidate),
     }
 
-    if not args.scan_only:
+    if args.brush_pacer:
+        report["safety"].update(
+            {
+                "characteristic_value_writes_sent": False,
+                "persistent_settings_changed": False,
+                "temporary_notification_descriptor_writes": True,
+            }
+        )
+        # The address is only needed for local device selection, not for an
+        # issue attachment. Preserve the session bytes but redact the address.
+        report["advertisement"]["address"] = "redacted"
+        print(
+            "Connecting read-only. Notification subscriptions may temporarily "
+            "update Bluetooth CCCD descriptors; no setting/value writes are sent."
+        )
+        brush_report: dict[str, Any] = {
+            "initial_reads": {},
+            "final_reads": {},
+            "annotation_notice": (
+                "Decoded fields are positional hints only; use length and hex as "
+                "the authoritative evidence."
+            ),
+        }
+        report["brush_pacer"] = brush_report
+        try:
+            async with BleakClient(
+                candidate.device, timeout=args.connect_timeout
+            ) as client:
+                brush_report["connected"] = bool(client.is_connected)
+                capture = BrushPacerCapture(client)
+                ended_reason = "capture_error"
+                try:
+                    start_error: BaseException | None = None
+                    try:
+                        await capture.start()
+                    except Exception as error:
+                        start_error = error
+
+                    # Read after notification setup so no early brushing event is
+                    # lost. Empty and all-zero replies remain distinguishable.
+                    brush_report["initial_reads"] = await read_brush_snapshot(
+                        client,
+                        BRUSH_INITIAL_READS,
+                        read_timeout=args.request_timeout,
+                    )
+                    brush_report["initial_reads_completed_at"] = utc_now()
+
+                    if start_error is not None:
+                        raise start_error
+                    print("Ready. Start brushing now.")
+                    print(
+                        "Capture stops after the brush leaves running state, or "
+                        f"after {args.session_timeout:g} seconds."
+                    )
+                    ended_reason = await capture.wait(
+                        session_timeout=args.session_timeout,
+                        end_grace=0,
+                    )
+                    # Re-read the configuration immediately after the terminal
+                    # state (or at timeout), while the same connection is alive.
+                    brush_report["final_reads"] = await read_brush_snapshot(
+                        client,
+                        BRUSH_FINAL_READS,
+                        read_timeout=args.request_timeout,
+                    )
+                    brush_report["final_reads_completed_at"] = utc_now()
+                    if ended_reason == "state_after_running":
+                        await asyncio.sleep(2.0)
+                except Exception as error:
+                    brush_report["error"] = error_text(error)
+                finally:
+                    await capture.stop()
+                    brush_report["session"] = capture.report(ended_reason)
+        except Exception as error:
+            brush_report["connected"] = False
+            brush_report["error"] = error_text(error)
+    elif not args.scan_only:
         print("Connecting to capture GATT and read-only values...")
         gatt: dict[str, Any] = {"connected": False, "services": []}
         report["gatt"] = gatt
@@ -587,7 +985,7 @@ async def run(args: argparse.Namespace) -> int:
         except Exception as error:
             gatt["error"] = error_text(error)
 
-    output = args.output or default_output_path()
+    output = args.output or default_output_path(brush_pacer=args.brush_pacer)
     output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print()
     print(console_summary(report))
@@ -623,6 +1021,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="delay between read-only GET frames (default: 0.35)",
     )
     parser.add_argument(
+        "--brush-pacer",
+        action="store_true",
+        help=(
+            "capture one toothbrush pacer session from FF04/FF07/FF08/FF09 "
+            "notifications plus FF02 and initial/final FF25/FF26/FF09 reads"
+        ),
+    )
+    parser.add_argument(
+        "--session-timeout",
+        type=float,
+        default=240.0,
+        help="brush-session timeout seconds (default: 240)",
+    )
+    parser.add_argument(
         "--scan-only",
         action="store_true",
         help="capture advertisements only; never connect or write GATT frames",
@@ -649,6 +1061,12 @@ def main() -> int:
             parser.error(f"--{field.replace('_', '-')} must be greater than zero")
     if args.frame_delay < 0:
         parser.error("--frame-delay cannot be negative")
+    if args.brush_pacer and args.session_timeout <= 0:
+        parser.error("--session-timeout must be greater than zero")
+    if args.brush_pacer and args.scan_only:
+        parser.error("--brush-pacer cannot be combined with --scan-only")
+    if args.brush_pacer and args.no_protocol:
+        parser.error("--brush-pacer cannot be combined with --no-protocol")
     try:
         return asyncio.run(run(args))
     except (OSError, RuntimeError, asyncio.TimeoutError) as error:

@@ -45,6 +45,14 @@ LEGACY_ADVERTISEMENT = bytes.fromhex("02a2000304015c013bdbb8a20157")
 
 
 class IOSenseProbeDiscoveryTests(unittest.TestCase):
+    def test_parser_keeps_charger_mode_as_default(self):
+        args = tool.build_parser().parse_args([])
+        self.assertFalse(args.brush_pacer)
+        self.assertFalse(args.scan_only)
+        self.assertFalse(args.no_protocol)
+        self.assertEqual(240.0, args.session_timeout)
+        self.assertTrue(str(tool.default_output_path()).startswith("iosense-probe-"))
+
     def test_legacy_advertisement_decodes(self):
         value = tool.decode_legacy_advertisement(LEGACY_ADVERTISEMENT)
         self.assertTrue(value["compatible"])
@@ -131,6 +139,50 @@ class IOSenseProbeDiscoveryTests(unittest.TestCase):
             "address-1",
             tool.choose_candidate(candidates, "ADDRESS-1", interactive=False).address,
         )
+
+    def test_toothbrush_selection_uses_11_byte_payload_not_charger_score(self):
+        charger = tool.Candidate(
+            FakeDevice("charger"),
+            FakeAdvertisement(
+                local_name="iO Sense",
+                manufacturer_data={
+                    tool.ORALB_MANUFACTURER_ID: LEGACY_ADVERTISEMENT
+                },
+            ),
+            200,
+            ("legacy_stargate_payload",),
+        )
+        brush = tool.Candidate(
+            FakeDevice("brush"),
+            FakeAdvertisement(
+                local_name="Oral-B iO",
+                manufacturer_data={tool.ORALB_MANUFACTURER_ID: b"\x00" * 11},
+            ),
+            -90,
+            ("toothbrush_11_byte_payload",),
+        )
+        selected = tool.choose_toothbrush_candidate(
+            [charger, brush], None, interactive=False
+        )
+        self.assertEqual("brush", selected.address)
+
+    def test_toothbrush_address_override_remains_exact(self):
+        candidate = tool.Candidate(
+            FakeDevice("explicit-device"), FakeAdvertisement(), 0, ()
+        )
+        selected = tool.choose_toothbrush_candidate(
+            [candidate], "EXPLICIT-DEVICE", interactive=False
+        )
+        self.assertEqual(candidate, selected)
+
+    def test_toothbrush_name_can_select_when_payload_is_unavailable(self):
+        candidate = tool.Candidate(
+            FakeDevice("brush"),
+            FakeAdvertisement(local_name="Oral-B iO"),
+            0,
+            (),
+        )
+        self.assertTrue(tool.is_toothbrush_candidate(candidate))
 
 
 class FakeProtocolClient:
@@ -265,6 +317,151 @@ class IOSenseProbeGattTests(unittest.IsolatedAsyncioTestCase):
             "03",
             services[0]["characteristics"][0]["descriptors"][0]["read"]["hex"],
         )
+
+
+class FakeBrushClient:
+    def __init__(self, *, sector_subscription_error=False) -> None:
+        self.callbacks = {}
+        self.stopped = []
+        self.characteristic_writes = []
+        self.sector_subscription_error = sector_subscription_error
+        self.read_values = {
+            tool.BRUSH_DEVICE_INFO_UUID: b"\x36\x06\x32",
+            tool.BRUSH_AVAILABLE_MODES_UUID: b"\x00\x01\x02",
+            tool.BRUSH_PACER_UUID: b"",
+            tool.BRUSH_SECTOR_UUID: b"\x00\x00\x00",
+        }
+
+    async def start_notify(self, uuid, callback):
+        if self.sector_subscription_error and uuid == tool.BRUSH_SECTOR_UUID:
+            raise RuntimeError("sector unavailable")
+        self.callbacks[uuid] = callback
+
+    async def stop_notify(self, uuid):
+        self.stopped.append(uuid)
+        self.callbacks.pop(uuid, None)
+
+    async def read_gatt_char(self, uuid):
+        return self.read_values[uuid]
+
+    async def write_gatt_char(self, uuid, value, response=True):
+        self.characteristic_writes.append((uuid, bytes(value), response))
+
+    def notify(self, uuid, value):
+        self.callbacks[uuid](None, bytearray(value))
+
+
+class BrushPacerCaptureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_read_preserves_empty_and_all_zero_values(self):
+        client = FakeBrushClient()
+        empty = await tool.read_characteristic(
+            client, tool.BRUSH_PACER_UUID, read_timeout=0.1
+        )
+        zeros = await tool.read_characteristic(
+            client, tool.BRUSH_SECTOR_UUID, read_timeout=0.1
+        )
+        self.assertEqual({"success": True, "length": 0, "hex": ""}, empty)
+        self.assertEqual(
+            {"success": True, "length": 3, "hex": "000000"}, zeros
+        )
+
+        tool.annotate_brush_read("pacer_configuration_ff26", empty)
+        tool.annotate_brush_read("sector_ff09", zeros)
+        self.assertEqual([], empty["positional_hints"]["usable_sector_seconds"])
+        self.assertEqual(0, zeros["positional_hints"]["total_hint_raw"])
+
+    async def test_snapshot_includes_ff25_and_pre_post_configuration_reads(self):
+        client = FakeBrushClient()
+        initial = await tool.read_brush_snapshot(
+            client, tool.BRUSH_INITIAL_READS, read_timeout=0.1
+        )
+        final = await tool.read_brush_snapshot(
+            client, tool.BRUSH_FINAL_READS, read_timeout=0.1
+        )
+
+        self.assertEqual(
+            {
+                "device_info_ff02",
+                "available_modes_ff25",
+                "pacer_configuration_ff26",
+                "sector_ff09",
+            },
+            set(initial),
+        )
+        self.assertEqual(
+            {
+                "available_modes_ff25",
+                "pacer_configuration_ff26",
+                "sector_ff09",
+            },
+            set(final),
+        )
+        self.assertEqual(
+            [0, 1, 2],
+            initial["available_modes_ff25"]["positional_hints"]["mode_values_raw"],
+        )
+        self.assertEqual(
+            6,
+            initial["device_info_ff02"]["positional_hints"][
+                "protocol_version_raw"
+            ],
+        )
+        self.assertEqual([], client.characteristic_writes)
+
+    async def test_records_raw_notifications_and_stops_after_running(self):
+        client = FakeBrushClient()
+        capture = tool.BrushPacerCapture(client)
+        await capture.start()
+
+        client.notify(tool.BRUSH_STATE_UUID, b"\x03")
+        client.notify(tool.BRUSH_MODE_UUID, b"\x05")
+        client.notify(tool.BRUSH_TIME_UUID, b"\x01\x02")
+        client.notify(tool.BRUSH_SECTOR_UUID, b"\x04\x09\x10")
+        client.notify(tool.BRUSH_STATE_UUID, b"\x02")
+
+        reason = await capture.wait(session_timeout=0.1, end_grace=0)
+        report = capture.report(reason)
+        await capture.stop()
+
+        self.assertEqual("state_after_running", reason)
+        self.assertTrue(report["running_seen"])
+        self.assertEqual(2, report["end_state_raw"])
+        self.assertEqual(
+            ["03", "05", "0102", "040910", "02"],
+            [item["hex"] for item in report["notifications"]],
+        )
+        self.assertEqual(62, report["notifications"][2]["brushing_time_seconds_hint"])
+        self.assertEqual(4, report["notifications"][3]["sector_raw"])
+        self.assertEqual([], client.characteristic_writes)
+        self.assertEqual(
+            {uuid for _name, uuid in tool.BRUSH_NOTIFY_CHARACTERISTICS},
+            set(client.stopped),
+        )
+
+    async def test_idle_before_running_does_not_end_capture(self):
+        client = FakeBrushClient()
+        capture = tool.BrushPacerCapture(client)
+        await capture.start()
+        client.notify(tool.BRUSH_STATE_UUID, b"\x02")
+
+        reason = await capture.wait(session_timeout=0.01, end_grace=0)
+        await capture.stop()
+
+        self.assertEqual("timeout", reason)
+        self.assertFalse(capture.running_seen)
+
+    async def test_ff09_subscription_is_required_and_partial_setup_cleans_up(self):
+        client = FakeBrushClient(sector_subscription_error=True)
+        capture = tool.BrushPacerCapture(client)
+        with self.assertRaisesRegex(RuntimeError, "required.*FF09"):
+            await capture.start()
+
+        await capture.stop()
+
+        self.assertIn("sector", capture.subscription_errors)
+        self.assertNotIn(tool.BRUSH_SECTOR_UUID, capture.subscribed)
+        self.assertEqual(set(capture.subscribed), set(client.stopped))
+        self.assertEqual([], client.characteristic_writes)
 
 
 if __name__ == "__main__":

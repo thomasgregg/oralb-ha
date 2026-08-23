@@ -264,6 +264,99 @@ advertisement to Home Assistant. It provides an independent local capture: if
 the probe finds a supported charger while Home Assistant does not, focus next
 on scanner mode, proxy reachability and Home Assistant Bluetooth diagnostics.
 
+## Toothbrush pacer capture
+
+The same release tool has a `--brush-pacer` mode for cases where the handle's
+reported sector count disagrees with its physical pacing. It captures the
+evidence needed for [issue #20](https://github.com/thomasgregg/oralb-ha/issues/20)
+in one run:
+
+- an exact initial FF02 device-information read;
+- exact initial and post-session reads of FF25 (available modes), FF26 (pacer
+  configuration) and FF09 (sector data), including empty or all-zero replies;
+- timestamped raw notifications from FF04 (state), FF07 (mode), FF08 (timer)
+  and FF09 (sector);
+- positional annotations alongside—not instead of—the exact length and hex;
+- automatic completion when a running-state notification is followed by a
+  non-running state, with a two-second tail to retain final notifications;
+- a 240-second safety timeout if that transition is not observed.
+
+This mode never calls `write_gatt_char`, changes a brush setting or sends a
+control command. Bluetooth notification setup normally causes the operating
+system to write temporary Client Characteristic Configuration Descriptor
+(CCCD) values. Those are subscription controls, not toothbrush configuration;
+the tool removes every successful subscription before disconnecting.
+
+### Download and run it
+
+The reporter does not need a repository checkout. After a release containing
+tool version 2 or later is published, these macOS/Linux commands download a
+fresh standalone copy and run the complete capture:
+
+```bash
+mkdir -p "$HOME/oralb-pacer-test"
+cd "$HOME/oralb-pacer-test"
+curl --fail --location --output iosense_probe.py \
+  https://github.com/thomasgregg/oralb-ha/releases/latest/download/iosense_probe.py
+python3.12 -m venv .venv-iosense
+.venv-iosense/bin/python -m pip install --upgrade pip bleak
+.venv-iosense/bin/python iosense_probe.py \
+  --brush-pacer --session-timeout 240 --output brush-pacer.json
+```
+
+On Linux, use `python3` in place of `python3.12` if it is Python 3.10 or newer.
+On Windows PowerShell:
+
+```powershell
+$TestDirectory = Join-Path $HOME "oralb-pacer-test"
+New-Item -ItemType Directory -Force $TestDirectory | Out-Null
+Set-Location $TestDirectory
+Invoke-WebRequest `
+  -Uri "https://github.com/thomasgregg/oralb-ha/releases/latest/download/iosense_probe.py" `
+  -OutFile "iosense_probe.py"
+py -3.12 -m venv .venv-iosense
+.venv-iosense\Scripts\python.exe -m pip install --upgrade pip bleak
+.venv-iosense\Scripts\python.exe iosense_probe.py `
+  --brush-pacer --session-timeout 240 --output brush-pacer.json
+```
+
+Before starting, close the Oral-B phone app, temporarily disable the Oral-B
+Live config entry or stop Home Assistant, and unplug the iO Sense charger for
+the duration of the capture. A toothbrush generally has one live BLE
+connection slot, so another client can prevent this capture or make it
+incomplete. Re-enable Home Assistant and power the charger again after the tool
+exits.
+
+The probe subscribes before it prints `Ready. Start brushing now.` After that
+message, run one normal uninterrupted brushing session and stop the handle in
+the usual way. For issue #20, use the routine that physically paces four
+30-second zones; do not change the routine between the Home Assistant/Card
+check and this raw capture.
+
+The script does not change the official app's Vibration setting. For the
+reverse test proposed in issue #20, turn Vibration off in the app first, allow
+the app to finish synchronizing, and then force-close it before following the
+disconnect steps above. The initial/final FF25, FF26 and FF09 snapshots show
+whether that reproduced configuration remains stable throughout the captured
+session.
+
+If several toothbrushes are nearby, select the correct numbered entry. An
+exact address or macOS CoreBluetooth UUID can instead be supplied:
+
+```bash
+.venv-iosense/bin/python iosense_probe.py --brush-pacer \
+  --address "AA:BB:CC:DD:EE:FF" --output brush-pacer.json
+```
+
+Return `brush-pacer.json` plus the printed summary. The selected Bluetooth
+address is redacted in brush-mode JSON, but FF02 and raw advertisement bytes
+could still be device-specific, so inspect the file before posting it
+publicly. Also report separately what Toothbrush Card displayed during a
+normal Home Assistant-connected session: its version, whether sector count was
+set to Auto or manually overridden, how many zones it drew, and the displayed
+sector at approximately 30, 60, 90 and 120 seconds. The probe cannot test the
+card concurrently because it temporarily owns the brush's BLE connection.
+
 ## iO Sense night-light tester
 
 `iosense_night_light.py` tests the charger ring colour and night-light mode
