@@ -342,6 +342,12 @@ Bluetooth adapter or proxy.
 
 ### Toothbrush Card
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/thomasgregg/oralb-ha/main/docs/images/toothbrush-card.png" alt="Toothbrush Card showing an Oral-B Live brushing session" width="600">
+  <br>
+  <sub>Live brushing progress and session recap in Toothbrush Card</sub>
+</p>
+
 The main entities follow the structure expected by
 [Toothbrush Card](https://github.com/mtheli/toothbrush-card):
 
