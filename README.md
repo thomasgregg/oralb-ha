@@ -33,6 +33,7 @@ the Oral-B cloud.
 - [Entities](#entities)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Cards and automations](#cards-and-automations)
 - [Requirements](#requirements)
 - [Protocol reference](#protocol-reference)
 - [Known limitations](#known-limitations)
@@ -337,7 +338,9 @@ The default charger/app-compatible option discovers and matches an iO Sense
 automatically. The charger must be within range of a connectable Home Assistant
 Bluetooth adapter or proxy.
 
-## Dashboard
+## Cards and automations
+
+### Toothbrush Card
 
 The main entities follow the structure expected by
 [Toothbrush Card](https://github.com/mtheli/toothbrush-card):
@@ -352,6 +355,9 @@ The main entities follow the structure expected by
 | Mode | `mode` translation key |
 | Battery | Battery device class |
 | Routine target | `routine_length` translation key, reported in seconds |
+| Session recap | `last_session` translation key, with duration in its attributes or through the `last_session_duration` translation key |
+| Completion verdict | `smiley` translation key and the retained session's `display_face` attribute |
+| Handle-color accent | `ring_color` translation key containing the brush's raw `#RRGGBB` LED drive levels |
 
 Toothbrush Card 0.28.0 and newer support Oral-B Live directly, including device
 selection in the visual editor. The equivalent YAML configuration is:
@@ -388,6 +394,12 @@ cards:
     entities:
       - sensor.<your_brush>_last_session_duration
 ```
+
+### ADHD Toothbrush Tracker blueprint
+
+The [ADHD Toothbrush Tracker blueprint](https://github.com/CoatsyJnr/home-assistant-blueprints)
+provides persistent morning and evening brushing reminders and can use Oral-B
+Live to detect when brushing starts.
 
 ## Requirements
 
