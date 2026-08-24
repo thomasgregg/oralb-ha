@@ -563,7 +563,7 @@ The observed protocol-8/9 payload is length-gated and little-endian:
 | --- | --- | --- |
 | `0` | pressure state | unsigned byte |
 | `1..2` | timestamp | unsigned 16-bit raw value |
-| `3..4` | force | unsigned 16-bit raw value |
+| `3..4` | force | signed 16-bit raw value |
 | `5..6` | oscillation angle | unsigned 16-bit raw value |
 | `7..8` | drive target | unsigned 16-bit raw value |
 | `9` | identifier | unsigned byte |
@@ -571,6 +571,9 @@ The observed protocol-8/9 payload is length-gated and little-endian:
 The integration exposes the captured force word as a Pressure attribute. It
 also exposes the two drive words as disabled-by-default diagnostic sensors
 named **Oscillation angle** (degrees) and **Drive target (raw)** (unitless).
+Short negative force readings can occur while the motor settles at startup.
+They remain visible in the live raw force attribute but are excluded from the
+session average and maximum, which represent applied brushing force.
 Their historical entity keys remain `motor_angle_raw` and `motor_target_raw` so
 existing entity IDs, dashboards and automations do not break. Unitless angle
 samples recorded by version 0.7.32 remain as their original raw values in

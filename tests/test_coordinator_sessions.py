@@ -120,6 +120,38 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertIsNone(c.data["motor_angle_raw"])
         self.assertIsNone(c.data["motor_target_raw"])
 
+    def test_negative_startup_force_is_excluded_from_session_summary(self) -> None:
+        samples = (
+            (0, -2000),
+            (1, -510),
+            (2, -23),
+            (0, 163),
+            (1, 2200),
+            (2, 5463),
+        )
+
+        for source in (const.DATA_SOURCE_DIRECT, const.DATA_SOURCE_CHARGER):
+            with self.subTest(source=source):
+                c = self._coordinator(const.CONNECTION_MODE_LIVE)
+                c._apply_state(const.RUNNING_STATE)
+                c._track_session_time(10, confirm_session=True)
+                for pressure_state, force in samples:
+                    payload = bytes((pressure_state, 0, 0)) + force.to_bytes(
+                        2, "little", signed=True
+                    )
+                    c._apply_pressure(payload, source)
+
+                self.assertEqual(c._session_pressure_samples, len(samples))
+                self.assertEqual(c._session_pressure_force_samples, 3)
+                self.assertEqual(c._session_pressure_force_total, 7826)
+                self.assertEqual(c._session_pressure_force_max, 5463)
+                self.assertEqual(c._session_high_pressure, 2)
+                self.assertEqual(c._session_low_pressure, 2)
+
+                c._apply_state(2)
+                self.assertEqual(c.data["last_session_average_pressure"], 2609)
+                self.assertEqual(c.data["last_session_maximum_pressure"], 5463)
+
     def test_idle_pressure_is_unknown_across_source_changes(self) -> None:
         """Reconnects cannot turn an untouched handle into a pressure reading."""
         c = self._coordinator()

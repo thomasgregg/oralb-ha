@@ -95,6 +95,13 @@ class ProtocolDecoderTests(unittest.TestCase):
         )
         self.assertEqual(protocol.parse_pressure_sample(b""), {})
 
+    def test_pressure_sample_force_is_signed(self) -> None:
+        settling = protocol.parse_pressure_sample(bytes.fromhex("01 00 00 30 f8"))
+        valid = protocol.parse_pressure_sample(bytes.fromhex("01 00 00 57 15"))
+
+        self.assertEqual(settling["pressure_force"], -2000)
+        self.assertEqual(valid["pressure_force"], 5463)
+
     def test_advertisement_pressure_uses_high_bit(self) -> None:
         """Advertisement byte 4 is a bit field, not a lookup or nibble."""
         for status in (0x30, 0x32, 0x38, 0x3A, 0x52, 0x72):
