@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -87,10 +88,12 @@ from .const import (
     SESSION_DISPLAY_FACE_PRE_END_GRACE_SECONDS,
     SESSION_DISPLAY_FACE_READ_RETRY_DELAYS,
     SESSION_DISPLAY_FACE_RESULT_MIN_RAW,
+    SESSION_PAUSE_GRACE_SECONDS,
     SESSION_RECONCILE_WINDOW_SECONDS,
     SESSION_RECORD_SETTLE_SECONDS,
     SESSION_SEEN_STATES,
     SESSION_SYNC_RETRY_BACKOFF_SECONDS,
+    SESSION_TIMER_RESET_MAX_SECONDS,
     SIGNAL_UPDATE,
     SMILEYS,
     STALE_CONNECTION_SECONDS,
@@ -126,6 +129,29 @@ _LOGGER = logging.getLogger(__name__)
 def _decode_time(hi: int, lo: int) -> int:
     """Brush time frames are [minutes, seconds]."""
     return hi * 60 + lo
+
+
+@dataclass
+class _PendingSession:
+    """A physically stopped session awaiting its logical boundary."""
+
+    face_generation: int
+    start: datetime
+    duration: int
+    mode: str | None
+    sectors: set[int]
+    high_pressure: int
+    low_pressure: int
+    high_pressure_time: float
+    low_pressure_time: float
+    pressure_samples: int
+    pressure_force_total: int
+    pressure_force_samples: int
+    pressure_force_max: int | None
+    target_duration: int | None
+    source: str | None
+    duration_source: str
+    display_face: str | None = None
 
 
 class OralBLiveCoordinator:
@@ -234,6 +260,12 @@ class OralBLiveCoordinator:
         self._session_mode: str | None = None
         self._last_pressure: str | None = None
         self._pending_passive_sessions: list[Any] = []
+        self._pending_session: _PendingSession | None = None
+        self._session_finalize_task: asyncio.Task | None = None
+        self._session_pause_grace_seconds = SESSION_PAUSE_GRACE_SECONDS
+        self._resume_timer_baseline: int | None = None
+        self._resume_saw_selection_menu = False
+        self._session_generation_marked = False
         # FF0A and FF04 are independent characteristics, and advertisements
         # carry both fields in one packet only on the passive path. Correlate a
         # transient result with exactly one completed session regardless of
@@ -305,11 +337,15 @@ class OralBLiveCoordinator:
 
     async def async_stop(self) -> None:
         self._stopping = True
+        # Do not lose an already stopped session merely because the integration
+        # is being reloaded during its pause grace period.
+        self._finalize_pending_session()
         for task in (
             self._reconnect_task,
             self._sync_task,
             self._charger_tick_task,
             self._session_face_read_task,
+            self._session_finalize_task,
         ):
             if task:
                 task.cancel()
@@ -317,6 +353,7 @@ class OralBLiveCoordinator:
         self._sync_task = None
         self._charger_tick_task = None
         self._session_face_read_task = None
+        self._session_finalize_task = None
         if self._unsub_bluetooth:
             self._unsub_bluetooth()
             self._unsub_bluetooth = None
@@ -609,7 +646,11 @@ class OralBLiveCoordinator:
         elif short_uuid == "FF2D":
             self._apply_refill(raw)
 
-        if self._charger_session_record and self._charger_session_rtc:
+        if (
+            self._charger_session_record
+            and self._charger_session_rtc
+            and self._pending_session is None
+        ):
             record, rtc = self._charger_session_record, self._charger_session_rtc
             rtc_sampled_at = self._charger_session_rtc_sampled_at
             self._charger_session_record = None
@@ -627,6 +668,51 @@ class OralBLiveCoordinator:
                 self._reset_session_sync_retry()
                 self._last_sync_ok = time.monotonic()
         self._push()
+
+    def _schedule_deferred_charger_session_record(self) -> None:
+        """Apply a charger record only after its physical stop is finalized."""
+        if (
+            self._pending_session is not None
+            or not self._charger_session_record
+            or not self._charger_session_rtc
+            or self._stopping
+        ):
+            return
+        record, rtc = self._charger_session_record, self._charger_session_rtc
+        rtc_sampled_at = self._charger_session_rtc_sampled_at
+        self._charger_session_record = None
+        self._charger_session_rtc = None
+        self._charger_session_rtc_sampled_at = None
+        self.hass.async_create_background_task(
+            self._async_apply_deferred_charger_session_record(
+                record,
+                rtc,
+                rtc_sampled_at,
+            ),
+            "oralb_live_deferred_session_record",
+        )
+
+    async def _async_apply_deferred_charger_session_record(
+        self,
+        record: bytes,
+        rtc: bytes,
+        rtc_sampled_at: datetime | None,
+    ) -> None:
+        """Reconcile one retained charger record after logical finalization."""
+        if (
+            await self._async_apply_session_record(
+                record,
+                rtc,
+                rtc_sampled_at=rtc_sampled_at,
+            )
+            == "new"
+        ):
+            self.data["last_session_source"] = DATA_SOURCE_SESSION
+            self._session_pending_sync = False
+            self._processed_session_generation = self._session_generation
+            self._reset_session_sync_retry()
+            self._last_sync_ok = time.monotonic()
+            self._push()
 
     def _advance_charger_timer(self) -> None:
         """Advance the displayed timer between two-second brush anchors."""
@@ -997,7 +1083,15 @@ class OralBLiveCoordinator:
         if self._last_synced_session_ts is None:
             stored = await self._store.async_load() or {}
             self._last_synced_session_ts = stored.get("last_session_ts", 0)
-        if session_ts == self._last_synced_session_ts:
+        current_duration = self.data.get("last_session_duration")
+        refines_same_timestamp = (
+            session_ts == self._last_synced_session_ts
+            and isinstance(current_duration, int)
+            and duration > current_duration
+            and self.data.get("last_session_source") == DATA_SOURCE_SESSION
+            and self.data.get("last_session_id") == parsed["session_id"]
+        )
+        if session_ts == self._last_synced_session_ts and not refines_same_timestamp:
             _LOGGER.debug(
                 "%s: ff29 still contains the previous session "
                 "(timestamp=%s, duration=%ss)",
@@ -1019,7 +1113,7 @@ class OralBLiveCoordinator:
         today = dt_util.now().date()
         previous_start = self.data.get("last_session_start")
         matched_passive_start = None
-        if self._pending_passive_sessions:
+        if not refines_same_timestamp and self._pending_passive_sessions:
             matched_passive_start = min(
                 self._pending_passive_sessions,
                 key=lambda candidate: abs((start - candidate).total_seconds()),
@@ -1029,10 +1123,12 @@ class OralBLiveCoordinator:
                 > SESSION_RECONCILE_WINDOW_SECONDS
             ):
                 matched_passive_start = None
-        reconciles_passive_session = matched_passive_start is not None
-        if reconciles_passive_session:
+        reconciles_passive_session = (
+            refines_same_timestamp or matched_passive_start is not None
+        )
+        if matched_passive_start is not None:
             self._pending_passive_sessions.remove(matched_passive_start)
-        elif previous_start is not None:
+        elif not refines_same_timestamp and previous_start is not None:
             # After an integration reload only the most recent passive session
             # is restored, not the in-memory queue.
             reconciles_passive_session = (
@@ -1133,7 +1229,10 @@ class OralBLiveCoordinator:
                 raw == RUNNING_STATE if confirm_session is None else confirm_session
             )
             if raw in session_states and previous_tracked not in session_states:
-                self._begin_session(confirmed=confirms_brushing)
+                self._begin_session(
+                    confirmed=confirms_brushing,
+                    selection_menu_route=(raw == 8 or previous_tracked == 8),
+                )
             elif raw in session_states and confirms_brushing:
                 self._confirm_session()
             elif raw not in session_states and previous_tracked in session_states:
@@ -1155,17 +1254,21 @@ class OralBLiveCoordinator:
             track_session
             and self.mode != CONNECTION_MODE_LIVE
             and raw in SESSION_SEEN_STATES
+            and raw not in session_states
             and previous_tracked not in SESSION_SEEN_STATES
         ):
+            # Summary-only observations still need retained-session recovery
+            # when the active running/menu edge was missed entirely.
             self._session_generation += 1
             self._session_pending_sync = True
             self._reset_session_sync_retry()
             _LOGGER.debug(
-                "%s: observed session generation %s in state %s",
+                "%s: observed summary-only session generation %s in state %s",
                 self.name,
                 self._session_generation,
                 self.data["state"],
             )
+
         return session_recorded
 
     def _is_pressure_active_state(self, raw: int | None = None) -> bool:
@@ -1230,13 +1333,20 @@ class OralBLiveCoordinator:
         now = time.monotonic() if observed_at is None else observed_at
         if not self._session_display_face_capture_is_open(generation, now=now):
             return False
-        self.data["last_session_display_face"] = SMILEYS.get(raw, f"face_{raw}")
+        face = SMILEYS.get(raw, f"face_{raw}")
+        if (
+            self._pending_session is not None
+            and self._pending_session.face_generation == generation
+        ):
+            self._pending_session.display_face = face
+        else:
+            self.data["last_session_display_face"] = face
         self._pending_session_face_generation = None
         self._pending_session_face_deadline = 0.0
         _LOGGER.debug(
             "%s: attached display face %s to session generation %s from %s",
             self.name,
-            self.data["last_session_display_face"],
+            face,
             generation,
             source or "unknown source",
         )
@@ -1316,9 +1426,188 @@ class OralBLiveCoordinator:
             if self._session_face_read_task is current_task:
                 self._session_face_read_task = None
 
-    def _begin_session(self, *, confirmed: bool = False) -> None:
-        """A brushing session just started."""
-        self._invalidate_session_display_face_capture(advance_generation=True)
+    def _mark_session_generation(self) -> None:
+        """Record one charger-priority sync generation per logical session."""
+        if self._session_generation_marked:
+            return
+        self._session_generation_marked = True
+        if self.mode == CONNECTION_MODE_LIVE:
+            return
+        self._session_generation += 1
+        self._session_pending_sync = True
+        self._reset_session_sync_retry()
+        _LOGGER.debug(
+            "%s: observed logical session generation %s",
+            self.name,
+            self._session_generation,
+        )
+
+    def _cancel_session_finalize(self) -> None:
+        """Cancel a bounded pending-session timeout."""
+        task, self._session_finalize_task = self._session_finalize_task, None
+        if task and not task.done():
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+            if task is not current_task:
+                task.cancel()
+
+    def _schedule_pending_session_finalize(self) -> bool:
+        """Finalize immediately in tests or after the production pause grace."""
+        pending = self._pending_session
+        if pending is None:
+            return False
+        if self._session_pause_grace_seconds <= 0:
+            return self._finalize_pending_session(pending.face_generation)
+        self._cancel_session_finalize()
+        self._session_finalize_task = self.hass.async_create_background_task(
+            self._async_finalize_pending_session(pending.face_generation),
+            "oralb_live_session_pause_grace",
+        )
+        return False
+
+    async def _async_finalize_pending_session(self, generation: int) -> None:
+        """Finalize a stopped logical session if it did not resume in time."""
+        try:
+            await asyncio.sleep(self._session_pause_grace_seconds)
+            if self._stopping:
+                return
+            if self._finalize_pending_session(generation):
+                self._push()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._session_finalize_task is asyncio.current_task():
+                self._session_finalize_task = None
+
+    def _finalize_pending_session(self, generation: int | None = None) -> bool:
+        """Publish one pending logical session and increment its count once."""
+        pending = self._pending_session
+        if pending is None or (
+            generation is not None and pending.face_generation != generation
+        ):
+            return False
+        self._cancel_session_finalize()
+        self._pending_session = None
+
+        today = dt_util.now().date()
+        previous_start = self.data.get("last_session_start")
+        count = self.data.get("sessions_today") or 0
+        if previous_start is not None:
+            previous_day = dt_util.as_local(previous_start).date()
+            if previous_day != today:
+                count = 0
+        self.data["sessions_today"] = count + 1
+        self.data["last_session_start"] = pending.start
+        self.data["last_session_duration"] = pending.duration
+        self.data["last_session_mode"] = pending.mode
+        self.data["last_session_display_face"] = pending.display_face
+        self.data["last_session_sectors"] = len(pending.sectors)
+        has_pressure_samples = pending.pressure_samples > 0
+        self.data["last_session_high_pressure"] = (
+            pending.high_pressure if has_pressure_samples else None
+        )
+        self.data["last_session_low_pressure"] = (
+            pending.low_pressure if has_pressure_samples else None
+        )
+        self.data["last_session_high_pressure_time"] = (
+            round(pending.high_pressure_time, 1) if has_pressure_samples else None
+        )
+        self.data["last_session_low_pressure_time"] = (
+            round(pending.low_pressure_time, 1) if has_pressure_samples else None
+        )
+        self.data["last_session_average_pressure"] = (
+            round(pending.pressure_force_total / pending.pressure_force_samples)
+            if pending.pressure_force_samples
+            else None
+        )
+        self.data["last_session_maximum_pressure"] = pending.pressure_force_max
+        self.data["last_session_battery_end"] = None
+        self.data["last_session_target_duration"] = pending.target_duration
+        self.data["last_session_id"] = None
+        self.data["last_session_source"] = pending.source
+        self._pending_passive_sessions.append(pending.start)
+        self._pending_passive_sessions = self._pending_passive_sessions[-10:]
+
+        # If a resumed fragment was still ambiguous when the predecessor timed
+        # out, it is now necessarily a distinct logical session.
+        if self._session_active and not self._session_generation_marked:
+            self._mark_session_generation()
+        if (
+            self._session_active
+            and self._session_face_generation != pending.face_generation
+        ):
+            self._invalidate_session_display_face_capture()
+        _LOGGER.debug(
+            "%s: session finalized from %s: %ss, mode %s, %s quadrants, "
+            "%s high-pressure events",
+            self.name,
+            pending.duration_source,
+            pending.duration,
+            pending.mode,
+            len(pending.sectors),
+            pending.high_pressure,
+        )
+        self._schedule_deferred_charger_session_record()
+        return True
+
+    def _merge_pending_session(self, resumed_seconds: int) -> None:
+        """Merge a timer-continuing resumed fragment into its predecessor."""
+        pending = self._pending_session
+        if pending is None:
+            return
+        self._cancel_session_finalize()
+        self._pending_session = None
+        self._invalidate_session_display_face_capture()
+        self._session_start = pending.start
+        self._session_max_time = max(pending.duration, resumed_seconds)
+        self._session_sectors |= pending.sectors
+        self._session_high_pressure += pending.high_pressure
+        self._session_low_pressure += pending.low_pressure
+        self._session_high_pressure_time += pending.high_pressure_time
+        self._session_low_pressure_time += pending.low_pressure_time
+        self._session_pressure_samples += pending.pressure_samples
+        self._session_pressure_force_total += pending.pressure_force_total
+        self._session_pressure_force_samples += pending.pressure_force_samples
+        if pending.pressure_force_max is not None:
+            self._session_pressure_force_max = (
+                pending.pressure_force_max
+                if self._session_pressure_force_max is None
+                else max(
+                    pending.pressure_force_max,
+                    self._session_pressure_force_max,
+                )
+            )
+        self._session_mode = self._session_mode or pending.mode
+        self._session_confirmed = True
+        self._session_generation_marked = True
+        self._resume_timer_baseline = None
+        self._resume_saw_selection_menu = False
+        # Any charger-retained record read at the interim stop is provisional.
+        self._charger_session_record = None
+        self._charger_session_rtc = None
+        self._charger_session_rtc_sampled_at = None
+        _LOGGER.debug(
+            "%s: resumed logical session at %ss after a temporary pause",
+            self.name,
+            resumed_seconds,
+        )
+
+    def _begin_session(
+        self,
+        *,
+        confirmed: bool = False,
+        selection_menu_route: bool = False,
+    ) -> None:
+        """Start a physical fragment, pending timer-based boundary evidence."""
+        resuming_pending = self._pending_session is not None
+        if resuming_pending:
+            # Keep the predecessor's provisional face capture open until the
+            # timer decides whether this is a continuation or a new session.
+            self._session_face_generation += 1
+        else:
+            self._invalidate_session_display_face_capture(advance_generation=True)
         self._session_active = True
         self._session_confirmed = confirmed
         self._session_timer_baseline = None
@@ -1337,7 +1626,18 @@ class OralBLiveCoordinator:
         self._session_pressure_force_max = None
         self._session_mode = self.data.get("mode")
         self._last_pressure = None
-        _LOGGER.debug("%s: session started", self.name)
+        self._resume_timer_baseline = None
+        self._resume_saw_selection_menu = (
+            selection_menu_route if resuming_pending else False
+        )
+        self._session_generation_marked = False
+        if not resuming_pending:
+            self._mark_session_generation()
+        _LOGGER.debug(
+            "%s: %s started",
+            self.name,
+            "resume candidate" if resuming_pending else "session",
+        )
 
     def _confirm_session(self) -> None:
         """Mark a provisional charger/menu observation as real brushing."""
@@ -1346,7 +1646,7 @@ class OralBLiveCoordinator:
             _LOGGER.debug("%s: session confirmed by brush data", self.name)
 
     def _end_session(self) -> bool:
-        """A brushing session just finished; record the result.
+        """Hold a physical stop provisionally until its pause grace expires.
 
         Prefer the brush's advertised/notified timer. If it stays at
         zero, use elapsed wall time between the observed running and
@@ -1355,6 +1655,12 @@ class OralBLiveCoordinator:
         """
         if not self._session_active:
             return False
+        # A resumed fragment that stopped before supplying decisive timer
+        # evidence cannot replace the older pending stop. Finalize the older
+        # logical session, then treat this fragment as its own candidate.
+        if self._pending_session is not None:
+            self._finalize_pending_session()
+            self._invalidate_session_display_face_capture()
         self._accumulate_session_pressure_time(time.monotonic())
         self._session_active = False
         self._cancel_charger_ticker()
@@ -1393,68 +1699,92 @@ class OralBLiveCoordinator:
             )
             return False
 
-        today = dt_util.now().date()
-        previous_start = self.data.get("last_session_start")
-        count = self.data.get("sessions_today") or 0
-        if previous_start is not None:
-            previous_day = dt_util.as_local(previous_start).date()
-            if previous_day != today:
-                count = 0
-        self.data["sessions_today"] = count + 1
-
-        self.data["last_session_start"] = self._session_start
-        self.data["last_session_duration"] = duration
-        self.data["last_session_mode"] = self._session_mode or self.data.get("mode")
-        # The result face arrives after the state transition on the passive
-        # advertisement path. Clear the predecessor now so another source can
-        # never make a new session inherit a face that does not belong to it.
-        self.data["last_session_display_face"] = None
-        self.data["last_session_sectors"] = len(self._session_sectors)
-        has_pressure_samples = self._session_pressure_samples > 0
-        self.data["last_session_high_pressure"] = (
-            self._session_high_pressure if has_pressure_samples else None
+        self._pending_session = _PendingSession(
+            face_generation=self._session_face_generation,
+            start=self._session_start,
+            duration=duration,
+            mode=self._session_mode or self.data.get("mode"),
+            sectors=set(self._session_sectors),
+            high_pressure=self._session_high_pressure,
+            low_pressure=self._session_low_pressure,
+            high_pressure_time=self._session_high_pressure_time,
+            low_pressure_time=self._session_low_pressure_time,
+            pressure_samples=self._session_pressure_samples,
+            pressure_force_total=self._session_pressure_force_total,
+            pressure_force_samples=self._session_pressure_force_samples,
+            pressure_force_max=self._session_pressure_force_max,
+            target_duration=self.data.get("target_duration"),
+            source=self.data.get("data_source"),
+            duration_source=duration_source,
         )
-        self.data["last_session_low_pressure"] = (
-            self._session_low_pressure if has_pressure_samples else None
-        )
-        self.data["last_session_high_pressure_time"] = (
-            round(self._session_high_pressure_time, 1) if has_pressure_samples else None
-        )
-        self.data["last_session_low_pressure_time"] = (
-            round(self._session_low_pressure_time, 1) if has_pressure_samples else None
-        )
-        self.data["last_session_average_pressure"] = (
-            round(
-                self._session_pressure_force_total
-                / self._session_pressure_force_samples
-            )
-            if self._session_pressure_force_samples
-            else None
-        )
-        self.data["last_session_maximum_pressure"] = self._session_pressure_force_max
-        self.data["last_session_battery_end"] = None
-        self.data["last_session_target_duration"] = self.data.get("target_duration")
-        self.data["last_session_id"] = None
-        self.data["last_session_source"] = self.data.get("data_source")
-        self._pending_passive_sessions.append(self._session_start)
-        self._pending_passive_sessions = self._pending_passive_sessions[-10:]
         self._open_session_display_face_capture()
         _LOGGER.debug(
-            "%s: session ended from %s: %ss, mode %s, %s quadrants, "
-            "%s high-pressure events",
+            "%s: physical session stop pending for %ss: %ss from %s",
             self.name,
-            duration_source,
+            self._session_pause_grace_seconds,
             duration,
-            self.data.get("mode"),
-            len(self._session_sectors),
-            self._session_high_pressure,
+            duration_source,
         )
-        return True
+        return self._schedule_pending_session_finalize()
 
     def _track_session_time(
         self, seconds: int, *, confirm_session: bool = False
     ) -> None:
         if not self._session_active:
+            # FF04 and FF08 are independent notifications. A final timer sample
+            # can arrive just after the quiet-state edge that opened the grace.
+            if (
+                confirm_session
+                and self._pending_session is not None
+                and seconds > self._pending_session.duration
+            ):
+                self._pending_session.duration = seconds
+            return
+        if self._pending_session is not None:
+            # Charger-mode display ticks are locally extrapolated and reset to
+            # zero on every physical restart. Only an advertisement or FF08
+            # sample may decide whether the toothbrush timer itself reset.
+            if not confirm_session:
+                return
+            baseline = self._resume_timer_baseline
+            if baseline is None or seconds < baseline:
+                self._resume_timer_baseline = seconds
+                self._session_max_time = seconds
+                return
+            if seconds == baseline:
+                return
+
+            pending_duration = self._pending_session.duration
+            timer_dropped = baseline < pending_duration
+            timer_near_zero = baseline <= SESSION_TIMER_RESET_MAX_SECONDS
+            starts_new_session = (
+                timer_dropped
+                and (timer_near_zero or self._resume_saw_selection_menu)
+            ) or (
+                self._resume_saw_selection_menu and timer_near_zero
+            )
+            if starts_new_session:
+                self._session_max_time = seconds
+                self._session_timer_baseline = baseline
+                self._confirm_session()
+                self._finalize_pending_session()
+                # Once a new timer is proven, no delayed predecessor face can
+                # attach to the session that is now actively brushing.
+                self._invalidate_session_display_face_capture()
+                self._resume_timer_baseline = None
+                self._resume_saw_selection_menu = False
+                return
+
+            if baseline < pending_duration:
+                # A slightly lower packet can be delayed predecessor data, not
+                # a reset. Once samples return above the ending timer, require
+                # another forward step before accepting continuation.
+                if seconds > pending_duration:
+                    self._resume_timer_baseline = seconds
+                self._session_max_time = seconds
+                return
+
+            self._merge_pending_session(seconds)
             return
         if confirm_session and not self._session_confirmed:
             previous_baseline = self._session_timer_baseline
@@ -1693,7 +2023,10 @@ class OralBLiveCoordinator:
         )
         self._last_smiley_sample_source = source or self.data.get("data_source")
         pending_generation = self._pending_session_face_generation
-        if pending_generation is not None:
+        if pending_generation is not None and (
+            not self._session_active
+            or self._session_face_generation == pending_generation
+        ):
             self._capture_session_display_face(
                 raw,
                 generation=pending_generation,

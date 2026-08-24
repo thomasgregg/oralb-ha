@@ -717,9 +717,17 @@ wall_start = wall_time_at_rtc_read - (brush_rtc - session_timestamp)
 The wall timestamp is stored with the RTC sample, so a retained record and RTC
 that arrive in separate charger requests still form an accurate pair.
 
-The live stream creates the HA session immediately. A later `FF29` record is
-matched to that session and refines it without increasing `sessions_today`
-twice.
+The live stream constructs the local HA session. Once its logical stop is
+finalized, a later `FF29` record is matched to it and refines it without
+increasing `sessions_today` twice.
+
+A quiet motor edge is provisional for 20 seconds because the handle can enter
+`idle` during a temporary pause without resetting `FF08`. A resume is merged
+when authoritative timer samples continue forward; a coherent reset near zero
+starts a new logical session. Sectors, pressure summaries and the original
+start are retained across merged fragments, while an interim display face is
+discarded. Charger-mode extrapolated ticks are display-only and never decide
+this boundary.
 
 `FF29` belongs to the brush and retains its latest summary. It is not a dump
 of a charger queue and does not contain per-second pressure distribution or

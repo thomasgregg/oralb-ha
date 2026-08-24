@@ -158,6 +158,13 @@ SYNC_RETRY_ATTEMPTS = 4
 # session, so the authoritative record can refine the fallback without
 # incrementing the daily count twice.
 SESSION_RECONCILE_WINDOW_SECONDS = 2 * 60
+# A motor stop can be a temporary pause while the handle keeps the same brush
+# timer. Keep the logical session provisional long enough for the slower
+# advertisement path to expose a resume, then finalize a genuine stop.
+SESSION_PAUSE_GRACE_SECONDS = 20.0
+# A selection-menu route can disambiguate two very short sessions whose sparse
+# timer samples overlap. Larger continuing values remain authoritative.
+SESSION_TIMER_RESET_MAX_SECONDS = 5
 # Refresh battery/state at least this often even without a session.
 PERIODIC_SYNC_INTERVAL_SECONDS = 6 * 3600
 # After the immediate settle/retry sequence, retry an unresolved generation
