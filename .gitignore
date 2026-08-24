@@ -3,6 +3,8 @@ __pycache__/
 .ruff_cache/
 .venv-night-light/
 .venv-iosense/
+.venv-test/
+.venv-test-current/
 iosense-night-light-backup-*.json
 iosense-probe-*.json
 

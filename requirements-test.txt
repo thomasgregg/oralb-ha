@@ -1,0 +1,25 @@
+# Home Assistant 2024.4 is the minimum version supported by Oral-B Live.
+# The current suite uses unittest-style tests and only needs HA's runtime
+# dependencies plus pytest as the deterministic runner.
+homeassistant==2024.4.4
+pytest==8.1.1
+
+# Bluetooth constraints from Home Assistant Core's 2024.4.4
+# requirements_all.txt. Home Assistant's wheel leaves these transitive
+# dependencies open-ended, which otherwise lets pip combine the old HA release
+# with incompatible current Bluetooth packages.
+bleak==0.21.1
+bleak-retry-connector==3.5.0
+bluetooth-adapters==0.18.0
+bluetooth-auto-recovery==1.4.0
+bluetooth-data-tools==1.19.0
+habluetooth==2.4.2
+pyserial==3.5
+josepy==1.14.0
+
+# Bleak 0.21's macOS extras allow newer Cocoa bindings that conflict with its
+# own PyObjC <10 constraint. Keep the matching 9.2 family for local macOS runs.
+pyobjc-core==9.2; sys_platform == "darwin"
+pyobjc-framework-Cocoa==9.2; sys_platform == "darwin"
+pyobjc-framework-CoreBluetooth==9.2; sys_platform == "darwin"
+pyobjc-framework-libdispatch==9.2; sys_platform == "darwin"

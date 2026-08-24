@@ -1,0 +1,15 @@
+# Current Home Assistant compatibility lane. Update these pins together when
+# advancing the current-version CI check.
+homeassistant==2026.8.3
+pytest==9.1.1
+
+# Bluetooth constraints from Home Assistant Core's 2026.8.3
+# requirements_all.txt.
+bleak==3.0.2
+bleak-retry-connector==4.6.3
+bluetooth-adapters==2.4.0
+bluetooth-auto-recovery==1.6.4
+bluetooth-data-tools==1.29.18
+habluetooth==6.26.5
+aiousbwatcher==1.1.2
+serialx==1.8.2
