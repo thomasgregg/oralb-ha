@@ -700,7 +700,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             self._attr_extra_state_attributes = {
                 "force": data.get("pressure_force"),
                 "raw": data.get("pressure_raw"),
-                "source": data.get("data_source"),
+                "source": data.get("pressure_source"),
             }
         elif self.entity_description.key == "motor_angle_raw":
             self._attr_extra_state_attributes = {

@@ -38,7 +38,13 @@ def _advertisement(payload: bytes):
     )
 
 
-def _payload(state: int, seconds: int, sector: int = 1, face: int = 0) -> bytes:
+def _payload(
+    state: int,
+    seconds: int,
+    sector: int = 1,
+    face: int = 0,
+    pressure: int = 0x72,
+) -> bytes:
     """Build a protocol 6 advertisement carrying a state and a timer."""
     return bytes(
         [
@@ -46,7 +52,7 @@ def _payload(state: int, seconds: int, sector: int = 1, face: int = 0) -> bytes:
             0x31,  # model type
             0x32,  # firmware
             state,
-            0x72,  # pressure
+            pressure,  # pressure/status flags
             seconds // 256,
             seconds % 256,
             0x00,  # mode
@@ -60,10 +66,10 @@ def _payload(state: int, seconds: int, sector: int = 1, face: int = 0) -> bytes:
 class PassiveSessionDurationTests(unittest.TestCase):
     """The recorded duration has to match what the brush displayed."""
 
-    def _coordinator(self):
+    def _coordinator(self, mode: str = const.CONNECTION_MODE_CHARGER):
         coordinator.async_dispatcher_send = lambda *args, **kwargs: None
         c = coordinator.OralBLiveCoordinator(
-            MagicMock(), "AA:BB:CC:DD:EE:FF", "test", const.CONNECTION_MODE_CHARGER
+            MagicMock(), "AA:BB:CC:DD:EE:FF", "test", mode
         )
         c._maybe_schedule_sync = lambda *args, **kwargs: None
         c._schedule_connect = lambda *args, **kwargs: None
@@ -94,6 +100,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
 
     def test_pressure_sample_exposes_raw_motor_diagnostics(self) -> None:
         c = self._coordinator()
+        c._apply_state(const.RUNNING_STATE)
         c._apply_pressure(
             bytes.fromhex("01 34 12 78 56 bc 9a f0 de aa"),
             const.DATA_SOURCE_CHARGER,
@@ -110,6 +117,91 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertIsNone(c.data["pressure_force"])
         self.assertIsNone(c.data["motor_angle_raw"])
         self.assertIsNone(c.data["motor_target_raw"])
+
+    def test_idle_pressure_is_unknown_across_source_changes(self) -> None:
+        """Reconnects cannot turn an untouched handle into a pressure reading."""
+        c = self._coordinator()
+
+        c._parse_advertisement(_advertisement(_payload(2, 0, pressure=0x72)))
+        self.assertIsNone(c.data["pressure"])
+        self.assertIsNone(c.data["pressure_raw"])
+        self.assertIsNone(c.data["pressure_source"])
+
+        c._apply_pressure(bytes([0]), const.DATA_SOURCE_DIRECT)
+        self.assertIsNone(c.data["pressure"])
+        self.assertIsNone(c.data["pressure_raw"])
+        self.assertIsNone(c.data["pressure_source"])
+
+        c._parse_advertisement(_advertisement(_payload(2, 0, pressure=0x52)))
+        self.assertIsNone(c.data["pressure"])
+        self.assertIsNone(c.data["pressure_raw"])
+        self.assertIsNone(c.data["pressure_source"])
+        self.assertIsNone(c.data["last_session_duration"])
+
+    def test_active_advertisement_pressure_uses_status_high_bit(self) -> None:
+        """Normal, button-only and high-bit advertisement values stay distinct."""
+        c = self._coordinator()
+
+        c._parse_advertisement(_advertisement(_payload(3, 1, pressure=0x72)))
+        self.assertEqual(c.data["pressure"], "normal")
+        self.assertEqual(c.data["pressure_raw"], "72")
+        self.assertEqual(c.data["pressure_source"], const.DATA_SOURCE_ADVERTISEMENT)
+
+        c._parse_advertisement(_advertisement(_payload(3, 2, pressure=0x38)))
+        self.assertEqual(c.data["pressure"], "normal")
+
+        c._parse_advertisement(_advertisement(_payload(3, 3, pressure=0xF2)))
+        self.assertEqual(c.data["pressure"], "high")
+
+    def test_ending_session_clears_pressure_after_accounting(self) -> None:
+        """The quiet edge clears live pressure without inventing a low event."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 20, pressure=0x72)))
+        c._parse_advertisement(_advertisement(_payload(2, 21, pressure=0x72)))
+
+        self.assertIsNone(c.data["pressure"])
+        self.assertIsNone(c.data["pressure_source"])
+        self.assertEqual(c.data["last_session_low_pressure"], 0)
+        self.assertEqual(c.data["last_session_high_pressure"], 0)
+
+    def test_cached_advertisement_does_not_restore_transient_pressure(self) -> None:
+        """A startup cache may seed identity but never live contact feedback."""
+        c = self._coordinator()
+        c._parse_advertisement(
+            _advertisement(_payload(3, 20, pressure=0xF2)), track_session=False
+        )
+
+        self.assertIsNone(c.data["pressure"])
+        self.assertIsNone(c.data["pressure_raw"])
+        self.assertIsNone(c.data["pressure_source"])
+
+    def test_selection_menu_can_carry_passive_session_pressure(self) -> None:
+        """Firmware using selection_menu for brushing keeps pressure active."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(8, 0, pressure=0xF2)))
+
+        self.assertEqual(c.data["pressure"], "high")
+        self.assertEqual(c.data["pressure_source"], const.DATA_SOURCE_ADVERTISEMENT)
+
+    def test_direct_mode_requires_running_for_pressure(self) -> None:
+        """Direct selection_menu is not the passive firmware brushing quirk."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        c._parse_advertisement(_advertisement(_payload(8, 0, pressure=0xF2)))
+        self.assertIsNone(c.data["pressure"])
+
+        c._parse_advertisement(_advertisement(_payload(3, 1, pressure=0xF2)))
+        self.assertEqual(c.data["pressure"], "high")
+
+        for raw, expected in ((0, "low"), (1, "normal"), (2, "high")):
+            with self.subTest(raw=raw):
+                c._apply_pressure(bytes([raw]), const.DATA_SOURCE_DIRECT)
+                self.assertEqual(c.data["pressure"], expected)
+                self.assertEqual(c.data["pressure_source"], const.DATA_SOURCE_DIRECT)
+
+        c._apply_state(2)
+        self.assertIsNone(c.data["pressure"])
+        self.assertIsNone(c.data["pressure_source"])
 
     def test_ending_advertisement_keeps_face_with_session(self) -> None:
         """The result face belongs to the session that just ended."""

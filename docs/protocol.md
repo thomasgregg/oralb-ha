@@ -270,6 +270,14 @@ Advertisements provide the passive fallback and are the data source used by
 Home Assistant's built-in Oral-B integration. They are unavailable while any
 client owns the toothbrush connection slot.
 
+Byte 4 is a status bit field, not an enum. Bit 7 (`0x80`) indicates high
+pressure, bit 2 (`0x04`) indicates the mode button and bit 3 (`0x08`) indicates
+the power button. The remaining bits vary with other handle state. Button bits
+do not change Oral-B Live's pressure reading: while brushing, bit 7 clear is
+`normal` and bit 7 set is `high`. Advertisements have no distinct equivalent
+of FF0B state `0` (`low`), so pressure remains `unknown` outside an active
+session rather than turning an idle status byte into a brushing measurement.
+
 The display face is decoded as `(payload[8] & 0x38) >> 3` and uses the same
 numbering as `FF0A`: `0` is `off`, `1` is `standard` and `2..7` are
 `special_2` through `special_7`. The three-bit advertisement field cannot

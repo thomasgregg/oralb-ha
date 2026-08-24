@@ -121,6 +121,19 @@ def parse_pressure_sample(
     }
 
 
+def decode_advertisement_pressure(status: int) -> str:
+    """Decode pressure from advertisement byte 4 during active brushing.
+
+    The byte is a status bit field rather than an enum. Bit 7 is the
+    high-pressure flag; bits 2 and 3 are button flags and do not change the
+    pressure reading. Advertisements do not carry FF0B's distinct low-pressure
+    state, so a clear high-pressure flag means normal only while brushing.
+    """
+    if not 0 <= status <= 0xFF:
+        raise ValueError("advertisement pressure/status must contain one byte")
+    return "high" if status & 0x80 else "normal"
+
+
 def oscillation_angle_degrees(raw_value: int | None) -> float | None:
     """Convert the captured centidegree oscillation-angle word to degrees."""
     return raw_value / 100 if raw_value is not None else None

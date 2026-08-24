@@ -95,6 +95,23 @@ class ProtocolDecoderTests(unittest.TestCase):
         )
         self.assertEqual(protocol.parse_pressure_sample(b""), {})
 
+    def test_advertisement_pressure_uses_high_bit(self) -> None:
+        """Advertisement byte 4 is a bit field, not a lookup or nibble."""
+        for status in (0x30, 0x32, 0x38, 0x3A, 0x52, 0x72):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    "normal", protocol.decode_advertisement_pressure(status)
+                )
+
+        for status in (0x90, 0x92, 0xB2, 0xF0, 0xF2):
+            with self.subTest(status=status):
+                self.assertEqual("high", protocol.decode_advertisement_pressure(status))
+
+    def test_advertisement_pressure_rejects_non_byte_values(self) -> None:
+        for status in (-1, 0x100):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                protocol.decode_advertisement_pressure(status)
+
     def test_oscillation_angle_centidegrees(self) -> None:
         self.assertEqual(protocol.oscillation_angle_degrees(2800), 28.0)
         self.assertEqual(protocol.oscillation_angle_degrees(1649), 16.49)

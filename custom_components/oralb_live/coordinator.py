@@ -77,7 +77,6 @@ from .const import (
     ORALB_MANUFACTURER_ID,
     PASSIVE_SESSION_ACTIVE_STATES,
     PERIODIC_SYNC_INTERVAL_SECONDS,
-    PRESSURE_FROM_ADV,
     PRESSURE_STATES,
     RECONNECT_INTERVAL_SECONDS,
     REFILL_STATES,
@@ -106,6 +105,7 @@ from .const import (
 from .protocol import (
     advance_pacer_progress,
     advance_session_timer_evidence,
+    decode_advertisement_pressure,
     decode_display_face,
     decode_ff09_sector,
     decode_sector,
@@ -142,6 +142,7 @@ class OralBLiveCoordinator:
             "time": None,
             "pressure": None,
             "pressure_raw": None,
+            "pressure_source": None,
             "mode": None,
             "mode_raw": None,
             "available_modes": None,
@@ -363,9 +364,6 @@ class OralBLiveCoordinator:
             self.data["time"] = _decode_time(
                 payload[ADV_IDX_TIME_HI], payload[ADV_IDX_TIME_LO]
             )
-            self.data["pressure"] = PRESSURE_FROM_ADV.get(
-                payload[ADV_IDX_PRESSURE], "normal"
-            )
             # The advertisement that first reports a quiet state still carries
             # the timer of the session that just ended, and it is the highest
             # value the brush ever shows for it. Sampled after _apply_state it
@@ -377,13 +375,15 @@ class OralBLiveCoordinator:
             self._track_session_time(self.data["time"], confirm_session=track_session)
         self._apply_state(state_raw, track_session=track_session)
         if not adv_live:
+            self._apply_advertisement_pressure(
+                payload[ADV_IDX_PRESSURE], current=track_session
+            )
             # The other side of the same transition: a session that begins with
             # this advertisement was not active when the sample above was
             # offered, so its first value needs the second chance. Repeating it
             # is safe - the tracker keeps a maximum, and the timer evidence it
             # collects only ever counts a value that moved forward.
             self._track_session_time(self.data["time"], confirm_session=track_session)
-            self._track_session_pressure(self.data["pressure"])
             self._apply_mode(payload[ADV_IDX_MODE])
             self._apply_smiley(
                 bytes((decode_display_face(payload[ADV_IDX_SECTOR]),)),
@@ -1144,6 +1144,13 @@ class OralBLiveCoordinator:
             self.data["sector_timer"] = None
             self._pacer_anchor = None
 
+        if not self._is_pressure_active_state(raw):
+            # Pressure is transient contact feedback, not a retained handle
+            # property. Clear it after session accounting has consumed the
+            # final sample so an untouched brush never reports a brushing
+            # judgement merely because its transport changed.
+            self._clear_pressure()
+
         if (
             track_session
             and self.mode != CONNECTION_MODE_LIVE
@@ -1160,6 +1167,13 @@ class OralBLiveCoordinator:
                 self.data["state"],
             )
         return session_recorded
+
+    def _is_pressure_active_state(self, raw: int | None = None) -> bool:
+        """Return whether pressure is meaningful in the current brush state."""
+        state_raw = self.data.get("state_raw") if raw is None else raw
+        if self.mode == CONNECTION_MODE_LIVE:
+            return state_raw == RUNNING_STATE
+        return state_raw in PASSIVE_SESSION_ACTIVE_STATES
 
     # ---------------------------------------------------------- sessions
     def _cancel_session_display_face_read(self) -> None:
@@ -1685,6 +1699,11 @@ class OralBLiveCoordinator:
         """Apply a native FF0B sample from either a direct or bridge path."""
         if not payload:
             return
+        if source:
+            self.data["data_source"] = source
+        if not self._is_pressure_active_state():
+            self._clear_pressure()
+            return
         raw = bytes(payload)
         parsed = parse_pressure_sample(raw)
         self.data["pressure_raw"] = raw.hex()
@@ -1695,9 +1714,30 @@ class OralBLiveCoordinator:
         self.data["pressure_force"] = parsed["pressure_force"]
         self.data["motor_angle_raw"] = parsed["motor_angle_raw"]
         self.data["motor_target_raw"] = parsed["motor_target_raw"]
-        if source:
-            self.data["data_source"] = source
+        self.data["pressure_source"] = source or self.data.get("data_source")
         self._track_session_pressure(self.data["pressure"], self.data["pressure_force"])
+
+    def _apply_advertisement_pressure(self, status: int, *, current: bool) -> None:
+        """Apply active contact feedback from advertisement status byte 4."""
+        if not current or not self._is_pressure_active_state():
+            self._clear_pressure()
+            return
+        self.data["pressure"] = decode_advertisement_pressure(status)
+        self.data["pressure_raw"] = f"{status:02x}"
+        self.data["pressure_source"] = DATA_SOURCE_ADVERTISEMENT
+        self.data["pressure_force"] = None
+        self.data["motor_angle_raw"] = None
+        self.data["motor_target_raw"] = None
+        self._track_session_pressure(self.data["pressure"])
+
+    def _clear_pressure(self) -> None:
+        """Clear transient pressure and source-specific live diagnostics."""
+        self.data["pressure"] = None
+        self.data["pressure_raw"] = None
+        self.data["pressure_source"] = None
+        self.data["pressure_force"] = None
+        self.data["motor_angle_raw"] = None
+        self.data["motor_target_raw"] = None
 
     # ------------------------------------------------------------- teardown
     async def _reconnect_loop(self) -> None:

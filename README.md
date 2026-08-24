@@ -181,7 +181,7 @@ reconciliation.
 | --- | --- |
 | Toothbrush state | `idle`, `running`, `charging`, `selection_menu`, summaries and diagnostic states |
 | Time | Current brushing duration; locally advanced between charger timer anchors |
-| Pressure | `low`, `normal` or `high`; direct and charger-forwarded reads also expose raw force as an attribute when available |
+| Pressure | `low`, `normal` or `high` while actively brushing and `unknown` otherwise; direct and charger-forwarded reads also expose raw force as an attribute when available |
 | Drive diagnostics | Brush-head oscillation angle in degrees and a raw unitless drive-target word from direct or charger-forwarded pressure samples; useful for observing mode waveforms and pressure reduction and disabled by default |
 | Mode | Daily clean, sensitive, gum care, whiten, intense, super sensitive, tongue clean, Smart Adapt, gentle white and supported unknown values |
 | Pacer sector | Current sequential pacer interval (`sector_1` … `sector_8`), advanced locally from the configured schedule and corrected by the brush |
@@ -205,6 +205,12 @@ The **Pacer sector timer** counts elapsed seconds within that pacer sector. In
 charger/app-compatible mode both pacer entities advance locally at 1 Hz from
 the brush's configured schedule, while regular brush reads correct them to the
 toothbrush's authoritative state.
+
+The **Pressure** entity is transient contact feedback rather than a retained
+handle property. It is `unknown` while the brush is idle, charging or showing
+a summary. Direct and charger-forwarded `FF0B` samples distinguish low, normal
+and high pressure during brushing. Passive advertisements distinguish normal
+from high pressure but do not carry a separate active low-pressure state.
 
 The **Smiley** entity follows the face currently shown by the brush. Passive
 advertisements carry faces `off` through `special_7`; direct FF0A notifications

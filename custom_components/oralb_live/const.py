@@ -287,13 +287,6 @@ PRESSURE_STATES: dict[int, str] = {
     2: "high",
 }
 
-PRESSURE_FROM_ADV: dict[int, str] = {
-    0x30: "normal",
-    0x32: "normal",
-    0x38: "high",
-    0x3A: "high",
-}
-
 SIGNAL_UPDATE = f"{DOMAIN}_update"
 SIGNAL_CHARGER_DISCOVERED = f"{DOMAIN}_charger_discovered"
 SIGNAL_CHARGER_UPDATE = f"{DOMAIN}_charger_update"
