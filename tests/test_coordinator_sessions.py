@@ -21,12 +21,13 @@ _PACKAGE = types.ModuleType("oralb_live")
 _PACKAGE.__path__ = [str(COMPONENT_PATH)]
 sys.modules.setdefault("oralb_live", _PACKAGE)
 
-try:
-    const = importlib.import_module("oralb_live.const")
-    coordinator = importlib.import_module("oralb_live.coordinator")
-    sensor = importlib.import_module("oralb_live.sensor")
-except ImportError as err:  # pragma: no cover - environment without HA
-    raise unittest.SkipTest(f"Home Assistant is not importable: {err}") from err
+# These imports intentionally fail collection when the Home Assistant test
+# dependencies are absent. Silently skipping this module would hide the
+# integration's coordinator, session and restore regressions behind a green
+# test run.
+const = importlib.import_module("oralb_live.const")
+coordinator = importlib.import_module("oralb_live.coordinator")
+sensor = importlib.import_module("oralb_live.sensor")
 
 
 def _advertisement(payload: bytes):
