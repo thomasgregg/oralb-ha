@@ -1828,7 +1828,10 @@ class OralBLiveCoordinator:
             self._session_pressure_state_started = observed
         elif self._session_pressure_state_started is None:
             self._session_pressure_state_started = observed
-        if force is not None:
+        # FF0B can report a short negative settling transient when the motor
+        # starts. Keep tracking its pressure state, but do not let a value
+        # that is not applied brushing force distort the session summary.
+        if force is not None and force >= 0:
             self._session_pressure_force_total += force
             self._session_pressure_force_samples += 1
             self._session_pressure_force_max = (

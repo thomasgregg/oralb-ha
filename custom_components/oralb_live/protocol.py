@@ -102,7 +102,8 @@ def parse_pressure_sample(
     The historical keys follow the vendor model's motor-field names. The first
     word behaves as brush-head oscillation angle in hundredths of a degree;
     the second drive-target word's encoding remains unknown. The wire values
-    stay available under their historical raw keys.
+    stay available under their historical raw keys. The force word is signed
+    and can briefly dip below zero while the motor settles at startup.
     """
     if not payload:
         return {}
@@ -110,7 +111,9 @@ def parse_pressure_sample(
     return {
         "pressure_state_raw": payload[0],
         "pressure_force": (
-            int.from_bytes(payload[3:5], "little") if len(payload) >= 5 else None
+            int.from_bytes(payload[3:5], "little", signed=True)
+            if len(payload) >= 5
+            else None
         ),
         "motor_angle_raw": (
             int.from_bytes(payload[5:7], "little") if len(payload) >= 7 else None
