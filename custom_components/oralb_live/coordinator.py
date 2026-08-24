@@ -1171,9 +1171,19 @@ class OralBLiveCoordinator:
     def _is_pressure_active_state(self, raw: int | None = None) -> bool:
         """Return whether pressure is meaningful in the current brush state."""
         state_raw = self.data.get("state_raw") if raw is None else raw
+        if state_raw == RUNNING_STATE:
+            return True
         if self.mode == CONNECTION_MODE_LIVE:
-            return state_raw == RUNNING_STATE
-        return state_raw in PASSIVE_SESSION_ACTIVE_STATES
+            return False
+        # Some passive firmware remains in selection_menu while its motor is
+        # running, but an ordinary mode-button press uses the same state. Only
+        # expose pressure after forward timer progress has confirmed that the
+        # provisional menu observation is a real brushing session.
+        return (
+            state_raw in PASSIVE_SESSION_ACTIVE_STATES
+            and self._session_active
+            and self._session_confirmed
+        )
 
     # ---------------------------------------------------------- sessions
     def _cancel_session_display_face_read(self) -> None:

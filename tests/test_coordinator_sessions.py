@@ -176,12 +176,27 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertIsNone(c.data["pressure_raw"])
         self.assertIsNone(c.data["pressure_source"])
 
-    def test_selection_menu_can_carry_passive_session_pressure(self) -> None:
-        """Firmware using selection_menu for brushing keeps pressure active."""
+    def test_selection_menu_pressure_waits_for_session_confirmation(self) -> None:
+        """An idle mode-button press cannot become retained normal pressure."""
         c = self._coordinator()
         c._parse_advertisement(_advertisement(_payload(8, 0, pressure=0xF2)))
+        c._parse_advertisement(_advertisement(_payload(8, 0, pressure=0x72)))
 
+        self.assertIsNone(c.data["pressure"])
+        self.assertIsNone(c.data["pressure_raw"])
+        self.assertIsNone(c.data["pressure_source"])
+        self.assertTrue(c._session_active)
+        self.assertFalse(c._session_confirmed)
+
+    def test_confirmed_selection_menu_session_carries_pressure(self) -> None:
+        """Timer progress enables pressure for firmware that stays in its menu."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(8, 0, pressure=0x72)))
+        c._parse_advertisement(_advertisement(_payload(8, 1, pressure=0xF2)))
+
+        self.assertTrue(c._session_confirmed)
         self.assertEqual(c.data["pressure"], "high")
+        self.assertEqual(c.data["pressure_raw"], "f2")
         self.assertEqual(c.data["pressure_source"], const.DATA_SOURCE_ADVERTISEMENT)
 
     def test_direct_mode_requires_running_for_pressure(self) -> None:
