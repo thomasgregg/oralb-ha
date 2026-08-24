@@ -180,9 +180,9 @@ SESSION_DISPLAY_FACE_PRE_END_GRACE_SECONDS = 2.0
 # sessions. Read without releasing the brush slot, then retry briefly while the
 # result would still be on the handle display.
 SESSION_DISPLAY_FACE_READ_RETRY_DELAYS = (0.0, 0.5, 1.0, 2.0)
-# 0 is display-off and 1 is the everyday/standard face. Neither is a brushing
-# verdict; only special and unknown future result values belong to a session.
-SESSION_DISPLAY_FACE_RESULT_MIN_RAW = 2
+# 0 is display-off and means no result was exposed. Raw 1 ("standard") is the
+# lowest brushing verdict; higher and unknown future values are verdicts too.
+SESSION_DISPLAY_FACE_RESULT_MIN_RAW = 1
 
 STORAGE_VERSION = 1
 

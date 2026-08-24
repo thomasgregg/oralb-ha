@@ -1228,7 +1228,7 @@ class OralBLiveCoordinator:
         )
 
         # Notifications from different GATT characteristics have no ordering
-        # guarantee. Accept a special face sampled just before the quiet-state
+        # guarantee. Accept a result face sampled just before the quiet-state
         # edge, but only if it was observed during this exact session.
         if (
             self._last_smiley_sample_raw is not None

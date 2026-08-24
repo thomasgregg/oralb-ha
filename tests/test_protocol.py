@@ -95,6 +95,11 @@ class ProtocolDecoderTests(unittest.TestCase):
         )
         self.assertEqual(protocol.parse_pressure_sample(b""), {})
 
+    def test_oscillation_angle_centidegrees(self) -> None:
+        self.assertEqual(protocol.oscillation_angle_degrees(2800), 28.0)
+        self.assertEqual(protocol.oscillation_angle_degrees(1649), 16.49)
+        self.assertIsNone(protocol.oscillation_angle_degrees(None))
+
     def test_device_info(self) -> None:
         self.assertEqual(
             protocol.parse_device_info(bytes.fromhex("36 08 52")),

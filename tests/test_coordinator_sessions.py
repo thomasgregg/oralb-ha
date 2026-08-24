@@ -129,6 +129,15 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertEqual(c.data["smiley"], "off")
         self.assertIsNone(c.data["last_session_display_face"])
 
+    def test_ending_advertisement_keeps_standard_result_with_session(self) -> None:
+        """Raw face 1 is the lowest verdict, not an unavailable placeholder."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 20, face=0)))
+        c._parse_advertisement(_advertisement(_payload(2, 21, face=1)))
+
+        self.assertEqual(c.data["smiley"], "standard")
+        self.assertEqual(c.data["last_session_display_face"], "standard")
+
     def test_result_on_next_quiet_advertisement_is_still_captured(self) -> None:
         """The result may appear one packet after the state-ending packet."""
         c = self._coordinator()
@@ -375,15 +384,30 @@ class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
         self.assertEqual(c.data["smiley"], "off")
         self.assertIsNone(c.data["last_session_display_face"])
 
-    def test_standard_face_is_not_used_as_a_session_placeholder(self) -> None:
-        """The everyday face means no verdict was captured for the recap."""
+    def test_direct_standard_notification_is_attached_to_completed_session(
+        self,
+    ) -> None:
+        """A directly notified raw face 1 is a genuine low-score verdict."""
         c = self._coordinator(const.CONNECTION_MODE_LIVE)
 
         self._complete_session(c)
         self._notify(c, const.CHAR_SMILEY, b"\x01")
 
         self.assertEqual(c.data["smiley"], "standard")
-        self.assertIsNone(c.data["last_session_display_face"])
+        self.assertEqual(c.data["last_session_display_face"], "standard")
+
+    def test_standard_notification_just_before_idle_is_still_correlated(self) -> None:
+        """Raw face 1 follows the same cross-character ordering rules as higher faces."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        with patch.object(coordinator.time, "monotonic", return_value=100.0):
+            self._notify(c, const.CHAR_STATE, bytes((const.RUNNING_STATE,)))
+            self._notify(c, const.CHAR_BRUSH_TIME, b"\x00\x15")
+            self._notify(c, const.CHAR_SMILEY, b"\x01")
+        with patch.object(coordinator.time, "monotonic", return_value=101.0):
+            self._notify(c, const.CHAR_STATE, b"\x02")
+
+        self.assertEqual(c.data["last_session_display_face"], "standard")
 
     def test_result_notification_just_before_idle_is_still_correlated(self) -> None:
         """FF0A and FF04 ordering cannot decide whether the result is kept."""
@@ -423,6 +447,18 @@ class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
         self.assertEqual(c.data["smiley"], "off")
         self.assertEqual(c.data["last_session_display_face"], "special_3")
 
+    def test_standard_result_is_frozen_against_later_display_changes(self) -> None:
+        """The lowest verdict has the same immutability as every higher result."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        self._complete_session(c)
+        self._notify(c, const.CHAR_SMILEY, b"\x01")
+        self._notify(c, const.CHAR_SMILEY, b"\x03")
+        self._notify(c, const.CHAR_SMILEY, b"\x00")
+
+        self.assertEqual(c.data["smiley"], "off")
+        self.assertEqual(c.data["last_session_display_face"], "standard")
+
     def test_result_after_capture_window_is_not_attached(self) -> None:
         """A later menu face must not leak into the completed session."""
         c = self._coordinator(const.CONNECTION_MODE_LIVE)
@@ -439,6 +475,24 @@ class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
             self._notify(c, const.CHAR_SMILEY, b"\x05")
 
         self.assertEqual(c.data["smiley"], "special_5")
+        self.assertIsNone(c.data["last_session_display_face"])
+
+    def test_standard_after_capture_window_is_not_attached(self) -> None:
+        """Accepting raw face 1 must not weaken the bounded-session guard."""
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+
+        with patch.object(coordinator.time, "monotonic", return_value=100.0):
+            self._complete_session(c)
+        with patch.object(
+            coordinator.time,
+            "monotonic",
+            return_value=(
+                100.0 + const.SESSION_DISPLAY_FACE_CAPTURE_WINDOW_SECONDS + 0.1
+            ),
+        ):
+            self._notify(c, const.CHAR_SMILEY, b"\x01")
+
+        self.assertEqual(c.data["smiley"], "standard")
         self.assertIsNone(c.data["last_session_display_face"])
 
     def test_new_session_invalidates_previous_capture_window(self) -> None:
@@ -462,6 +516,18 @@ class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
 
         self.assertEqual(c.data["smiley"], "special_4")
         self.assertEqual(c.data["last_session_display_face"], "special_4")
+
+    def test_charger_forwarded_standard_is_attached_to_completed_session(self) -> None:
+        """The iO Sense path must retain raw face 1 as a valid verdict."""
+        c = self._coordinator(const.CONNECTION_MODE_CHARGER)
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(21, confirm_session=True)
+        c._apply_state(2)
+
+        asyncio.run(c._async_apply_charger_passthrough("FF0A", b"\x01"))
+
+        self.assertEqual(c.data["smiley"], "standard")
+        self.assertEqual(c.data["last_session_display_face"], "standard")
 
 
 class ConnectedSessionDisplayFaceReadTests(unittest.IsolatedAsyncioTestCase):
@@ -517,8 +583,8 @@ class ConnectedSessionDisplayFaceReadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.data["last_session_display_face"], "special_3")
         client.disconnect.assert_not_awaited()
 
-    async def test_failed_and_non_result_reads_leave_literal_null(self) -> None:
-        """Retry exhaustion is expected unavailability, not a fabricated face."""
+    async def test_reads_retry_from_off_to_standard_result(self) -> None:
+        """A later raw face 1 read ends retries and supplies the session verdict."""
         c, tasks = self._coordinator()
         client = MagicMock()
         client.is_connected = True
@@ -536,6 +602,28 @@ class ConnectedSessionDisplayFaceReadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.read_gatt_char.await_count, 3)
         self.assertEqual(c.data["smiley"], "standard")
+        self.assertEqual(c.data["last_session_display_face"], "standard")
+        client.disconnect.assert_not_awaited()
+
+    async def test_failed_and_off_reads_leave_literal_null(self) -> None:
+        """Errors and display-off still mean honest result unavailability."""
+        c, tasks = self._coordinator()
+        client = MagicMock()
+        client.is_connected = True
+        client.read_gatt_char = AsyncMock(
+            side_effect=(coordinator.BleakError("missed"), b"\x00", b"\x00")
+        )
+        client.disconnect = AsyncMock()
+        c._client = client
+
+        with patch.object(
+            coordinator, "SESSION_DISPLAY_FACE_READ_RETRY_DELAYS", (0.0, 0.0, 0.0)
+        ):
+            self._complete_session(c)
+            await tasks[-1]
+
+        self.assertEqual(client.read_gatt_char.await_count, 3)
+        self.assertEqual(c.data["smiley"], "off")
         self.assertIsNone(c.data["last_session_display_face"])
         client.disconnect.assert_not_awaited()
 

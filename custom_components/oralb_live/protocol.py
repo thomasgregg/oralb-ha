@@ -97,10 +97,12 @@ def parse_battery_status(
 def parse_pressure_sample(
     payload: bytes | bytearray,
 ) -> dict[str, int | None]:
-    """Decode the length-gated fields in an FF0B pressure/motor sample.
+    """Decode the length-gated fields in an FF0B pressure/drive sample.
 
-    The motor words are intentionally kept as raw unsigned integers. Their
-    units and relationship to the brush's operating modes are not yet known.
+    The historical keys follow the vendor model's motor-field names. The first
+    word behaves as brush-head oscillation angle in hundredths of a degree;
+    the second drive-target word's encoding remains unknown. The wire values
+    stay available under their historical raw keys.
     """
     if not payload:
         return {}
@@ -117,6 +119,11 @@ def parse_pressure_sample(
             int.from_bytes(payload[7:9], "little") if len(payload) >= 9 else None
         ),
     }
+
+
+def oscillation_angle_degrees(raw_value: int | None) -> float | None:
+    """Convert the captured centidegree oscillation-angle word to degrees."""
+    return raw_value / 100 if raw_value is not None else None
 
 
 def parse_device_info(payload: bytes | bytearray) -> dict[str, int]:

@@ -86,7 +86,7 @@ The primary brush service is:
 | `FF08` | notify, read | Brushing timer as `[minutes, seconds]`, normally 1 Hz while running |
 | `FF09` | notify, read | Sequential pacer sector, elapsed interval seconds and configured sector count |
 | `FF0A` | notify, read | Smiley/display face |
-| `FF0B` | notify, read | Pressure state and, on protocol 8/9, pressure/motor fields |
+| `FF0B` | notify, read | Pressure state and, on protocol 8/9, pressure/drive fields |
 | `FF0C` | read, write, notify | Authentication-gated cache; not used |
 | `FF0D` | notify, read | Motion and gyroscope data, approximately 30 Hz |
 | `FF0E` | notify | Configurable batched motion/gyroscope dashboard stream |
@@ -158,7 +158,8 @@ their bytes are present.
 
 `FF06` is the button characteristic, not pressure. Pressure is `FF0B`; its
 first byte is `0` low, `1` normal or `2` high. A captured protocol-8/9 payload
-also contains a timestamp, force, motor angle, motor target and identifier.
+also contains a timestamp, force, oscillation-angle word, drive-target word and
+identifier.
 Oral-B Live exposes the pressure state and, when the longer payload is
 available, raw force as an attribute for both direct and charger-forwarded
 `FF0B` values. A direct `FF06` read during hard brushing returned `00 00 00 00`;
@@ -174,7 +175,10 @@ The recognized `FF0A` display-face values are:
 | `2..11` | `special_2` through `special_11` |
 
 Values through `special_10` were confirmed in captured charger-forwarded
-reads. Unknown future values remain visible as their raw face number.
+reads. Raw `0` means that the display is off and is not a session verdict. Raw
+`1` (`standard`) is the lowest, frowning result on the observed handles and is
+retained as a valid completed-session verdict. Unknown future values remain
+visible as their raw face number.
 
 `FF08` is elapsed time for the active brushing session. It is unrelated to the
 estimated battery runtime carried by `FF05`.
@@ -465,7 +469,7 @@ not force the charger to establish that private connection.
 | `FF08` | timer | `[minutes, seconds]` confirmed live |
 | `FF09` | pacer sector | zero-based interval ID, elapsed sector timer and configured count confirmed live |
 | `FF0A` | brush display face/smiley | values through `special_10` confirmed |
-| `FF0B` | pressure/motor | pressure state, timestamp, force and motor fields confirmed live |
+| `FF0B` | pressure/drive | pressure state, timestamp, force and drive fields confirmed live |
 | `FF0D` | motion | timestamped motion and gyroscope snapshots confirmed; local research tooling demonstrated the inference pipeline described above |
 | `FF22` | brush real-time clock | confirmed |
 | `FF25` | available modes | confirmed |
@@ -552,16 +556,75 @@ The observed protocol-8/9 payload is length-gated and little-endian:
 | `0` | pressure state | unsigned byte |
 | `1..2` | timestamp | unsigned 16-bit raw value |
 | `3..4` | force | unsigned 16-bit raw value |
-| `5..6` | motor angle | unsigned 16-bit raw value |
-| `7..8` | motor target | unsigned 16-bit raw value |
+| `5..6` | oscillation angle | unsigned 16-bit raw value |
+| `7..8` | drive target | unsigned 16-bit raw value |
 | `9` | identifier | unsigned byte |
 
 The integration exposes the captured force word as a Pressure attribute. It
-also exposes the angle and target words as disabled-by-default diagnostic
-sensors named **Motor angle (raw)** and **Motor target (raw)**. Both are
-deliberately unitless: their scale and relationship to brushing modes have not
-yet been validated across models or firmware, so they are not presented as an
-intensity setting.
+also exposes the two drive words as disabled-by-default diagnostic sensors
+named **Oscillation angle** (degrees) and **Drive target (raw)** (unitless).
+Their historical entity keys remain `motor_angle_raw` and `motor_target_raw` so
+existing entity IDs, dashboards and automations do not break. Unitless angle
+samples recorded by version 0.7.32 remain as their original raw values in
+recorder history; new samples are recorded in degrees.
+
+The first word is not handle orientation. On the tested brush it matches
+published iO brush-head oscillation angles after division by 100: for example,
+Daily Clean reports `2800` against a published `28°`, Sensitive reports `2000`
+against `20°`, and Intense reports `3300` against `33°`. Gum Care's alternating
+word and Whiten's varying word also match their published angle ranges. This is
+strong evidence for a centidegree encoding. The integration divides the raw
+word by 100 and exposes the result in degrees; the original word remains
+available as the sensor's `raw` attribute.
+
+The second word is related to the drive operating point, but its physical
+meaning and unit remain unresolved. The reconstructed vendor model calls the
+field a motor target; **Drive target (raw)** preserves that limited knowledge
+without claiming it is speed, frequency or amplitude.
+
+References:
+
+- [Electric Teeth's mode measurements](https://www.electricteeth.com/uk/oral-b-cleaning-modes-explained/)
+  list iO oscillation angles that closely match the captured first word after
+  division by 100.
+- [The iO development paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC9379190/)
+  explains that excessive pressure makes the variable-speed drive reduce the
+  oscillation angle and operate in Sensitive mode.
+
+#### Observed drive behaviour
+
+Controlled captures on the tested protocol-8 iO Series 10 produced the
+following pairs, shown as raw `oscillation angle / drive target`:
+
+| Mode | Low or normal pressure | High pressure | Observed behaviour |
+| --- | --- | --- | --- |
+| Sensitive | `2000 / 3755` | `1600 / 2745` | fixed level, reduced again by pressure protection |
+| Smart Adapt | `2000 / 3755` | `1600 / 2745` | one captured operating point; the adaptive mode may select other levels in other conditions |
+| Daily Clean | `2800 / 5654` | `2000 / 3755` | fixed level with pressure reduction |
+| Intense | `3300 / 6663` | `2000 / 3755` | highest captured fixed level with pressure reduction |
+| Whiten | sampled `1165..3479 / 2353..7027` | sampled `1926..2264 / 3890..4573` | continuously modulated waveform; the ranges are approximately 1 Hz samples, not guaranteed extrema |
+| Gum Care | alternates `1649 / 3330` and `2800 / 5654` | the same two captured pairs | deliberately pulsed waveform |
+| Tongue Clean | `1600 / 3230` | not applicable in the capture | fixed low level; stopped automatically after about 30 seconds |
+
+The steady modes show discrete drive operating points rather than a live
+handle-orientation angle. Excessive pressure steps Sensitive, Daily Clean and Intense
+down to a lower point. Whiten continuously varies both words, while Gum Care
+alternates between two repeatable points. Tongue Clean kept pressure state `0`
+(`low`) even while the force word increased and then stopped automatically, so
+the normal three-state pressure feedback appears inactive in that mode.
+
+The target word is related to, but not redundant with, the oscillation-angle
+word. Tongue Clean and pressure-limited Sensitive can both report angle `1600`
+while reporting different targets (`3230` and `2745`). The two words may encode
+separate drive parameters, but only the first word currently has a strongly
+supported physical interpretation.
+
+At present these entities are useful for protocol research, comparing drive
+waveforms between modes, confirming pressure-triggered drive reduction and
+spotting model or firmware differences. They are not suitable for mouth
+position, brushing score or automation control. Whiten and Gum Care can change
+the values frequently, so enabling the diagnostics also creates relatively
+dense recorder history.
 
 ### Pacer numbering
 
@@ -655,9 +718,9 @@ of a charger queue and does not contain per-second pressure distribution or
 per-zone pressure time. It also has no display-face field, so Oral-B Live keeps
 a transient result delivered by the ending advertisement, direct `FF0A`
 notification/read or charger-forwarded `FF0A` with the matching Home Assistant
-session record. Association is bounded to the completed session: `off` and
-`standard` are not verdicts, a later display change cannot overwrite a captured
-result, and an unavailable result remains `null`.
+session record. Association is bounded to the completed session: `off` is not a
+verdict, `standard` is the lowest valid verdict, a later display change cannot
+overwrite a captured result, and an unavailable result remains `null`.
 
 ### Availability after a session
 

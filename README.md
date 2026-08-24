@@ -182,7 +182,7 @@ reconciliation.
 | Toothbrush state | `idle`, `running`, `charging`, `selection_menu`, summaries and diagnostic states |
 | Time | Current brushing duration; locally advanced between charger timer anchors |
 | Pressure | `low`, `normal` or `high`; direct and charger-forwarded reads also expose raw force as an attribute when available |
-| Motor diagnostics | Raw motor angle and target words from direct or charger-forwarded pressure samples; disabled by default and intentionally unitless |
+| Drive diagnostics | Brush-head oscillation angle in degrees and a raw unitless drive-target word from direct or charger-forwarded pressure samples; useful for observing mode waveforms and pressure reduction and disabled by default |
 | Mode | Daily clean, sensitive, gum care, whiten, intense, super sensitive, tongue clean, Smart Adapt, gentle white and supported unknown values |
 | Pacer sector | Current sequential pacer interval (`sector_1` … `sector_8`), advanced locally from the configured schedule and corrected by the brush |
 | Pacer sector timer | Elapsed seconds in the current pacer interval while brushing; `unknown` outside an active session |
@@ -224,9 +224,14 @@ successful brush read. They remain `unknown` until the charger or direct brush
 connection has returned the corresponding characteristic; Oral-B Live does not
 invent placeholder values for unsupported or not-yet-read fields.
 
-Battery voltage, current and temperature, raw motor angle and target, plus both
-brush-head remainder entities, are disabled by default. Enable them from the
-toothbrush device's entity list if those diagnostics are needed.
+Battery voltage, current and temperature, oscillation angle and raw drive
+target, plus both brush-head remainder entities, are disabled by default. The
+first drive word is converted from hundredths of a degree to degrees; the
+second word's physical meaning remains unresolved. The captured mappings are
+documented in the
+[pressure payload reference](docs/protocol.md#observed-drive-behaviour).
+Enable them from the toothbrush device's entity list if those diagnostics are
+needed.
 
 The **SmartRing color** entity belongs to the toothbrush and is distinct from
 the iO Sense charger's own Ring color entity. Oral-B Live reads the handle's
@@ -265,8 +270,10 @@ event counts and ending battery without creating a second session. The
 captured display face remains attached to that session because `FF29` does not
 contain it. Direct connections also make a few short FF0A reads immediately
 after the session because optional notifications can be missed; the connection
-is retained throughout. If the handle exposes no result, `display_face` remains
-`null` rather than substituting `off`, `standard` or an older session's face.
+is retained throughout. Raw `standard` is the lowest result face and is stored
+like every `special_*` verdict; only `off` means that no result was exposed. If
+the handle supplies only `off` or no usable face, `display_face` remains `null`
+rather than inheriting an older session's face.
 
 ### iO Sense Charger device
 

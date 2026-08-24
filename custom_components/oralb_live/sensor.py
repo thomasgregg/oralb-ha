@@ -17,6 +17,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    DEGREE,
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfElectricCurrent,
@@ -46,6 +47,7 @@ from .const import (
     brush_device_name,
 )
 from .coordinator import OralBLiveCoordinator
+from .protocol import oscillation_angle_degrees
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -83,8 +85,9 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
     OralBSensorDescription(
         key="motor_angle_raw",
         translation_key="motor_angle_raw",
-        name="Motor angle (raw)",
+        name="Oscillation angle",
         data_key="motor_angle_raw",
+        native_unit_of_measurement=DEGREE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
@@ -92,7 +95,7 @@ SENSORS: tuple[OralBSensorDescription, ...] = (
     OralBSensorDescription(
         key="motor_target_raw",
         translation_key="motor_target_raw",
-        name="Motor target (raw)",
+        name="Drive target (raw)",
         data_key="motor_target_raw",
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
@@ -454,9 +457,16 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         self.coordinator = coordinator
         self.entity_description: OralBSensorDescription = description
         self._attr_unique_id = f"{coordinator.address}-{description.key}"
-        self._attr_native_value = coordinator.data.get(description.data_key)
+        self._attr_native_value = self._native_value(coordinator.data)
         self._last_device_identity: tuple[Any, ...] | None = None
         self._attr_device_info = self._device_info(coordinator.data)
+
+    def _native_value(self, data: dict[str, Any]) -> Any:
+        """Return the entity value, applying validated wire-unit scaling."""
+        value = data.get(self.entity_description.data_key)
+        if self.entity_description.key == "motor_angle_raw":
+            return oscillation_angle_degrees(value)
+        return value
 
     def _device_info(self, data: dict[str, Any]) -> DeviceInfo:
         """Build current toothbrush registry metadata."""
@@ -579,7 +589,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
 
     @callback
     def _handle_update(self, data: dict[str, Any]) -> None:
-        value = data.get(self.entity_description.data_key)
+        value = self._native_value(data)
         # Restored session values must not be wiped by a fresh coordinator
         # that has not seen a session yet.
         if value is None and self.entity_description.restore:
@@ -691,6 +701,10 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 "force": data.get("pressure_force"),
                 "raw": data.get("pressure_raw"),
                 "source": data.get("data_source"),
+            }
+        elif self.entity_description.key == "motor_angle_raw":
+            self._attr_extra_state_attributes = {
+                "raw": data.get("motor_angle_raw"),
             }
         elif self.entity_description.key in (
             "refill_days",
