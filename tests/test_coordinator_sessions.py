@@ -72,6 +72,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c = coordinator.OralBLiveCoordinator(
             MagicMock(), "AA:BB:CC:DD:EE:FF", "test", mode
         )
+        c._session_pause_grace_seconds = 0
         c._maybe_schedule_sync = lambda *args, **kwargs: None
         c._schedule_connect = lambda *args, **kwargs: None
         return c
@@ -283,6 +284,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c = self._coordinator()
         c._parse_advertisement(_advertisement(_payload(3, 30)))
         c._parse_advertisement(_advertisement(_payload(2, 30, face=4)))
+        c._parse_advertisement(_advertisement(_payload(3, 1)))
         c._parse_advertisement(_advertisement(_payload(3, 45)))
         c._parse_advertisement(_advertisement(_payload(2, 45, face=7)))
 
@@ -293,6 +295,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c = self._coordinator()
         c._parse_advertisement(_advertisement(_payload(3, 30)))
         c._parse_advertisement(_advertisement(_payload(2, 30, face=4)))
+        c._parse_advertisement(_advertisement(_payload(3, 1)))
         c._parse_advertisement(_advertisement(_payload(3, 45)))
         c._parse_advertisement(_advertisement(_payload(2, 45, face=0)))
 
@@ -304,6 +307,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c = coordinator.OralBLiveCoordinator(
             MagicMock(), "AA:BB:CC:DD:EE:FF", "test", const.CONNECTION_MODE_LIVE
         )
+        c._session_pause_grace_seconds = 0
         c.data["last_session_display_face"] = "special_5"
 
         c._apply_state(const.RUNNING_STATE)
@@ -356,6 +360,47 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertEqual(c.data["battery"], 94)
         self.assertIsNotNone(c.data["battery_updated_at"])
         self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_SESSION)
+
+    def test_same_timestamp_longer_record_refines_without_recounting(self) -> None:
+        """A final FF29 may extend an interim record from the same timer run."""
+        c = self._coordinator()
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+        session_ts = int.from_bytes(record[0:4], "little")
+        now = coordinator.dt_util.utcnow()
+        c._last_synced_session_ts = session_ts
+        c.data["last_session_start"] = now
+        c.data["last_session_duration"] = 100
+        c.data["last_session_display_face"] = "special_5"
+        c.data["last_session_id"] = 353
+        c.data["last_session_source"] = const.DATA_SOURCE_SESSION
+        c.data["sessions_today"] = 1
+        c._store.async_save = AsyncMock()
+
+        result = asyncio.run(
+            c._async_apply_session_record(
+                record,
+                record[:4],
+                rtc_sampled_at=now,
+            )
+        )
+
+        self.assertEqual(result, "new")
+        self.assertEqual(c.data["last_session_duration"], 128)
+        self.assertEqual(c.data["last_session_display_face"], "special_5")
+        self.assertEqual(c.data["sessions_today"], 1)
+
+    def test_old_same_timestamp_record_cannot_replace_newer_local_session(self) -> None:
+        c = self._coordinator()
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+        c._last_synced_session_ts = int.from_bytes(record[0:4], "little")
+        c.data["last_session_duration"] = 50
+        c.data["last_session_id"] = None
+        c.data["last_session_source"] = const.DATA_SOURCE_ADVERTISEMENT
+
+        result = asyncio.run(c._async_apply_session_record(record, None))
+
+        self.assertEqual(result, "duplicate")
+        self.assertEqual(c.data["last_session_duration"], 50)
 
     def test_retained_record_preserves_face_when_reconciling_same_session(self) -> None:
         """FF29 refines a passive record but has no replacement face."""
@@ -445,6 +490,317 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertIsNone(c.data["last_session_display_face"])
 
 
+class PauseResumeSessionTests(unittest.TestCase):
+    """One continuing handle timer remains one logical brushing session."""
+
+    def _coordinator(self, mode: str = const.CONNECTION_MODE_CHARGER):
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        c = coordinator.OralBLiveCoordinator(
+            MagicMock(), "AA:BB:CC:DD:EE:FF", "test", mode
+        )
+        c._session_pause_grace_seconds = 20
+        c._schedule_pending_session_finalize = lambda: False
+        c._maybe_schedule_sync = lambda *args, **kwargs: None
+        c._schedule_connect = lambda *args, **kwargs: None
+        return c
+
+    def test_multiple_continuing_fragments_finalize_once_with_final_face(self) -> None:
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 60)))
+        original_start = c._session_start
+        c._parse_advertisement(_advertisement(_payload(2, 69, face=3)))
+
+        self.assertIsNone(c.data["last_session_start"])
+        self.assertEqual(c._pending_session.display_face, "special_3")
+
+        c._parse_advertisement(_advertisement(_payload(3, 69)))
+        c._parse_advertisement(_advertisement(_payload(3, 70)))
+        c._parse_advertisement(_advertisement(_payload(2, 80, face=3)))
+        c._parse_advertisement(_advertisement(_payload(3, 80)))
+        c._parse_advertisement(_advertisement(_payload(3, 81)))
+        c._parse_advertisement(_advertisement(_payload(2, 101, face=4)))
+
+        self.assertTrue(c._finalize_pending_session())
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_start"], original_start)
+        self.assertEqual(c.data["last_session_duration"], 101)
+        self.assertEqual(c.data["last_session_display_face"], "special_4")
+        self.assertEqual(c._session_generation, 1)
+        self.assertEqual(len(c._pending_passive_sessions), 1)
+
+    def test_sectors_and_pressure_summaries_merge_without_idle_time(self) -> None:
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+        with patch.object(coordinator.time, "monotonic", return_value=100.0):
+            c._apply_state(const.RUNNING_STATE)
+            c._track_session_time(10, confirm_session=True)
+            c._apply_ff09_sector(0, 4)
+        with patch.object(coordinator.time, "monotonic", return_value=101.0):
+            c._apply_pressure(bytes((2, 0, 0, 100, 0)), const.DATA_SOURCE_DIRECT)
+        with patch.object(coordinator.time, "monotonic", return_value=102.0):
+            c._apply_state(2)
+
+        with patch.object(coordinator.time, "monotonic", return_value=110.0):
+            c._apply_state(const.RUNNING_STATE)
+            c._track_session_time(10, confirm_session=True)
+            c._track_session_time(11, confirm_session=True)
+            c._apply_ff09_sector(1, 4)
+        with patch.object(coordinator.time, "monotonic", return_value=111.0):
+            c._apply_pressure(bytes((0, 0, 0, 44, 1)), const.DATA_SOURCE_DIRECT)
+        with patch.object(coordinator.time, "monotonic", return_value=113.0):
+            c._apply_state(2)
+
+        c._finalize_pending_session()
+        self.assertEqual(c.data["last_session_sectors"], 2)
+        self.assertEqual(c.data["last_session_high_pressure"], 1)
+        self.assertEqual(c.data["last_session_low_pressure"], 1)
+        self.assertEqual(c.data["last_session_high_pressure_time"], 1.0)
+        self.assertEqual(c.data["last_session_low_pressure_time"], 2.0)
+        self.assertEqual(c.data["last_session_average_pressure"], 200)
+        self.assertEqual(c.data["last_session_maximum_pressure"], 300)
+
+    def test_selection_menu_and_coherent_reset_create_a_new_session(self) -> None:
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 30)))
+        c._parse_advertisement(_advertisement(_payload(2, 30, face=4)))
+
+        c._parse_advertisement(_advertisement(_payload(8, 0)))
+        c._parse_advertisement(_advertisement(_payload(3, 1)))
+
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_duration"], 30)
+        self.assertEqual(c.data["last_session_display_face"], "special_4")
+        self.assertEqual(c._session_generation, 2)
+
+        c._parse_advertisement(_advertisement(_payload(2, 5, face=7)))
+        c._finalize_pending_session()
+        self.assertEqual(c.data["sessions_today"], 2)
+        self.assertEqual(c.data["last_session_duration"], 5)
+        self.assertEqual(c.data["last_session_display_face"], "special_7")
+
+    def test_selection_menu_does_not_override_a_large_continuing_timer(self) -> None:
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 30)))
+        original_start = c._session_start
+        c._parse_advertisement(_advertisement(_payload(2, 30, face=3)))
+
+        c._parse_advertisement(_advertisement(_payload(8, 30)))
+        c._parse_advertisement(_advertisement(_payload(3, 31)))
+
+        self.assertIsNone(c._pending_session)
+        self.assertEqual(c._session_start, original_start)
+        self.assertIsNone(c.data["sessions_today"])
+
+    def test_selection_menu_disambiguates_overlapping_very_short_timers(self) -> None:
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 3)))
+        c._parse_advertisement(_advertisement(_payload(2, 3, face=1)))
+
+        c._parse_advertisement(_advertisement(_payload(8, 3)))
+        c._parse_advertisement(_advertisement(_payload(3, 4)))
+
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_duration"], 3)
+        self.assertEqual(c._session_generation, 2)
+
+    def test_equal_short_timer_without_menu_route_can_continue(self) -> None:
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(3, confirm_session=True)
+        original_start = c._session_start
+        c._apply_state(2)
+
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(3, confirm_session=True)
+        c._track_session_time(4, confirm_session=True)
+
+        self.assertIsNone(c._pending_session)
+        self.assertEqual(c._session_start, original_start)
+
+    def test_summary_only_observation_still_requests_retained_session(self) -> None:
+        c = self._coordinator()
+
+        c._apply_state(9)
+
+        self.assertEqual(c._session_generation, 1)
+        self.assertTrue(c._session_pending_sync)
+        self.assertFalse(c._session_active)
+
+    def test_stale_high_timer_before_reset_cannot_merge_sessions(self) -> None:
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(80, confirm_session=True)
+        c._apply_state(2)
+
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(81, confirm_session=True)  # delayed predecessor
+        c._track_session_time(0, confirm_session=True)
+        c._track_session_time(1, confirm_session=True)
+
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_duration"], 80)
+        self.assertEqual(c._session_max_time, 1)
+
+    def test_slightly_lower_stale_timer_can_recover_to_continuation(self) -> None:
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(80, confirm_session=True)
+        original_start = c._session_start
+        c._apply_state(2)
+
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(79, confirm_session=True)
+        c._track_session_time(82, confirm_session=True)
+        self.assertIsNotNone(c._pending_session)
+        c._track_session_time(83, confirm_session=True)
+
+        self.assertIsNone(c._pending_session)
+        self.assertEqual(c._session_start, original_start)
+        self.assertEqual(c._session_max_time, 83)
+
+    def test_final_timer_after_idle_updates_the_pending_duration(self) -> None:
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(60, confirm_session=True)
+        c._apply_state(2)
+
+        c._track_session_time(62, confirm_session=True)
+        c._finalize_pending_session()
+
+        self.assertEqual(c.data["last_session_duration"], 62)
+
+    def test_wrong_timeout_generation_cannot_finalize_current_pending_stop(self) -> None:
+        c = self._coordinator(const.CONNECTION_MODE_LIVE)
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(20, confirm_session=True)
+        c._apply_state(2)
+        generation = c._pending_session.face_generation
+
+        self.assertFalse(c._finalize_pending_session(generation + 1))
+        self.assertIsNotNone(c._pending_session)
+        self.assertTrue(c._finalize_pending_session(generation))
+        self.assertEqual(c.data["sessions_today"], 1)
+
+    def test_charger_synthetic_zero_is_not_timer_reset_evidence(self) -> None:
+        c = self._coordinator()
+        c._start_charger_ticker = lambda: None
+        c._cancel_charger_ticker = lambda: None
+        c._advance_charger_timer = lambda: None
+        c._charger_session_started(confirmed=True)
+        original_start = c._session_start
+        c._track_session_time(20, confirm_session=True)
+        c._charger_session_ended()
+
+        c._charger_session_started(confirmed=True)
+        self.assertEqual(c.data["time"], 0)
+        c._charger_timer_anchor = (0, 100.0)
+        with patch.object(coordinator.time, "monotonic", return_value=102.0):
+            coordinator.OralBLiveCoordinator._advance_charger_timer(c)
+        self.assertIsNotNone(c._pending_session)
+        self.assertIsNone(c._resume_timer_baseline)
+        asyncio.run(c._async_apply_charger_passthrough("FF08", b"\x00\x14"))
+        asyncio.run(c._async_apply_charger_passthrough("FF08", b"\x00\x15"))
+
+        self.assertIsNone(c._pending_session)
+        self.assertEqual(c._session_start, original_start)
+        self.assertEqual(c._session_max_time, 21)
+        self.assertEqual(c._session_generation, 1)
+
+    def test_final_ff29_refines_combined_session_without_recounting(self) -> None:
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 110)))
+        c._parse_advertisement(_advertisement(_payload(2, 120, face=3)))
+        c._parse_advertisement(_advertisement(_payload(3, 120)))
+        c._parse_advertisement(_advertisement(_payload(3, 121)))
+        c._parse_advertisement(_advertisement(_payload(2, 128, face=6)))
+        c._finalize_pending_session()
+        local_start = c.data["last_session_start"]
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+        c._last_synced_session_ts = 0
+        c._store.async_save = AsyncMock()
+
+        result = asyncio.run(
+            c._async_apply_session_record(
+                record,
+                record[:4],
+                rtc_sampled_at=local_start,
+            )
+        )
+
+        self.assertEqual(result, "new")
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_duration"], 128)
+        self.assertEqual(c.data["last_session_display_face"], "special_6")
+        self.assertEqual(c.data["last_session_source"], const.DATA_SOURCE_SESSION)
+
+
+class PauseResumeTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """A real stop still finalizes after the bounded pause grace."""
+
+    async def test_unresumed_stop_finalizes_after_timeout(self) -> None:
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        hass = MagicMock()
+        tasks: list[asyncio.Task] = []
+
+        def _create_background_task(coro, name):
+            task = asyncio.create_task(coro, name=name)
+            tasks.append(task)
+            return task
+
+        hass.async_create_background_task.side_effect = _create_background_task
+        c = coordinator.OralBLiveCoordinator(
+            hass,
+            "AA:BB:CC:DD:EE:FF",
+            "test",
+            const.CONNECTION_MODE_LIVE,
+        )
+        c._session_pause_grace_seconds = 0.01
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(12, confirm_session=True)
+        c._apply_state(2)
+
+        self.assertIsNone(c.data["last_session_duration"])
+        await asyncio.gather(*tasks)
+        self.assertEqual(c.data["last_session_duration"], 12)
+        self.assertEqual(c.data["sessions_today"], 1)
+
+    async def test_charger_ff29_waits_for_logical_finalization(self) -> None:
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        hass = MagicMock()
+        tasks: list[asyncio.Task] = []
+
+        def _create_background_task(coro, name):
+            task = asyncio.create_task(coro, name=name)
+            tasks.append(task)
+            return task
+
+        hass.async_create_background_task.side_effect = _create_background_task
+        c = coordinator.OralBLiveCoordinator(
+            hass,
+            "AA:BB:CC:DD:EE:FF",
+            "test",
+            const.CONNECTION_MODE_CHARGER,
+        )
+        c._session_pause_grace_seconds = 20
+        c._schedule_pending_session_finalize = lambda: False
+        c._store.async_save = AsyncMock()
+        c._last_synced_session_ts = 0
+        c._apply_state(const.RUNNING_STATE)
+        c._track_session_time(128, confirm_session=True)
+        c._apply_state(2)
+        record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+
+        await c._async_apply_charger_passthrough("FF29", record)
+        await c._async_apply_charger_passthrough("FF22", record[:4])
+        self.assertIsNone(c.data["last_session_duration"])
+        self.assertIsNotNone(c._charger_session_record)
+
+        c._finalize_pending_session()
+        await asyncio.gather(*tasks)
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_duration"], 128)
+        self.assertEqual(c.data["last_session_source"], const.DATA_SOURCE_SESSION)
+
+
 class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
     """Reproduce display-face loss on connected delivery paths from issue 18."""
 
@@ -453,6 +809,7 @@ class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
         c = coordinator.OralBLiveCoordinator(
             MagicMock(), "AA:BB:CC:DD:EE:FF", "test", mode
         )
+        c._session_pause_grace_seconds = 0
         c._maybe_schedule_sync = lambda *args, **kwargs: None
         c._schedule_connect = lambda *args, **kwargs: None
         c.data["data_source"] = (
@@ -658,6 +1015,7 @@ class ConnectedSessionDisplayFaceReadTests(unittest.IsolatedAsyncioTestCase):
             "test",
             const.CONNECTION_MODE_LIVE,
         )
+        c._session_pause_grace_seconds = 0
         c.data["data_source"] = const.DATA_SOURCE_DIRECT
         return c, tasks
 
