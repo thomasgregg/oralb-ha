@@ -152,6 +152,7 @@ class _PendingSession:
     source: str | None
     duration_source: str
     display_face: str | None = None
+    display_face_source: str | None = None
 
 
 class OralBLiveCoordinator:
@@ -181,6 +182,7 @@ class OralBLiveCoordinator:
             "target_duration": None,
             "smiley": None,
             "smiley_raw": None,
+            "smiley_source": None,
             "battery": None,
             "battery_time_remaining": None,
             "battery_voltage": None,
@@ -215,6 +217,7 @@ class OralBLiveCoordinator:
             "last_session_duration": None,
             "last_session_mode": None,
             "last_session_display_face": None,
+            "last_session_display_face_source": None,
             "last_session_sectors": None,
             "last_session_high_pressure": None,
             "last_session_low_pressure": None,
@@ -1164,6 +1167,7 @@ class OralBLiveCoordinator:
                     advance_generation=True
                 )
                 self.data["last_session_display_face"] = None
+                self.data["last_session_display_face_source"] = None
             self.data["last_session_start"] = start
             self.data["last_session_duration"] = duration
             self.data["last_session_mode"] = MODES.get(mode_raw, f"mode_{mode_raw}")
@@ -1344,8 +1348,10 @@ class OralBLiveCoordinator:
             and self._pending_session.face_generation == generation
         ):
             self._pending_session.display_face = face
+            self._pending_session.display_face_source = source
         else:
             self.data["last_session_display_face"] = face
+            self.data["last_session_display_face_source"] = source
         self._pending_session_face_generation = None
         self._pending_session_face_deadline = 0.0
         _LOGGER.debug(
@@ -1508,6 +1514,7 @@ class OralBLiveCoordinator:
         self.data["last_session_duration"] = pending.duration
         self.data["last_session_mode"] = pending.mode
         self.data["last_session_display_face"] = pending.display_face
+        self.data["last_session_display_face_source"] = pending.display_face_source
         self.data["last_session_sectors"] = len(pending.sectors)
         has_pressure_samples = pending.pressure_samples > 0
         self.data["last_session_high_pressure"] = (
@@ -2040,12 +2047,13 @@ class OralBLiveCoordinator:
         observed_at = time.monotonic()
         self.data["smiley_raw"] = raw
         self.data["smiley"] = SMILEYS.get(raw, f"face_{raw}")
+        self.data["smiley_source"] = source or self.data.get("data_source")
         self._last_smiley_sample_raw = raw
         self._last_smiley_sample_monotonic = observed_at
         self._last_smiley_sample_generation = (
             self._session_face_generation if self._session_active else None
         )
-        self._last_smiley_sample_source = source or self.data.get("data_source")
+        self._last_smiley_sample_source = self.data["smiley_source"]
         pending_generation = self._pending_session_face_generation
         if pending_generation is not None and (
             not self._session_active

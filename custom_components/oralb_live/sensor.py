@@ -539,6 +539,9 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                     "last_session_duration": last.attributes.get("duration_seconds"),
                     "last_session_mode": last.attributes.get("mode"),
                     "last_session_display_face": last.attributes.get("display_face"),
+                    "last_session_display_face_source": last.attributes.get(
+                        "display_face_source"
+                    ),
                     "last_session_sectors": last.attributes.get("quadrants_covered"),
                     "last_session_high_pressure": last.attributes.get(
                         "high_pressure_events"
@@ -601,6 +604,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 "duration_seconds": data.get("last_session_duration"),
                 "mode": data.get("last_session_mode"),
                 "display_face": data.get("last_session_display_face"),
+                "display_face_source": data.get("last_session_display_face_source"),
                 "quadrants_covered": data.get("last_session_sectors"),
                 "high_pressure_events": data.get("last_session_high_pressure"),
                 "low_pressure_events": data.get("last_session_low_pressure"),
@@ -691,6 +695,7 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
         elif self.entity_description.key == "smiley":
             self._attr_extra_state_attributes = {
                 "smiley_raw": data.get("smiley_raw"),
+                "source": data.get("smiley_source"),
             }
         elif self.entity_description.key == "ring_color":
             self._attr_extra_state_attributes = {
