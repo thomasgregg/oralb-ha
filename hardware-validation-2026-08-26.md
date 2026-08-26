@@ -2,7 +2,7 @@
 
 ## Test environment
 
-- Oral-B Live: `v0.7.34b4`
+- Oral-B Live: `v0.7.34b5`
 - Home Assistant Core: `2026.8.3`
 - Home Assistant OS: `18.2`
 - Host: Raspberry Pi 5
@@ -12,7 +12,7 @@
 - Test-only option: `live`
 - Official Oral-B app: force-closed except while changing and restoring the Vibration setting
 - iO Sense charger: unplugged during advertisement/direct/raw-capture tests
-- Automated tests: 153 passed with both minimum and current dependency sets
+- Automated tests: 164 passed with both minimum and current dependency sets
 
 All timestamps below use Europe/Berlin local time unless marked UTC.
 
@@ -84,7 +84,7 @@ Attach the raw JSON and this result to #20. Keep #20 open until either the origi
 
 Issue: <https://github.com/thomasgregg/oralb-ha/issues/21>
 
-Status after validation: **open for b5 charger hardware validation**. Hardware evidence: <https://github.com/thomasgregg/oralb-ha/issues/21#issuecomment-5422074693>. Fix and validation request: <https://github.com/thomasgregg/oralb-ha/issues/21#issuecomment-5422166958>
+Status after validation: **closed as completed after b5 charger hardware validation**. Hardware evidence: <https://github.com/thomasgregg/oralb-ha/issues/21#issuecomment-5422074693>. Fix and validation request: <https://github.com/thomasgregg/oralb-ha/issues/21#issuecomment-5422166958>
 
 ### Advertisement-only menu test: pass
 
@@ -108,7 +108,7 @@ With the charger unplugged, the config entry reloaded, and no live connection:
 - high-pressure events: 2
 - high-pressure duration: 5.2 seconds
 
-### Charger-priority settings/menu test: fail, new charger-specific path
+### Charger-priority settings/menu test on b4: fail, new charger-specific path
 
 With the brush physically in its settings menu and the motor off:
 
@@ -123,9 +123,46 @@ After the charger was physically unplugged, a stale charger bridge state continu
 
 The likely path is `charger brush_status = pre_run` being treated as an active session by `resolve_charger_session_running()`, followed by `_charger_session_started()` creating a synthetic running state and polling FF0B even though `session_status` is inactive and the motor is off.
 
-### Recommendation
+### Charger-priority b5 validation: pass
 
-Do not close #21 solely on the advertisement result. The original advertisement idle/menu behavior passes in b4, but the charger-priority `pre_run` path is a concrete remaining bug. Either extend #21 with the charger evidence or open a focused issue titled approximately “Charger pre_run/settings menu creates synthetic running session and stale pressure.” A fix should require stronger evidence than `brush_status = pre_run`—for example active charger session state and/or a real brush running transition—and must clear the synthetic session on charger disconnect.
+The `v0.7.34b5` provisional-session fix was installed through HACS and Home Assistant was restarted. Three targeted hardware paths passed.
+
+With the motor physically off and the handle in its settings menu, the charger reported `pre_run`, but the integration did not promote it:
+
+- initial brush state: `selection_menu`
+- pressure remained `unknown`
+- timer remained `0`
+- charger session remained `inactive`
+- `sessions_today` remained `6`
+- after the handle became quiet, the integration remained idle on advertisement data for the complete 45-second observation window
+
+A genuine charger-bridged session then promoted only after motor evidence:
+
+- main state: `running`
+- data source: `charger_bridge`
+- live connection: `true`
+- charger brush status: `run`
+- charger session status: `active_running`
+- timer advanced from 12 to 24 seconds during the sampled interval
+- live pressure and force updated normally
+
+At motor stop, pressure cleared immediately and the timer stabilized at 40 seconds. The charger session transitioned `active_running -> active_idle -> inactive`; exactly one session finalized after the grace period, `sessions_today` changed `6 -> 7`, and Last session duration became 40 seconds. The source returned to advertisement and the live timer reset to 0 without a duplicate finalization.
+
+Finally, charger power was removed during a newly observed provisional `pre_run`. Bridge ownership was discarded immediately:
+
+- `bridge_connected`: `false`
+- main state remained `idle` from advertisement data
+- live connection remained `false`
+- pressure remained `unknown`
+- timer remained `0`
+- charger session remained `inactive`
+- `sessions_today` remained `7`
+
+The charger's diagnostic Brush status retained its last raw `pre_run` value while the base was unpowered, but that stale diagnostic did not control the brush coordinator. After charger power was restored and the brush was docked, Brush status cleared to `not_connected`, the brush reported `charging`, pressure was `unknown`, timer was 0, and the session remained inactive.
+
+### Recommendation and resolution
+
+Post the b5 results to #21 and close it as completed. The original advertisement path, passive-session path, charger provisional path, genuine charger promotion/finalization path, and charger-disconnect cleanup are all now confirmed on hardware.
 
 ## Issue #22 — pause/resume fragments
 
@@ -212,13 +249,13 @@ The raw startup value, next positive value, sample count, and aggregate equality
 - Brush pressure: `unknown`
 - Home Assistant system log errors for `oralb_live`: none
 
-The legacy iO Sense charger-detail entities remained `unavailable` after the charger was powered, the brush was docked, and the config entry was reloaded. The brush itself reports charging correctly from advertisement data. This does not affect the captured issue results, but charger bridge discovery should be checked again when the base next advertises.
+The iO Sense charger was rediscovered during b5 validation and its detail entities were available. After the final power restoration, the brush reported charging from advertisement data, the charger Brush status was `not_connected`, charger Session status was `inactive`, pressure was `unknown`, timer was 0, and `sessions_today` remained 7.
 
 ## Suggested upstream actions
 
 1. Completed: #26 received the signed startup/aggregate evidence and was closed.
 2. Completed: #22 received the 42 -> 43 continuous-timer merge and single 72-second finalization evidence and was closed.
 3. Completed: #20 received the raw capture and cross-firmware result. The defensive fallback shipped in `v0.7.34b5`; the issue remains open pending b5 validation and the older firmware-50 capture.
-4. Completed: #21 received the charger-specific `pre_run` evidence. The provisional-session fix shipped in `v0.7.34b5`; the issue remains open pending charger hardware validation.
+4. Completed: #21 received the charger-specific `pre_run` evidence. The provisional-session fix shipped in `v0.7.34b5`, passed all three targeted charger hardware checks, and the issue was closed.
 
-GitHub comments were posted to all four issues. Issues #22 and #26 were closed after hardware validation; #20 and #21 remain open for the targeted `v0.7.34b5` checks. No new issue was opened.
+GitHub comments were posted to all four issues. Issues #21, #22, and #26 were closed after hardware validation. Issue #20 remains open for the older firmware-50 capture or equivalent targeted confirmation. No new issue was opened.
