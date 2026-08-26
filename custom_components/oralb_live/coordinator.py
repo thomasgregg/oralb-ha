@@ -295,6 +295,11 @@ class OralBLiveCoordinator:
         self._charger_timer_anchor: tuple[int, float] | None = None
         self._charger_tick_task: asyncio.Task | None = None
         self._pacer_anchor: tuple[int, int, int] | None = None
+        # Distinguish a failed/not-yet-attempted FF26 read from a successful
+        # read of an empty schedule.  Only the latter makes FF09's total hint
+        # demonstrably untrustworthy.
+        self._pacer_configuration_read = False
+        self._pacer_configuration_valid = False
         self._charger_session_record: bytes | None = None
         self._charger_session_rtc: bytes | None = None
         self._charger_session_rtc_sampled_at: datetime | None = None
@@ -1869,9 +1874,15 @@ class OralBLiveCoordinator:
     ) -> None:
         """Apply a zero-based quadrant value from FF09."""
         self.data["sector_raw"] = raw
+        trusted_total = (
+            None
+            if self._pacer_configuration_read
+            and not self._pacer_configuration_valid
+            else total
+        )
         sector, quadrant, decoded_total = decode_ff09_sector(
             raw,
-            total,
+            trusted_total,
             self.data.get("number_of_sectors"),
         )
         self.data["sector"] = (
@@ -1971,12 +1982,22 @@ class OralBLiveCoordinator:
         )
 
     def _apply_pacer(self, payload: bytes | bytearray | None) -> None:
-        if payload is not None:
-            parsed = parse_pacer(payload)
-            if "number_of_sectors" in parsed:
-                self.data["number_of_sectors"] = parsed.pop("number_of_sectors")
-            self.data.update(parsed)
-            self._update_pacer_progress()
+        if payload is None:
+            return
+        parsed = parse_pacer(payload)
+        self._pacer_configuration_read = True
+        self._pacer_configuration_valid = bool(parsed)
+        if not parsed:
+            # A successful all-zero/empty FF26 read means no timer schedule is
+            # configured.  Clear any retained schedule and do not let FF09's
+            # firmware-specific slot-count hint replace it.
+            self.data["number_of_sectors"] = None
+            self.data["sector_times"] = None
+            self.data["target_duration"] = None
+            return
+        self.data["number_of_sectors"] = parsed.pop("number_of_sectors")
+        self.data.update(parsed)
+        self._update_pacer_progress()
 
     def _apply_available_modes(self, payload: bytes | bytearray | None) -> None:
         if payload is None:

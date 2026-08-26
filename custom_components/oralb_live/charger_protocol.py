@@ -168,6 +168,13 @@ def resolve_charger_session_running(
     return currently_running
 
 
+def charger_session_confirmed(
+    session_status: str | None, brush_status: str | None
+) -> bool:
+    """Return whether native charger state confirms that the motor is running."""
+    return brush_status == "run" or session_status == "active_running"
+
+
 def charger_live_auxiliary(
     tick: int,
     *,

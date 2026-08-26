@@ -1400,6 +1400,39 @@ class LiveSectorNumberingTests(unittest.TestCase):
             self._notify(c, quadrant)
             self.assertEqual(c.data["sector"], expected)
 
+    def test_empty_ff26_rejects_slot_count_hint_and_maps_final_sentinel(self) -> None:
+        """An empty schedule cannot turn FF09's slot count into eight zones."""
+        c = self._coordinator()
+        c._apply_pacer(bytes(8))
+
+        for raw, expected in (
+            (0, "sector_1"),
+            (1, "sector_2"),
+            (2, "sector_3"),
+            (3, "sector_4"),
+            (0xFF, "sector_4"),
+        ):
+            c._apply_ff09_sector(raw, 8)
+            self.assertEqual(c.data["sector"], expected)
+            self.assertIsNone(c.data["number_of_sectors"])
+
+        self.assertIsNone(c.data["sector_times"])
+        self.assertIsNone(c.data["target_duration"])
+
+    def test_valid_ff26_schedule_remains_authoritative(self) -> None:
+        c = self._coordinator()
+        c._apply_pacer(bytes((15,) * 8))
+        c._apply_ff09_sector(0, 4)
+        self.assertEqual(c.data["number_of_sectors"], 8)
+        c._apply_ff09_sector(0xFF, 4)
+        self.assertEqual(c.data["sector"], "sector_8")
+
+    def test_failed_ff26_read_keeps_ff09_fallback(self) -> None:
+        c = self._coordinator()
+        c._apply_pacer(None)
+        c._apply_ff09_sector(0, 6)
+        self.assertEqual(c.data["number_of_sectors"], 6)
+
     def test_the_advertisement_still_counts_from_one(self) -> None:
         """The other wire format is untouched: its 1 is the first zone."""
         c = self._coordinator()

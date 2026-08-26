@@ -315,6 +315,12 @@ class ProtocolDecoderTests(unittest.TestCase):
             ("no_sector", None, 6),
         )
 
+    def test_ff09_configured_total_wins_over_firmware_hint(self) -> None:
+        self.assertEqual(
+            protocol.decode_ff09_sector(0, 8, 4),
+            ("sector_1", 1, 4),
+        )
+
     def test_verified_protocol_8_session_record(self) -> None:
         parsed = protocol.parse_session_record(
             bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
@@ -375,6 +381,17 @@ class ChargerProtocolTests(unittest.TestCase):
         )
         self.assertTrue(
             charger_protocol.resolve_charger_session_running("inactive", "run")
+        )
+
+    def test_charger_session_confirmation_requires_motor_evidence(self) -> None:
+        self.assertFalse(
+            charger_protocol.charger_session_confirmed("inactive", "pre_run")
+        )
+        self.assertTrue(
+            charger_protocol.charger_session_confirmed("inactive", "run")
+        )
+        self.assertTrue(
+            charger_protocol.charger_session_confirmed("active_running", "pre_run")
         )
 
     def test_charger_session_prefers_quiet_brush_status(self) -> None:
