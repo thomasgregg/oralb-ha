@@ -35,6 +35,7 @@ from .charger_protocol import (
     ChargerPacket,
     build_charger_get,
     build_passthrough_read,
+    charger_session_confirmed,
     charger_live_auxiliary,
     decode_charger_advertisement,
     decode_charger_read,
@@ -54,6 +55,7 @@ from .const import (
     CHARGER_SNAPSHOT_INTERVAL_SECONDS,
     DATA_SOURCE_CHARGER,
     ORALB_MANUFACTURER_ID,
+    RUNNING_STATE,
     SIGNAL_CHARGER_DISCOVERED,
     SIGNAL_CHARGER_UPDATE,
 )
@@ -147,6 +149,8 @@ class IOSenseBridge:
         self._pending_short_uuid: str | None = None
         self._candidate_addresses: set[str] = set()
         self._session_running = False
+        self._session_confirmed = False
+        self._provisional_timer_baseline: int | None = None
         self._snapshot_complete = False
         self._last_probe_monotonic = 0.0
         self._last_snapshot_monotonic = 0.0
@@ -254,6 +258,7 @@ class IOSenseBridge:
     def _async_unavailable(self, _service_info: BluetoothServiceInfoBleak) -> None:
         self.available = False
         self.data["state"] = "unavailable"
+        self._end_session(schedule_disconnect=False)
         self._push()
         self.parent._push()
 
@@ -541,29 +546,64 @@ class IOSenseBridge:
 
     def _start_session(self) -> None:
         """Start or recover a charger-managed brush stream."""
-        confirmed = (
-            self.data.get("brush_status") == "run"
-            or self.data.get("session_status") == "active_running"
+        confirmed = charger_session_confirmed(
+            self.data.get("session_status"), self.data.get("brush_status")
         )
         self._cancel_disconnect()
         if not self._session_running:
             self._session_running = True
-            self.parent._charger_session_started(confirmed=confirmed)
-        elif not self.parent._session_active:
+            self._session_confirmed = False
+            self._provisional_timer_baseline = None
+        if confirmed and not self._session_confirmed:
+            self._confirm_session()
+        elif self._session_confirmed and not self.parent._session_active:
             # Re-enter tracking after a reload or missed state edge while the
             # charger still reports an active brush state.
-            self.parent._charger_session_started(confirmed=confirmed)
-        elif confirmed:
-            self.parent._confirm_session()
+            self.parent._charger_session_started(confirmed=True)
         self._ensure_live_task()
 
-    def _end_session(self) -> None:
+    def _confirm_session(self) -> None:
+        """Promote provisional charger ownership to a real brush session."""
+        if not self._session_running or self._session_confirmed:
+            return
+        self._session_confirmed = True
+        self._provisional_timer_baseline = None
+        self.parent._charger_session_started(confirmed=True)
+
+    def _observe_provisional_passthrough(
+        self, short_uuid: str, payload: bytes | bytearray
+    ) -> bool:
+        """Use authoritative brush values to confirm a provisional pre_run."""
+        raw = bytes(payload)
+        if self._session_confirmed:
+            return True
+        if short_uuid == "FF04" and raw and raw[0] == RUNNING_STATE:
+            self._confirm_session()
+            return True
+        if short_uuid != "FF08" or len(raw) < 2:
+            return False
+        seconds = raw[0] * 60 + raw[1]
+        baseline = self._provisional_timer_baseline
+        if baseline is None or seconds < baseline:
+            self._provisional_timer_baseline = seconds
+            return False
+        if seconds <= baseline:
+            return False
+        self._confirm_session()
+        return True
+
+    def _end_session(self, *, schedule_disconnect: bool = True) -> None:
         """Finish a charger-managed stream once the brush is genuinely quiet."""
         if not self._session_running:
             return
+        confirmed = self._session_confirmed
         self._session_running = False
-        self.parent._charger_session_ended()
-        self._schedule_disconnect()
+        self._session_confirmed = False
+        self._provisional_timer_baseline = None
+        if confirmed:
+            self.parent._charger_session_ended()
+        if schedule_disconnect:
+            self._schedule_disconnect()
 
     def _ensure_live_task(self) -> None:
         if not self._session_running:
@@ -583,6 +623,37 @@ class IOSenseBridge:
                 and self._client.is_connected
             ):
                 started = time.monotonic()
+                if not self._session_confirmed:
+                    # pre_run is also emitted while the handle is only in its
+                    # settings/menu flow.  Probe authoritative state/timer
+                    # values without exposing pressure or a synthetic session.
+                    if (
+                        tick > 0
+                        and tick % CHARGER_BRUSH_STATUS_EVERY_TICKS == 0
+                    ):
+                        await self._async_get(ChargerCommand.BRUSH_STATUS)
+                        if not self._session_running:
+                            break
+                    else:
+                        provisional_action = "FF04" if tick % 2 == 0 else "FF08"
+                        if provisional := await self._async_passthrough(
+                            provisional_action
+                        ):
+                            if self._observe_provisional_passthrough(
+                                provisional_action, provisional
+                            ):
+                                await self.parent._async_apply_charger_passthrough(
+                                    provisional_action, provisional
+                                )
+                    self._push()
+                    tick += 1
+                    remaining = CHARGER_BRIDGE_INTERVAL_SECONDS - (
+                        time.monotonic() - started
+                    )
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                    continue
+
                 if pressure := await self._async_passthrough("FF0B"):
                     await self.parent._async_apply_charger_passthrough("FF0B", pressure)
 
@@ -656,9 +727,15 @@ class IOSenseBridge:
         self._client = None
         self.data["bridge_connected"] = False
         self.data["state"] = "available" if self.available else "unavailable"
+        self.hass.loop.call_soon_threadsafe(self._handle_transport_disconnect)
+
+    @callback
+    def _handle_transport_disconnect(self) -> None:
+        """Clear session ownership when the charger transport disappears."""
+        self._end_session(schedule_disconnect=False)
         self.parent.data["live"] = False
-        self.hass.loop.call_soon_threadsafe(self._push)
-        self.hass.loop.call_soon_threadsafe(self.parent._push)
+        self._push()
+        self.parent._push()
 
     async def _async_disconnect(self) -> None:
         client, self._client = self._client, None

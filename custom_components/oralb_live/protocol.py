@@ -313,7 +313,13 @@ def decode_ff09_sector(
     raw: int, total: int | None, configured_total: int | None
 ) -> tuple[str, int | None, int | None]:
     """Decode the zero-based FF09 pacer sector."""
-    decoded_total = total if total and 1 <= total <= 8 else configured_total
+    # FF26 is the handle's actual pacer schedule.  FF09 byte 2 is only a
+    # firmware-dependent hint and can expose the number of available schedule
+    # slots (8) when the stored schedule is empty.  Never let that hint replace
+    # a schedule-derived count.
+    decoded_total = configured_total
+    if decoded_total is None and total and 1 <= total <= 8:
+        decoded_total = total
     if raw == 0xF0:
         return "no_sector", None, decoded_total
     if raw == 0xFF:
