@@ -259,7 +259,12 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c._parse_advertisement(_advertisement(_payload(2, 69, face=5)))
 
         self.assertEqual(c.data["smiley"], "special_5")
+        self.assertEqual(c.data["smiley_source"], const.DATA_SOURCE_ADVERTISEMENT)
         self.assertEqual(c.data["last_session_display_face"], "special_5")
+        self.assertEqual(
+            c.data["last_session_display_face_source"],
+            const.DATA_SOURCE_ADVERTISEMENT,
+        )
 
     def test_ending_advertisement_without_result_keeps_face_unknown(self) -> None:
         """Display-off is not a substitute for a missing session verdict."""
@@ -298,7 +303,12 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c._parse_advertisement(_advertisement(_payload(2, 0, face=0)))
 
         self.assertEqual(c.data["smiley"], "off")
+        self.assertEqual(c.data["smiley_source"], const.DATA_SOURCE_ADVERTISEMENT)
         self.assertEqual(c.data["last_session_display_face"], "special_5")
+        self.assertEqual(
+            c.data["last_session_display_face_source"],
+            const.DATA_SOURCE_ADVERTISEMENT,
+        )
 
     def test_ignored_provisional_session_does_not_replace_result_face(self) -> None:
         """A menu-only transition cannot attach its face to the last session."""
@@ -869,7 +879,11 @@ class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
         self._notify(c, const.CHAR_SMILEY, b"\x03")
 
         self.assertEqual(c.data["smiley"], "special_3")
+        self.assertEqual(c.data["smiley_source"], const.DATA_SOURCE_DIRECT)
         self.assertEqual(c.data["last_session_display_face"], "special_3")
+        self.assertEqual(
+            c.data["last_session_display_face_source"], const.DATA_SOURCE_DIRECT
+        )
 
     def test_direct_session_without_ff0a_remains_unknown(self) -> None:
         """No notification is a normal unavailable result, not a placeholder."""
@@ -1012,7 +1026,11 @@ class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
         asyncio.run(c._async_apply_charger_passthrough("FF0A", b"\x04"))
 
         self.assertEqual(c.data["smiley"], "special_4")
+        self.assertEqual(c.data["smiley_source"], const.DATA_SOURCE_CHARGER)
         self.assertEqual(c.data["last_session_display_face"], "special_4")
+        self.assertEqual(
+            c.data["last_session_display_face_source"], const.DATA_SOURCE_CHARGER
+        )
 
     def test_charger_forwarded_standard_is_attached_to_completed_session(self) -> None:
         """The iO Sense path must retain raw face 1 as a valid verdict."""
@@ -1452,6 +1470,7 @@ class LastSessionDisplayFaceSensorTests(unittest.IsolatedAsyncioTestCase):
         coordinator_instance.data = {
             "last_session_start": coordinator.dt_util.utcnow(),
             "last_session_display_face": "special_5",
+            "last_session_display_face_source": const.DATA_SOURCE_DIRECT,
         }
         description = next(
             item for item in sensor.SENSORS if item.key == "last_session"
@@ -1468,13 +1487,41 @@ class LastSessionDisplayFaceSensorTests(unittest.IsolatedAsyncioTestCase):
             entity._handle_update(coordinator_instance.data)
 
         self.assertEqual(entity.extra_state_attributes["display_face"], "special_5")
+        self.assertEqual(
+            entity.extra_state_attributes["display_face_source"],
+            const.DATA_SOURCE_DIRECT,
+        )
+
+    def test_smiley_exposes_raw_value_and_transport_source(self) -> None:
+        coordinator_instance, _ = self._entity()
+        coordinator_instance.data.update(
+            {
+                "smiley": "special_7",
+                "smiley_raw": 7,
+                "smiley_source": const.DATA_SOURCE_ADVERTISEMENT,
+            }
+        )
+        description = next(item for item in sensor.SENSORS if item.key == "smiley")
+        entity = sensor.OralBLiveSensor(coordinator_instance, description)
+
+        with patch.object(entity, "async_write_ha_state"):
+            entity._handle_update(coordinator_instance.data)
+
+        self.assertEqual(
+            entity.extra_state_attributes,
+            {"smiley_raw": 7, "source": const.DATA_SOURCE_ADVERTISEMENT},
+        )
 
     async def test_last_session_restores_display_face_after_restart(self) -> None:
         coordinator_instance, entity = self._entity()
         coordinator_instance.data["last_session_display_face"] = None
+        coordinator_instance.data["last_session_display_face_source"] = None
         restored = types.SimpleNamespace(
             state=coordinator_instance.data["last_session_start"].isoformat(),
-            attributes={"display_face": "special_6"},
+            attributes={
+                "display_face": "special_6",
+                "display_face_source": const.DATA_SOURCE_CHARGER,
+            },
         )
         entity.hass = MagicMock()
         entity.async_get_last_state = AsyncMock(return_value=restored)
@@ -1488,7 +1535,15 @@ class LastSessionDisplayFaceSensorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             coordinator_instance.data["last_session_display_face"], "special_6"
         )
+        self.assertEqual(
+            coordinator_instance.data["last_session_display_face_source"],
+            const.DATA_SOURCE_CHARGER,
+        )
         self.assertEqual(entity.extra_state_attributes["display_face"], "special_6")
+        self.assertEqual(
+            entity.extra_state_attributes["display_face_source"],
+            const.DATA_SOURCE_CHARGER,
+        )
 
     async def test_older_restored_face_cannot_fill_newer_session_null(self) -> None:
         """Restore attributes only when their session timestamp also matches."""
