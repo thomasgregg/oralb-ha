@@ -20,6 +20,8 @@ All timestamps below use Europe/Berlin local time unless marked UTC.
 
 Issue: <https://github.com/thomasgregg/oralb-ha/issues/20>
 
+Status after validation: **open for b5 and older-firmware hardware validation**. Evidence and release comment: <https://github.com/thomasgregg/oralb-ha/issues/20#issuecomment-5422166732>
+
 ### Baseline
 
 With **Brush vibration enabled** and **All sessions** selected:
@@ -81,6 +83,8 @@ Attach the raw JSON and this result to #20. Keep #20 open until either the origi
 ## Issue #21 — pressure changes while idle
 
 Issue: <https://github.com/thomasgregg/oralb-ha/issues/21>
+
+Status after validation: **open for b5 charger hardware validation**. Hardware evidence: <https://github.com/thomasgregg/oralb-ha/issues/21#issuecomment-5422074693>. Fix and validation request: <https://github.com/thomasgregg/oralb-ha/issues/21#issuecomment-5422166958>
 
 ### Advertisement-only menu test: pass
 
@@ -214,7 +218,7 @@ The legacy iO Sense charger-detail entities remained `unavailable` after the cha
 
 1. Completed: #26 received the signed startup/aggregate evidence and was closed.
 2. Completed: #22 received the 42 -> 43 continuous-timer merge and single 72-second finalization evidence and was closed.
-3. Remaining: attach `brush-pacer-vibration-off.json` to #20 and keep it open pending the older firmware-50 capture or a defensive fallback.
-4. Remaining: keep #21 open or split the charger-specific `pre_run` false-session bug into a focused new issue with the captured state sequence.
+3. Completed: #20 received the raw capture and cross-firmware result. The defensive fallback shipped in `v0.7.34b5`; the issue remains open pending b5 validation and the older firmware-50 capture.
+4. Completed: #21 received the charger-specific `pre_run` evidence. The provisional-session fix shipped in `v0.7.34b5`; the issue remains open pending charger hardware validation.
 
-GitHub comments were posted and issues #22 and #26 were closed after hardware validation. No comment was posted to #20 or #21, and no new issue was opened.
+GitHub comments were posted to all four issues. Issues #22 and #26 were closed after hardware validation; #20 and #21 remain open for the targeted `v0.7.34b5` checks. No new issue was opened.
