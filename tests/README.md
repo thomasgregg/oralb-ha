@@ -13,6 +13,6 @@ The coordinator test module intentionally fails to import when its Home
 Assistant dependencies are missing. A full test run must never report success
 by silently skipping the coordinator and session tests.
 
-CI runs the same suite twice: once against the minimum supported Home
-Assistant release and once against the pinned current release. Update
-`requirements-test-current.txt` when advancing the current compatibility lane.
+CI runs the complete suite once against the minimum supported Home Assistant
+and Python versions. This keeps the compatibility guarantee without duplicating
+the same test run against a second dependency environment on every change.
