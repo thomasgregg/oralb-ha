@@ -431,7 +431,9 @@ Live to detect when brushing starts.
 - An iO Sense charger for charger-bridge data; the integration still operates
   without one through its other local sources.
 
-Recommended ESP32 ESPHome proxy configuration:
+### Bluetooth proxy recommendations
+
+Merge the following components into an existing ESP32 device configuration:
 
 ```yaml
 esp32_ble_tracker:
@@ -440,12 +442,64 @@ bluetooth_proxy:
   active: true
 ```
 
-The default ESPHome scan parameters, including active and continuous scanning,
-are recommended. Oral-B Live needs an active-capable proxy for direct GATT and
-charger-bridge connections, but does not require custom `interval`, `window`
-or `continuous` values. If an existing configuration explicitly sets the BLE
-tracker's `active: false`, remove that override or set it to `true` so scan
-response data remains available.
+Use the ESP-IDF framework and keep the `board` value matched to the physical
+device. For example, an M5Stack ATOM Lite uses `board: m5stack-atom`; in the
+ESPHome Device Builder board picker, choose **M5Stack ATOM Lite Bluetooth
+Proxy**, not a generic ESP32 profile.
+
+The default ESPHome scan parameters are recommended. Oral-B Live needs an
+active-capable proxy for direct GATT and charger-bridge connections, but does
+not require custom `interval`, `window` or `continuous` values. Remove older
+full-duty scan overrides such as `interval: 1100ms` plus `window: 1100ms` and
+leave `esp32_ble_tracker:` empty. Current ESPHome releases automatically manage
+the scan window while a GATT connection is active; an explicit `window` can
+bypass that behaviour and make Wi-Fi/Bluetooth coexistence less reliable. Keep
+the ESPHome integration's Bluetooth scanning mode in Home Assistant set to
+**Auto**. If a configuration explicitly sets the BLE tracker's `active: false`,
+remove that override or set it to `true` so scan-response data remains
+available.
+
+On an original ESP32 using ESP-IDF, ESPHome may report that its bootloader can
+use SRAM1 as IRAM. If the boot log explicitly says the bootloader supports it,
+enable the suggested option to reclaim 40 KB of instruction RAM:
+
+```yaml
+esp32:
+  # Keep the existing board value that matches the hardware.
+  framework:
+    type: esp-idf
+    advanced:
+      sram1_as_iram: true
+```
+
+This setting is not portable to every ESP32 variant, so do not put it in a
+shared package used by ESP32-C3, ESP32-S3 or other board families. A successful
+charger transaction normally connects, discovers services and disconnects
+again after a few seconds. `DISCONNECT_EVT reason=0x16` means the local host
+ended the connection and is expected. A single ESP-IDF message saying that a
+connection-parameter update is still pending is also harmless when service
+discovery and the disconnect complete successfully. Repeated `status=133`,
+disconnect reason `0x08`, crashes or boot loops indicate a real problem.
+
+Hardware choices:
+
+- **M5Stack ATOM Lite** is the compact, project-tested Wi-Fi option for a proxy
+  placed close to the brush or iO Sense charger. Use the `m5stack-atom` ESPHome
+  board ID and the matching Bluetooth Proxy profile in Device Builder.
+- **Olimex ESP32-PoE-ISO-EA** is the preferred higher-reliability option when
+  Ethernet is available. Ethernet avoids Wi-Fi/Bluetooth radio contention and
+  the `-EA` model supports an external antenna for better reception.
+- A generic original ESP32 development board is sufficient when it has stable
+  power and can be placed near the Oral-B device, but select the exact board
+  profile whenever one exists.
+
+Do not use an advertisement-only scanner for charger-bridge or direct mode.
+For example, a Shelly scanner can forward advertisements but cannot establish
+the required GATT connection. ESPHome also recommends leaving scan timing at
+its defaults and, for the best reception, placing the proxy away from routers,
+switches and other sources of interference. See the ESPHome
+[Bluetooth Proxy](https://esphome.io/components/bluetooth_proxy/) and
+[ESP32 platform](https://esphome.io/components/esp32/) documentation.
 
 ## Protocol reference
 
