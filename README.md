@@ -255,9 +255,12 @@ calibration and current model-scope limitation are documented in the
 [protocol reference](docs/protocol.md#smartring-led-drive-levels).
 
 The **Battery** entity keeps its last valid percentage across Home Assistant
-restarts and exposes `last_read` and `source` attributes. A fresh brush reading
-is preferred; the ending percentage from a newly retained session result is
-used as a local fallback when a current reading is unavailable.
+restarts and exposes `last_read` and `source` attributes. For protocol
+troubleshooting, `ff05_raw`, `ff05_source`, `ff29_raw`, `protocol_version` and
+`firmware_revision` preserve the most recent raw battery/session evidence in
+one place. A fresh brush reading is preferred; the ending percentage from a
+newly retained session result is used as a local fallback when a current
+reading is unavailable.
 
 The **Last session** attributes can include:
 
