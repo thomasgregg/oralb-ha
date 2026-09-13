@@ -691,6 +691,11 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             self._attr_extra_state_attributes = {
                 "last_read": data.get("battery_updated_at"),
                 "source": data.get("battery_source"),
+                "ff05_raw": data.get("battery_status_raw"),
+                "ff05_source": data.get("battery_status_source"),
+                "ff29_raw": data.get("last_session_record_raw"),
+                "protocol_version": data.get("protocol_version"),
+                "firmware_revision": data.get("firmware_revision"),
             }
         elif self.entity_description.key == "smiley":
             self._attr_extra_state_attributes = {
