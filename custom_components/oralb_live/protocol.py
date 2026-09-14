@@ -7,7 +7,23 @@ regression-tested without installing Home Assistant.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Literal
+
+
+SessionRecord = dict[str, int | float]
+SessionRecordDecoder = Callable[[bytes | bytearray], SessionRecord]
+SessionRecordDecodeStatus = Literal[
+    "decoded", "invalid", "unresolved", "unsupported"
+]
+
+
+@dataclass(frozen=True)
+class SessionRecordDecodeResult:
+    """One protocol-aware FF29 decode attempt."""
+
+    status: SessionRecordDecodeStatus
+    value: SessionRecord | None = None
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -253,7 +269,7 @@ def advance_session_timer_evidence(
     return baseline, seconds > baseline
 
 
-def parse_session_record(payload: bytes | bytearray) -> dict[str, int | float]:
+def parse_session_record(payload: bytes | bytearray) -> SessionRecord:
     """Decode the protocol 7/8 FF29 retained-session summary.
 
     The two 16-bit words at offsets 4 and 6 contain packed identifiers and
@@ -286,6 +302,60 @@ def parse_session_record(payload: bytes | bytearray) -> dict[str, int | float]:
     if len(payload) >= 21 and payload[20] <= 100:
         result["battery_end"] = payload[20]
     return result
+
+
+# Register compatibility explicitly instead of assuming that every older or
+# future protocol uses the newest known layout. Protocol 9 already followed
+# this decoder before protocol-aware dispatch was introduced, so retaining it
+# here preserves that existing behavior while protocols 7/8 remain the
+# verified captures documented in docs/protocol.md.
+SESSION_RECORD_DECODERS: dict[int, SessionRecordDecoder] = {
+    7: parse_session_record,
+    8: parse_session_record,
+    9: parse_session_record,
+}
+
+
+def decode_session_record(
+    payload: bytes | bytearray,
+    *,
+    protocol_version: int | None,
+    model_id: int | None = None,
+    firmware_revision: int | None = None,
+) -> SessionRecordDecodeResult:
+    """Decode FF29 with the layout registered for one brush identity.
+
+    Model and firmware are accepted now so a future hardware-specific layout
+    can be selected without changing coordinator call sites. Unknown identity
+    stays retriable; a known but unregistered protocol is safely unsupported.
+    """
+    if protocol_version is None:
+        return SessionRecordDecodeResult(
+            "unresolved", reason="brush protocol version is not available yet"
+        )
+
+    decoder = SESSION_RECORD_DECODERS.get(protocol_version)
+    if decoder is None:
+        details = [f"protocol {protocol_version}"]
+        if model_id is not None:
+            details.append(f"model 0x{model_id:02x}")
+        if firmware_revision is not None:
+            details.append(f"firmware {firmware_revision}")
+        return SessionRecordDecodeResult(
+            "unsupported",
+            reason="no FF29 decoder is registered for " + ", ".join(details),
+        )
+
+    try:
+        value = decoder(payload)
+    except (IndexError, ValueError) as error:
+        return SessionRecordDecodeResult("invalid", reason=str(error))
+    if not value:
+        return SessionRecordDecodeResult(
+            "invalid",
+            reason=f"payload does not match protocol {protocol_version} FF29",
+        )
+    return SessionRecordDecodeResult("decoded", value=value)
 
 
 def decode_sector(

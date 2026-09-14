@@ -284,6 +284,12 @@ like every `special_*` verdict; only `off` means that no result was exposed. If
 the handle supplies only `off` or no usable face, `display_face` remains `null`
 rather than inheriting an older session's face.
 
+`FF29` is selected through an exact protocol-version decoder registry. The
+verified protocol-7/8 layout remains in use there, with protocol 9 retaining
+its existing compatibility. Protocol 6 exposes a different payload, so
+Oral-B Live preserves its locally reconstructed session and raw `ff29_raw`
+diagnostic instead of interpreting that payload as a newer-format result.
+
 ### iO Sense Charger device
 
 A successfully matched charger appears as a separate device connected through

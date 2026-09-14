@@ -379,6 +379,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
     def test_invalid_session_record_does_not_overwrite_battery(self) -> None:
         """An uncommitted all-zero FF29 buffer is not a battery reading."""
         c = self._coordinator()
+        c.data["protocol_version"] = 8
         c.data["battery"] = 76
         c.data["battery_updated_at"] = "previous-update"
         c.data["battery_source"] = const.DATA_SOURCE_DIRECT
@@ -425,9 +426,35 @@ class PassiveSessionDurationTests(unittest.TestCase):
             },
         )
 
+    def test_protocol_6_ff29_cannot_override_ff05_battery(self) -> None:
+        """Protocol 6 keeps its valid FF05 value and local session summary."""
+        c = self._coordinator()
+        c.data["protocol_version"] = 6
+        c.data["last_session_duration"] = 120
+        c.data["last_session_source"] = const.DATA_SOURCE_ADVERTISEMENT
+        c._apply_battery_status(
+            bytes.fromhex("5b 00 00 00"), const.DATA_SOURCE_DIRECT
+        )
+        record = bytes.fromhex(
+            "ff 02 02 00 00 01 03 02 04 05 07 07 06 01 00 00 00 00 00 00"
+        )
+
+        result = asyncio.run(c._async_apply_session_record(record, None))
+
+        self.assertEqual(result, "unsupported")
+        self.assertEqual(c.data["battery"], 91)
+        self.assertEqual(c.data["battery_time_remaining"], 0)
+        self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_DIRECT)
+        self.assertEqual(c.data["last_session_duration"], 120)
+        self.assertEqual(
+            c.data["last_session_source"], const.DATA_SOURCE_ADVERTISEMENT
+        )
+        self.assertEqual(c.data["last_session_record_raw"], record.hex(" "))
+
     def test_valid_duplicate_session_record_refreshes_battery(self) -> None:
         """A previously counted real record remains useful for battery state."""
         c = self._coordinator()
+        c.data["protocol_version"] = 8
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = int.from_bytes(record[0:4], "little")
 
@@ -441,6 +468,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
     def test_same_timestamp_longer_record_refines_without_recounting(self) -> None:
         """A final FF29 may extend an interim record from the same timer run."""
         c = self._coordinator()
+        c.data["protocol_version"] = 8
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         session_ts = int.from_bytes(record[0:4], "little")
         now = coordinator.dt_util.utcnow()
@@ -468,6 +496,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
 
     def test_old_same_timestamp_record_cannot_replace_newer_local_session(self) -> None:
         c = self._coordinator()
+        c.data["protocol_version"] = 8
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = int.from_bytes(record[0:4], "little")
         c.data["last_session_duration"] = 50
@@ -484,6 +513,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c = self._coordinator()
         c._parse_advertisement(_advertisement(_payload(3, 110)))
         c._parse_advertisement(_advertisement(_payload(2, 120, face=6)))
+        c.data["protocol_version"] = 8
         passive_start = c.data["last_session_start"]
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = 0
@@ -506,6 +536,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c = self._coordinator()
         c._parse_advertisement(_advertisement(_payload(3, 110)))
         c._parse_advertisement(_advertisement(_payload(2, 120, face=0)))
+        c.data["protocol_version"] = 8
         passive_start = c.data["last_session_start"]
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = 0
@@ -526,6 +557,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
     def test_new_retained_record_does_not_inherit_previous_face(self) -> None:
         """A newer FF29-only session has an unknown face, not a stale one."""
         c = self._coordinator()
+        c.data["protocol_version"] = 8
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = 0
         c._store.async_save = AsyncMock()
@@ -549,6 +581,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c = self._coordinator()
         c._parse_advertisement(_advertisement(_payload(3, 60)))
         c._parse_advertisement(_advertisement(_payload(2, 60, face=0)))
+        c.data["protocol_version"] = 8
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = 0
         c._store.async_save = AsyncMock()
@@ -790,6 +823,7 @@ class PauseResumeSessionTests(unittest.TestCase):
         c._parse_advertisement(_advertisement(_payload(3, 121)))
         c._parse_advertisement(_advertisement(_payload(2, 128, face=6)))
         c._finalize_pending_session()
+        c.data["protocol_version"] = 8
         local_start = c.data["last_session_start"]
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = 0
@@ -861,6 +895,7 @@ class PauseResumeTimeoutTests(unittest.IsolatedAsyncioTestCase):
         c._schedule_pending_session_finalize = lambda: False
         c._store.async_save = AsyncMock()
         c._last_synced_session_ts = 0
+        c.data["protocol_version"] = 8
         c._apply_state(const.RUNNING_STATE)
         c._track_session_time(128, confirm_session=True)
         c._apply_state(2)
@@ -1311,6 +1346,21 @@ class SessionSyncRetryTests(unittest.TestCase):
         c._session_sync_retry_count = 2
         c._session_sync_retry_not_before = 999.0
         c._async_sync_once = AsyncMock(return_value="new")
+
+        self._run_sequence(c)
+
+        c._async_sync_once.assert_awaited_once()
+        self.assertEqual(c._processed_session_generation, 1)
+        self.assertFalse(c._session_pending_sync)
+        self.assertEqual(c._session_sync_retry_count, 0)
+        self.assertEqual(c._session_sync_retry_not_before, 0.0)
+
+    def test_unsupported_record_resolves_generation_without_retry(self) -> None:
+        """Known unsupported FF29 layouts keep the local session without retries."""
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._async_sync_once = AsyncMock(return_value="unsupported")
 
         self._run_sequence(c)
 

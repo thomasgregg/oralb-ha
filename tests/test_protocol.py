@@ -344,6 +344,55 @@ class ProtocolDecoderTests(unittest.TestCase):
         )
         self.assertNotIn("battery_end", parsed)
 
+    def test_session_dispatch_reuses_registered_layouts(self) -> None:
+        payload = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
+
+        for protocol_version in (7, 8, 9):
+            with self.subTest(protocol_version=protocol_version):
+                result = protocol.decode_session_record(
+                    payload,
+                    protocol_version=protocol_version,
+                    model_id=0x36,
+                    firmware_revision=0x52,
+                )
+                self.assertEqual(result.status, "decoded")
+                self.assertIsNotNone(result.value)
+                self.assertEqual(result.value["battery_end"], 94)
+
+    def test_session_dispatch_rejects_protocol_6_layout_guess(self) -> None:
+        result = protocol.decode_session_record(
+            bytes.fromhex(
+                "ff 02 02 00 00 01 03 02 04 05 07 07 06 01 00 00 00 00 00 00"
+            ),
+            protocol_version=6,
+            model_id=0x31,
+            firmware_revision=107,
+        )
+
+        self.assertEqual(result.status, "unsupported")
+        self.assertIsNone(result.value)
+        self.assertIn("protocol 6", result.reason)
+        self.assertIn("model 0x31", result.reason)
+        self.assertIn("firmware 107", result.reason)
+
+    def test_session_dispatch_distinguishes_unknown_identity(self) -> None:
+        result = protocol.decode_session_record(
+            bytes.fromhex("26e4ff3161017800800064000a001321280201045e"),
+            protocol_version=None,
+        )
+
+        self.assertEqual(result.status, "unresolved")
+        self.assertIsNone(result.value)
+
+    def test_session_dispatch_rejects_invalid_registered_payload(self) -> None:
+        result = protocol.decode_session_record(
+            bytes(19),
+            protocol_version=8,
+        )
+
+        self.assertEqual(result.status, "invalid")
+        self.assertIsNone(result.value)
+
     def test_comino_sensor_snapshot(self) -> None:
         records = protocol.parse_comino_sensor_snapshot(
             bytes.fromhex("f49bfcf8011612f0cc9bfbf8021612f000001080")
