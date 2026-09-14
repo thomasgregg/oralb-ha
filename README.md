@@ -255,12 +255,9 @@ calibration and current model-scope limitation are documented in the
 [protocol reference](docs/protocol.md#smartring-led-drive-levels).
 
 The **Battery** entity keeps its last valid percentage across Home Assistant
-restarts and exposes `last_read` and `source` attributes. For protocol
-troubleshooting, `ff05_raw`, `ff05_source`, `ff29_raw`, `protocol_version` and
-`firmware_revision` preserve the most recent raw battery/session evidence in
-one place. A fresh brush reading is preferred; the ending percentage from a
-newly retained session result is used as a local fallback when a current
-reading is unavailable.
+restarts and exposes `last_read` and `source` attributes. A fresh brush reading
+is preferred; the ending percentage from a newly retained session result is
+used as a local fallback when a current reading is unavailable.
 
 The **Last session** attributes can include:
 
@@ -287,8 +284,8 @@ rather than inheriting an older session's face.
 `FF29` is selected through an exact protocol-version decoder registry. The
 verified protocol-7/8 layout remains in use there, with protocol 9 retaining
 its existing compatibility. Protocol 6 exposes a different payload, so
-Oral-B Live preserves its locally reconstructed session and raw `ff29_raw`
-diagnostic instead of interpreting that payload as a newer-format result.
+Oral-B Live preserves its locally reconstructed session instead of
+interpreting that payload as a newer-format result.
 
 ### iO Sense Charger device
 
