@@ -191,9 +191,6 @@ class OralBLiveCoordinator:
             "battery_temperature": None,
             "battery_updated_at": None,
             "battery_source": None,
-            "battery_status_raw": None,
-            "battery_status_source": None,
-            "last_session_record_raw": None,
             "refill_state": None,
             "refill_state_raw": None,
             "refill_days": None,
@@ -1064,13 +1061,6 @@ class OralBLiveCoordinator:
         """
         raw_record = bytes(record)
         raw_hex = raw_record.hex(" ")
-        self.data["last_session_record_raw"] = raw_hex
-        _LOGGER.debug(
-            "%s: FF29 raw (%s bytes): %s",
-            self.name,
-            len(raw_record),
-            raw_hex or "<empty>",
-        )
         decoded = decode_session_record(
             raw_record,
             protocol_version=self.data.get("protocol_version"),
@@ -1965,23 +1955,11 @@ class OralBLiveCoordinator:
         source: str | None = None,
     ) -> None:
         if payload is not None:
-            raw_payload = bytes(payload)
-            raw_hex = raw_payload.hex(" ")
-            raw_source = source or self.data.get("data_source")
-            self.data["battery_status_raw"] = raw_hex
-            self.data["battery_status_source"] = raw_source
-            _LOGGER.debug(
-                "%s: FF05 raw (%s, %s bytes): %s",
-                self.name,
-                raw_source or "unknown source",
-                len(raw_payload),
-                raw_hex or "<empty>",
-            )
-            parsed = parse_battery_status(raw_payload)
+            parsed = parse_battery_status(payload)
             self.data.update(parsed)
             if "battery" in parsed:
                 self.data["battery_updated_at"] = dt_util.utcnow()
-                self.data["battery_source"] = raw_source
+                self.data["battery_source"] = source or self.data.get("data_source")
 
     def _apply_device_info(self, payload: bytes | bytearray | None) -> None:
         if payload is None:

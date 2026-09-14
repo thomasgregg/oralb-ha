@@ -390,23 +390,11 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertEqual(c.data["battery"], 76)
         self.assertEqual(c.data["battery_updated_at"], "previous-update")
         self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_DIRECT)
-        self.assertEqual(c.data["last_session_record_raw"], " ".join(["00"] * 21))
 
-    def test_battery_protocol_diagnostics_capture_raw_payloads(self) -> None:
-        """The Battery entity exposes enough raw evidence for remote debugging."""
+    def test_battery_entity_exposes_only_stable_metadata(self) -> None:
+        """Temporary protocol-capture fields do not leak into stable entities."""
         c = self._coordinator()
-        c.data["protocol_version"] = 6
-        c.data["firmware_revision"] = 107
-        c.data["last_session_record_raw"] = "01 02 03"
-
-        with self.assertLogs(coordinator._LOGGER, level="DEBUG") as logs:
-            c._apply_battery_status(
-                bytes.fromhex("00 00 00 00"), const.DATA_SOURCE_DIRECT
-            )
-
-        self.assertEqual(c.data["battery_status_raw"], "00 00 00 00")
-        self.assertEqual(c.data["battery_status_source"], const.DATA_SOURCE_DIRECT)
-        self.assertIn("FF05 raw (direct_brush, 4 bytes): 00 00 00 00", logs.output[0])
+        c._apply_battery_status(bytes.fromhex("5b 00 00 00"), const.DATA_SOURCE_DIRECT)
 
         description = next(item for item in sensor.SENSORS if item.key == "battery")
         entity = sensor.OralBLiveSensor(c, description)
@@ -418,11 +406,6 @@ class PassiveSessionDurationTests(unittest.TestCase):
             {
                 "last_read": c.data["battery_updated_at"],
                 "source": const.DATA_SOURCE_DIRECT,
-                "ff05_raw": "00 00 00 00",
-                "ff05_source": const.DATA_SOURCE_DIRECT,
-                "ff29_raw": "01 02 03",
-                "protocol_version": 6,
-                "firmware_revision": 107,
             },
         )
 
@@ -449,7 +432,9 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertEqual(
             c.data["last_session_source"], const.DATA_SOURCE_ADVERTISEMENT
         )
-        self.assertEqual(c.data["last_session_record_raw"], record.hex(" "))
+        self.assertNotIn("battery_status_raw", c.data)
+        self.assertNotIn("battery_status_source", c.data)
+        self.assertNotIn("last_session_record_raw", c.data)
 
     def test_valid_duplicate_session_record_refreshes_battery(self) -> None:
         """A previously counted real record remains useful for battery state."""
