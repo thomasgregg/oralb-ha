@@ -710,6 +710,12 @@ The verified protocol-7/8 payload is 21 bytes, little-endian:
 | `19` | brushing mode | mode ID |
 | `20` | battery at session end | percent |
 
+The decoder registry assigns this layout to protocols 7 and 8 and retains the
+integration's prior protocol-9 compatibility. A protocol-6 capture returned a
+different 20-byte payload; it is retained as raw diagnostic evidence but is
+not decoded as this structure. Other unregistered protocol versions also fail
+closed instead of being assumed compatible with the newest known layout.
+
 The brush clock can drift. The wall-clock start is calculated relative to an
 `FF22` value read in the same connection:
 

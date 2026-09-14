@@ -112,6 +112,7 @@ from .protocol import (
     decode_display_face,
     decode_ff09_sector,
     decode_sector,
+    decode_session_record,
     derive_pacer_progress,
     parse_available_modes,
     parse_battery_status,
@@ -120,10 +121,10 @@ from .protocol import (
     parse_pressure_sample,
     parse_refill_remainder,
     parse_ring_color,
-    parse_session_record,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_SESSION_SYNC_RESOLVED_RESULTS = frozenset(("new", "unsupported"))
 
 
 def _decode_time(hi: int, lo: int) -> int:
@@ -667,13 +668,12 @@ class OralBLiveCoordinator:
             self._charger_session_record = None
             self._charger_session_rtc = None
             self._charger_session_rtc_sampled_at = None
-            if (
-                await self._async_apply_session_record(
-                    record, rtc, rtc_sampled_at=rtc_sampled_at
-                )
-                == "new"
-            ):
-                self.data["last_session_source"] = DATA_SOURCE_SESSION
+            result = await self._async_apply_session_record(
+                record, rtc, rtc_sampled_at=rtc_sampled_at
+            )
+            if result in _SESSION_SYNC_RESOLVED_RESULTS:
+                if result == "new":
+                    self.data["last_session_source"] = DATA_SOURCE_SESSION
                 self._session_pending_sync = False
                 self._processed_session_generation = self._session_generation
                 self._reset_session_sync_retry()
@@ -710,15 +710,14 @@ class OralBLiveCoordinator:
         rtc_sampled_at: datetime | None,
     ) -> None:
         """Reconcile one retained charger record after logical finalization."""
-        if (
-            await self._async_apply_session_record(
-                record,
-                rtc,
-                rtc_sampled_at=rtc_sampled_at,
-            )
-            == "new"
-        ):
-            self.data["last_session_source"] = DATA_SOURCE_SESSION
+        result = await self._async_apply_session_record(
+            record,
+            rtc,
+            rtc_sampled_at=rtc_sampled_at,
+        )
+        if result in _SESSION_SYNC_RESOLVED_RESULTS:
+            if result == "new":
+                self.data["last_session_source"] = DATA_SOURCE_SESSION
             self._session_pending_sync = False
             self._processed_session_generation = self._session_generation
             self._reset_session_sync_retry()
@@ -869,7 +868,7 @@ class OralBLiveCoordinator:
                 self._last_sync_attempt = time.monotonic()
                 result = await self._async_sync_once()
                 if (
-                    result == "new"
+                    result in _SESSION_SYNC_RESOLVED_RESULTS
                     or not session_observed
                     or self._processed_session_generation >= target_generation
                     or self._session_generation > target_generation
@@ -887,7 +886,7 @@ class OralBLiveCoordinator:
                     )
                     await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
 
-            if result == "new":
+            if result in _SESSION_SYNC_RESOLVED_RESULTS:
                 self._processed_session_generation = max(
                     self._processed_session_generation, target_generation
                 )
@@ -1072,14 +1071,22 @@ class OralBLiveCoordinator:
             len(raw_record),
             raw_hex or "<empty>",
         )
-        parsed = parse_session_record(raw_record)
-        if not parsed:
+        decoded = decode_session_record(
+            raw_record,
+            protocol_version=self.data.get("protocol_version"),
+            model_id=self.data.get("model_id"),
+            firmware_revision=self.data.get("firmware_revision"),
+        )
+        if decoded.status != "decoded":
             _LOGGER.debug(
-                "%s: unexpected ff29 length %s: %s",
+                "%s: FF29 decode %s: %s",
                 self.name,
-                len(raw_record),
-                raw_hex,
+                decoded.status,
+                decoded.reason or "no reason provided",
             )
+            return decoded.status
+        parsed = decoded.value
+        if parsed is None:  # Defensive guard for future decoder implementations.
             return "invalid"
         session_ts = int(parsed["session_timestamp"])
         duration = int(parsed["duration"])
