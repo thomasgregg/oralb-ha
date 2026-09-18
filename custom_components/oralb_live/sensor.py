@@ -418,6 +418,24 @@ async def async_setup_entry(
             "sensor", DOMAIN, f"{coordinator.address}-{suffix}"
         ):
             registry.async_remove(entity_id)
+    device_registry = dr.async_get(hass)
+    brush_device = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, coordinator.address)},
+        connections={(CONNECTION_BLUETOOTH, coordinator.address)},
+        name=brush_device_name(
+            coordinator.address,
+            coordinator.data.get("model_name"),
+        ),
+        manufacturer="Oral-B",
+        model=coordinator.data.get("model_name"),
+        sw_version=coordinator.data.get("firmware_version"),
+        hw_version=(
+            f"BLE protocol {coordinator.data['protocol_version']}"
+            if coordinator.data.get("protocol_version") is not None
+            else None
+        ),
+    )
     async_add_entities(
         OralBLiveSensor(coordinator, description) for description in SENSORS
     )
@@ -429,6 +447,24 @@ async def async_setup_entry(
         if charger_added or not coordinator.charger or not coordinator.charger.address:
             return
         charger_added = True
+        charger_device = device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, f"{coordinator.address}-iosense")},
+            connections={(CONNECTION_BLUETOOTH, coordinator.charger.address)},
+            name=coordinator.charger.name,
+            manufacturer="Oral-B",
+            model="iO Sense",
+            sw_version=coordinator.charger.data.get("firmware"),
+            hw_version=(
+                str(coordinator.charger.data["hardware_version"])
+                if coordinator.charger.data.get("hardware_version") is not None
+                else None
+            ),
+        )
+        device_registry.async_update_device(
+            charger_device.id,
+            via_device_id=brush_device.id,
+        )
         async_add_entities(
             IOSenseSensor(coordinator, description) for description in CHARGER_SENSORS
         )
@@ -486,10 +522,14 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        last = (
+            await self.async_get_last_state()
+            if self.entity_description.restore
+            else None
+        )
         # Session results must survive restarts; the brush will not replay them.
         if (
-            self.entity_description.restore
-            and (last := await self.async_get_last_state()) is not None
+            last is not None
             and last.state
             not in (
                 None,
@@ -573,6 +613,13 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 for key, value in restored_attributes.items():
                     if value is not None and self.coordinator.data.get(key) is None:
                         self.coordinator.data[key] = value
+            if self.entity_description.key == "sessions_today":
+                self.coordinator.restore_sessions_today(
+                    int(self._attr_native_value),
+                    last.attributes.get("count_date"),
+                )
+                if self.coordinator.data.get("sessions_today") is not None:
+                    self._attr_native_value = self.coordinator.data["sessions_today"]
             elif self.entity_description.key in (
                 "refill_days",
                 "refill_brushing_time",
@@ -581,6 +628,10 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                     value = last.attributes.get(key)
                     if value is not None and self.coordinator.data.get(key) is None:
                         self.coordinator.data[key] = value
+        elif self.entity_description.key == "sessions_today":
+            self.coordinator.restore_sessions_today(0, None)
+        if self.entity_description.key == "last_session":
+            self.coordinator.complete_last_session_restore()
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,
@@ -692,6 +743,14 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
                 "last_read": data.get("battery_updated_at"),
                 "source": data.get("battery_source"),
             }
+        elif self.entity_description.key == "sessions_today":
+            self._attr_extra_state_attributes = {
+                "count_date": (
+                    self.coordinator.sessions_today_date.isoformat()
+                    if self.coordinator.sessions_today_date is not None
+                    else None
+                )
+            }
         elif self.entity_description.key == "smiley":
             self._attr_extra_state_attributes = {
                 "smiley_raw": data.get("smiley_raw"),
@@ -768,7 +827,6 @@ class IOSenseSensor(SensorEntity):
                 if self.charger.data.get("hardware_version") is not None
                 else None
             ),
-            via_device=(DOMAIN, coordinator.address),
         )
 
     async def async_added_to_hass(self) -> None:

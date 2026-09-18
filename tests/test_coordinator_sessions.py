@@ -8,7 +8,7 @@ import pathlib
 import sys
 import types
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 COMPONENT_PATH = (
@@ -369,12 +369,13 @@ class PassiveSessionDurationTests(unittest.TestCase):
     def test_menu_only_observation_remains_provisional(self) -> None:
         """Opening the mode menu without timer progress is not brushing."""
         c = self._coordinator()
+        c._session_pending_sync = False
         c._parse_advertisement(_advertisement(_payload(8, 0)))
         c._parse_advertisement(_advertisement(_payload(4, 0)))
 
         self.assertIsNone(c.data["last_session_duration"])
-        self.assertEqual(c._session_generation, 1)
-        self.assertTrue(c._session_pending_sync)
+        self.assertEqual(c._session_generation, 0)
+        self.assertFalse(c._session_pending_sync)
 
     def test_invalid_session_record_does_not_overwrite_battery(self) -> None:
         """An uncommitted all-zero FF29 buffer is not a battery reading."""
@@ -426,7 +427,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
 
         self.assertEqual(result, "unsupported")
         self.assertEqual(c.data["battery"], 91)
-        self.assertEqual(c.data["battery_time_remaining"], 0)
+        self.assertIsNone(c.data["battery_time_remaining"])
         self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_DIRECT)
         self.assertEqual(c.data["last_session_duration"], 120)
         self.assertEqual(
@@ -622,6 +623,120 @@ class PauseResumeSessionTests(unittest.TestCase):
         self.assertEqual(c.data["last_session_display_face"], "special_4")
         self.assertEqual(c._session_generation, 1)
         self.assertEqual(len(c._pending_passive_sessions), 1)
+
+    def test_late_selection_menu_tail_refines_published_session_once(self) -> None:
+        """The issue-33 127->128 tail cannot replace the real session summary."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 127, sector=4)))
+        original_start = c._session_start
+        c._session_sectors = {1, 2, 3, 4}
+        c._session_pressure_samples = 40
+        c._session_high_pressure = 39
+        c._session_high_pressure_time = 12.5
+        c._parse_advertisement(_advertisement(_payload(2, 127, face=6)))
+        c._finalize_pending_session()
+
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c._session_generation, 1)
+
+        c._parse_advertisement(_advertisement(_payload(8, 127, sector=1)))
+        self.assertEqual(c._session_generation, 1)
+        c._parse_advertisement(_advertisement(_payload(8, 128, sector=1)))
+        c._parse_advertisement(_advertisement(_payload(2, 128, face=6)))
+        c._finalize_pending_session()
+
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_start"], original_start)
+        self.assertEqual(c.data["last_session_duration"], 128)
+        self.assertEqual(c.data["last_session_sectors"], 4)
+        self.assertEqual(c.data["last_session_high_pressure"], 39)
+        self.assertEqual(c.data["last_session_high_pressure_time"], 12.5)
+        self.assertEqual(c.data["last_session_display_face"], "special_6")
+        self.assertEqual(c._session_generation, 1)
+        self.assertEqual(len(c._pending_passive_sessions), 1)
+
+    def test_late_menu_tail_with_timer_reset_is_a_new_session(self) -> None:
+        """A real near-zero reset still wins inside the reconciliation window."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 30)))
+        c._parse_advertisement(_advertisement(_payload(2, 30)))
+        c._finalize_pending_session()
+
+        c._parse_advertisement(_advertisement(_payload(8, 30)))
+        c._parse_advertisement(_advertisement(_payload(8, 0)))
+        c._parse_advertisement(_advertisement(_payload(8, 1)))
+        c._parse_advertisement(_advertisement(_payload(2, 5)))
+        c._finalize_pending_session()
+
+        self.assertEqual(c.data["sessions_today"], 2)
+        self.assertEqual(c.data["last_session_duration"], 5)
+        self.assertEqual(c._session_generation, 2)
+
+    def test_slightly_lower_late_tail_does_not_create_a_session(self) -> None:
+        """One out-of-order tail packet cannot defeat recent-session matching."""
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 80)))
+        c._parse_advertisement(_advertisement(_payload(2, 80)))
+        c._finalize_pending_session()
+
+        c._parse_advertisement(_advertisement(_payload(8, 80)))
+        c._parse_advertisement(_advertisement(_payload(8, 79)))
+        c._parse_advertisement(_advertisement(_payload(8, 81)))
+        c._parse_advertisement(_advertisement(_payload(2, 81)))
+        c._finalize_pending_session()
+
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_duration"], 81)
+        self.assertEqual(c._session_generation, 1)
+
+    def test_recent_menu_tail_without_progress_does_not_create_generation(self) -> None:
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 40)))
+        c._parse_advertisement(_advertisement(_payload(2, 40)))
+        c._finalize_pending_session()
+
+        c._parse_advertisement(_advertisement(_payload(8, 40)))
+        c._parse_advertisement(_advertisement(_payload(9, 40)))
+
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c._session_generation, 1)
+        self.assertFalse(c._session_active)
+
+    def test_late_tail_cannot_downgrade_retained_session_details(self) -> None:
+        c = self._coordinator()
+        c._parse_advertisement(_advertisement(_payload(3, 127)))
+        c._session_sectors = {1, 2, 3, 4}
+        c._session_pressure_samples = 40
+        c._session_high_pressure = 39
+        c._parse_advertisement(_advertisement(_payload(2, 127, face=6)))
+        c._finalize_pending_session()
+        c.data.update(
+            {
+                "last_session_sectors": 6,
+                "last_session_high_pressure": 40,
+                "last_session_average_pressure": 1900,
+                "last_session_maximum_pressure": 3300,
+                "last_session_battery_end": 94,
+                "last_session_target_duration": 120,
+                "last_session_id": 353,
+                "last_session_source": const.DATA_SOURCE_SESSION,
+            }
+        )
+
+        c._parse_advertisement(_advertisement(_payload(8, 127)))
+        c._parse_advertisement(_advertisement(_payload(8, 128)))
+        c._parse_advertisement(_advertisement(_payload(2, 128, face=6)))
+        c._finalize_pending_session()
+
+        self.assertEqual(c.data["sessions_today"], 1)
+        self.assertEqual(c.data["last_session_sectors"], 6)
+        self.assertEqual(c.data["last_session_high_pressure"], 40)
+        self.assertEqual(c.data["last_session_average_pressure"], 1900)
+        self.assertEqual(c.data["last_session_maximum_pressure"], 3300)
+        self.assertEqual(c.data["last_session_battery_end"], 94)
+        self.assertEqual(c.data["last_session_target_duration"], 120)
+        self.assertEqual(c.data["last_session_id"], 353)
+        self.assertEqual(c.data["last_session_source"], const.DATA_SOURCE_SESSION)
 
     def test_sectors_and_pressure_summaries_merge_without_idle_time(self) -> None:
         c = self._coordinator(const.CONNECTION_MODE_LIVE)
@@ -896,6 +1011,65 @@ class PauseResumeTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.data["sessions_today"], 1)
         self.assertEqual(c.data["last_session_duration"], 128)
         self.assertEqual(c.data["last_session_source"], const.DATA_SOURCE_SESSION)
+
+
+class SessionsTodayDateTests(unittest.TestCase):
+    """Daily counts are scoped to Home Assistant's local calendar day."""
+
+    def _coordinator(self):
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        return coordinator.OralBLiveCoordinator(
+            MagicMock(),
+            "AA:BB:CC:DD:EE:FF",
+            "test",
+            const.CONNECTION_MODE_CHARGER,
+        )
+
+    def test_dated_restore_discards_yesterdays_count(self) -> None:
+        c = self._coordinator()
+        now = datetime(2026, 9, 18, 8, tzinfo=timezone.utc)
+
+        with patch.object(coordinator.dt_util, "now", return_value=now):
+            c.restore_sessions_today(2, "2026-09-17")
+
+        self.assertEqual(c.data["sessions_today"], 0)
+        self.assertEqual(c.sessions_today_date.isoformat(), "2026-09-18")
+
+    def test_legacy_restore_survives_only_when_last_session_is_today(self) -> None:
+        now = datetime(2026, 9, 18, 8, tzinfo=timezone.utc)
+        for last_start, expected in (
+            (datetime(2026, 9, 18, 6, tzinfo=timezone.utc), 2),
+            (datetime(2026, 9, 17, 22, tzinfo=timezone.utc), 0),
+        ):
+            with self.subTest(last_start=last_start):
+                c = self._coordinator()
+                c.data["last_session_start"] = last_start
+                with patch.object(coordinator.dt_util, "now", return_value=now):
+                    c.complete_last_session_restore()
+                    c.restore_sessions_today(2, None)
+                self.assertEqual(c.data["sessions_today"], expected)
+
+    def test_midnight_reset_publishes_zero(self) -> None:
+        c = self._coordinator()
+        c.data["sessions_today"] = 3
+        c._sessions_today_date = datetime(2026, 9, 17).date()
+        c._push = MagicMock()
+
+        c._async_reset_sessions_today(datetime(2026, 9, 18))
+
+        self.assertEqual(c.data["sessions_today"], 0)
+        self.assertEqual(c.sessions_today_date.isoformat(), "2026-09-18")
+        c._push.assert_called_once()
+
+    def test_yesterdays_delayed_session_is_not_counted_today(self) -> None:
+        c = self._coordinator()
+        now = datetime(2026, 9, 18, 8, tzinfo=timezone.utc)
+        start = datetime(2026, 9, 17, 22, tzinfo=timezone.utc)
+
+        with patch.object(coordinator.dt_util, "now", return_value=now):
+            c._count_session_for_today(start)
+
+        self.assertEqual(c.data["sessions_today"], 0)
 
 
 class ConnectedSessionDisplayFaceRegressionTests(unittest.TestCase):
@@ -1267,6 +1441,8 @@ class SessionSyncRetryTests(unittest.TestCase):
             MagicMock(), "AA:BB:CC:DD:EE:FF", "test", const.CONNECTION_MODE_CHARGER
         )
         c.data["state_raw"] = 2
+        c._maintenance_pending = False
+        c._last_sync_ok = 1000.0
         return c
 
     def _run_sequence(self, c) -> None:
@@ -1286,7 +1462,7 @@ class SessionSyncRetryTests(unittest.TestCase):
         c = self._coordinator()
         c._session_generation = 1
         c._session_pending_sync = True
-        c._async_sync_once = AsyncMock(return_value="failed")
+        c._async_sync_once = AsyncMock(return_value=coordinator._SyncOutcome())
 
         self._run_sequence(c)
 
@@ -1301,7 +1477,9 @@ class SessionSyncRetryTests(unittest.TestCase):
         c._session_generation = 1
         c._session_pending_sync = True
         c._session_sync_retry_count = 1
-        c._async_sync_once = AsyncMock(return_value="duplicate")
+        c._async_sync_once = AsyncMock(
+            return_value=coordinator._SyncOutcome("duplicate")
+        )
 
         self._run_sequence(c)
 
@@ -1316,7 +1494,9 @@ class SessionSyncRetryTests(unittest.TestCase):
         c._session_generation = 1
         c._session_pending_sync = True
         c._session_sync_retry_count = 3
-        c._async_sync_once = AsyncMock(return_value="invalid")
+        c._async_sync_once = AsyncMock(
+            return_value=coordinator._SyncOutcome("invalid")
+        )
 
         self._run_sequence(c)
 
@@ -1330,7 +1510,9 @@ class SessionSyncRetryTests(unittest.TestCase):
         c._session_pending_sync = True
         c._session_sync_retry_count = 2
         c._session_sync_retry_not_before = 999.0
-        c._async_sync_once = AsyncMock(return_value="new")
+        c._async_sync_once = AsyncMock(
+            return_value=coordinator._SyncOutcome("new")
+        )
 
         self._run_sequence(c)
 
@@ -1345,7 +1527,9 @@ class SessionSyncRetryTests(unittest.TestCase):
         c = self._coordinator()
         c._session_generation = 1
         c._session_pending_sync = True
-        c._async_sync_once = AsyncMock(return_value="unsupported")
+        c._async_sync_once = AsyncMock(
+            return_value=coordinator._SyncOutcome("unsupported")
+        )
 
         self._run_sequence(c)
 
@@ -1355,6 +1539,58 @@ class SessionSyncRetryTests(unittest.TestCase):
         self.assertEqual(c._session_sync_retry_count, 0)
         self.assertEqual(c._session_sync_retry_not_before, 0.0)
 
+    def test_unsupported_record_does_not_hide_failed_battery_refresh(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._maintenance_pending = True
+        c._last_sync_ok = 0.0
+        c._async_sync_once = AsyncMock(
+            return_value=coordinator._SyncOutcome("unsupported", False, True)
+        )
+
+        self._run_sequence(c)
+
+        self.assertEqual(c._processed_session_generation, 1)
+        self.assertFalse(c._session_pending_sync)
+        self.assertTrue(c._maintenance_pending)
+        self.assertEqual(c._maintenance_sync_retry_count, 1)
+        self.assertEqual(c._maintenance_sync_retry_not_before, 1060.0)
+
+    def test_unsupported_record_and_fresh_battery_resolve_independently(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._maintenance_pending = True
+        c._last_sync_ok = 0.0
+        c._async_sync_once = AsyncMock(
+            return_value=coordinator._SyncOutcome("unsupported", True, True)
+        )
+
+        self._run_sequence(c)
+
+        self.assertEqual(c._processed_session_generation, 1)
+        self.assertFalse(c._session_pending_sync)
+        self.assertFalse(c._maintenance_pending)
+        self.assertEqual(c._last_sync_ok, 1000.0)
+
+    def test_fresh_battery_does_not_resolve_a_missing_session_record(self) -> None:
+        c = self._coordinator()
+        c._session_generation = 1
+        c._session_pending_sync = True
+        c._maintenance_pending = True
+        c._last_sync_ok = 0.0
+        c._async_sync_once = AsyncMock(
+            return_value=coordinator._SyncOutcome("missing", True, True)
+        )
+
+        self._run_sequence(c)
+
+        self.assertEqual(c._processed_session_generation, 0)
+        self.assertTrue(c._session_pending_sync)
+        self.assertFalse(c._maintenance_pending)
+        self.assertEqual(c._async_sync_once.await_count, const.SYNC_RETRY_ATTEMPTS)
+
     def test_concurrent_charger_resolution_does_not_resurrect_pending(self) -> None:
         c = self._coordinator()
         c._session_generation = 1
@@ -1363,7 +1599,7 @@ class SessionSyncRetryTests(unittest.TestCase):
         async def _charger_wins():
             c._processed_session_generation = 1
             c._session_pending_sync = False
-            return "duplicate"
+            return coordinator._SyncOutcome("duplicate")
 
         c._async_sync_once = AsyncMock(side_effect=_charger_wins)
 
@@ -1385,8 +1621,8 @@ class SessionSyncRetryTests(unittest.TestCase):
                 c._session_generation = 2
                 c._session_sync_retry_count = 0
                 c._session_sync_retry_not_before = 0.0
-                return "failed"
-            return "new"
+                return coordinator._SyncOutcome()
+            return coordinator._SyncOutcome("new")
 
         c._async_sync_once = AsyncMock(side_effect=_new_generation_then_record)
 
@@ -1402,7 +1638,7 @@ class SessionSyncRetryTests(unittest.TestCase):
         c._session_generation = 1
         c._session_pending_sync = True
         c.charger.address = "11:22:33:44:55:66"
-        c._async_sync_once = AsyncMock(return_value="failed")
+        c._async_sync_once = AsyncMock(return_value=coordinator._SyncOutcome())
 
         self._run_sequence(c)
 
@@ -1411,13 +1647,13 @@ class SessionSyncRetryTests(unittest.TestCase):
         self.assertTrue(c._session_pending_sync)
         self.assertEqual(c._session_sync_retry_count, 0)
 
-    def test_new_generation_resets_deferred_retry(self) -> None:
+    def test_confirmed_generation_resets_deferred_retry(self) -> None:
         c = self._coordinator()
         c._tracked_state_raw = 2
         c._session_sync_retry_count = 3
         c._session_sync_retry_not_before = 999.0
 
-        c._apply_state(8)
+        c._apply_state(const.RUNNING_STATE)
 
         self.assertEqual(c._session_generation, 1)
         self.assertTrue(c._session_pending_sync)
@@ -1429,7 +1665,11 @@ class SessionSyncRetryTests(unittest.TestCase):
         c._session_generation = 0
         c._processed_session_generation = 0
         c._session_pending_sync = True
-        c._async_sync_once = AsyncMock(return_value="duplicate")
+        c._maintenance_pending = True
+        c._last_sync_ok = 0.0
+        c._async_sync_once = AsyncMock(
+            return_value=coordinator._SyncOutcome("duplicate", True, True)
+        )
 
         self._run_sequence(c)
 
@@ -1447,6 +1687,86 @@ class SessionSyncRetryTests(unittest.TestCase):
             c._maybe_schedule_sync()
 
         c.hass.async_create_background_task.assert_not_called()
+
+
+class GattServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """A stale all-missing GATT table gets one bounded rediscovery."""
+
+    class _Services:
+        def __init__(self, core_present: bool) -> None:
+            self.core_present = core_present
+
+        def get_characteristic(self, uuid: str):
+            if uuid == const.CHAR_STATE and self.core_present:
+                return object()
+            return None
+
+    class _Client:
+        def __init__(self, core_present: bool) -> None:
+            self.services = GattServiceRecoveryTests._Services(core_present)
+            self.clear_cache = AsyncMock(return_value=True)
+            self.disconnect = AsyncMock()
+
+    def _coordinator(self):
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        return coordinator.OralBLiveCoordinator(
+            MagicMock(),
+            "AA:BB:CC:DD:EE:FF",
+            "test",
+            const.CONNECTION_MODE_CHARGER,
+        )
+
+    async def test_missing_core_characteristic_forces_one_uncached_discovery(
+        self,
+    ) -> None:
+        c = self._coordinator()
+        stale = self._Client(False)
+        fresh = self._Client(True)
+        establish = AsyncMock(side_effect=(stale, fresh))
+
+        with patch.object(coordinator, "establish_connection", establish):
+            result = await c._async_establish_brush_connection(
+                object(), max_attempts=2
+            )
+
+        self.assertIs(result, fresh)
+        self.assertEqual(establish.await_count, 2)
+        stale.clear_cache.assert_awaited_once()
+        stale.disconnect.assert_awaited_once()
+        self.assertFalse(
+            establish.await_args_list[1].kwargs["use_services_cache"]
+        )
+
+    async def test_present_core_does_not_refresh_for_missing_optional_values(
+        self,
+    ) -> None:
+        c = self._coordinator()
+        client = self._Client(True)
+        establish = AsyncMock(return_value=client)
+
+        with patch.object(coordinator, "establish_connection", establish):
+            result = await c._async_establish_brush_connection(
+                object(), max_attempts=2
+            )
+
+        self.assertIs(result, client)
+        establish.assert_awaited_once()
+        client.clear_cache.assert_not_awaited()
+
+    async def test_persistently_missing_core_stops_after_one_refresh(self) -> None:
+        c = self._coordinator()
+        stale = self._Client(False)
+        still_stale = self._Client(False)
+        establish = AsyncMock(side_effect=(stale, still_stale))
+
+        with (
+            patch.object(coordinator, "establish_connection", establish),
+            self.assertRaises(coordinator.BleakError),
+        ):
+            await c._async_establish_brush_connection(object(), max_attempts=2)
+
+        self.assertEqual(establish.await_count, 2)
+        still_stale.disconnect.assert_awaited_once()
 
 
 class LiveSectorNumberingTests(unittest.TestCase):
@@ -1528,6 +1848,92 @@ class LiveSectorNumberingTests(unittest.TestCase):
         c._parse_advertisement(_advertisement(_payload(3, 10, sector=1)))
 
         self.assertEqual(c.data["sector"], "sector_1")
+
+
+class ChargerDeviceLinkTests(unittest.IsolatedAsyncioTestCase):
+    """The charger uses a registry id link without deprecated DeviceInfo."""
+
+    async def test_setup_links_existing_device_ids_without_via_device(self) -> None:
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        hass = MagicMock()
+        entry = MagicMock()
+        entry.entry_id = "entry-id"
+        c = coordinator.OralBLiveCoordinator(
+            hass,
+            "AA:BB:CC:DD:EE:FF",
+            "test",
+            const.CONNECTION_MODE_CHARGER,
+        )
+        assert c.charger is not None
+        c.charger.address = "11:22:33:44:55:66"
+        c.charger.data["firmware"] = "0.3.4"
+        hass.data = {const.DOMAIN: {entry.entry_id: c}}
+
+        entity_registry = MagicMock()
+        entity_registry.async_get_entity_id.return_value = None
+        device_registry = MagicMock()
+        brush_device = types.SimpleNamespace(id="brush-device-id")
+        charger_device = types.SimpleNamespace(id="charger-device-id")
+        device_registry.async_get_or_create.side_effect = (
+            brush_device,
+            charger_device,
+        )
+        async_add_entities = MagicMock()
+
+        with (
+            patch.object(sensor.er, "async_get", return_value=entity_registry),
+            patch.object(sensor.dr, "async_get", return_value=device_registry),
+            patch.object(
+                sensor,
+                "async_dispatcher_connect",
+                return_value=lambda: None,
+            ),
+        ):
+            await sensor.async_setup_entry(hass, entry, async_add_entities)
+
+        device_registry.async_update_device.assert_called_once_with(
+            "charger-device-id",
+            via_device_id="brush-device-id",
+        )
+        charger_entities = list(async_add_entities.call_args_list[1].args[0])
+        self.assertGreater(len(charger_entities), 0)
+        self.assertNotIn("via_device", charger_entities[0].device_info)
+
+
+class SessionsTodaySensorTests(unittest.IsolatedAsyncioTestCase):
+    """The restored entity persists and publishes its represented date."""
+
+    async def test_stale_dated_state_restores_as_zero_for_today(self) -> None:
+        coordinator.async_dispatcher_send = lambda *args, **kwargs: None
+        c = coordinator.OralBLiveCoordinator(
+            MagicMock(),
+            "AA:BB:CC:DD:EE:FF",
+            "test",
+            const.CONNECTION_MODE_CHARGER,
+        )
+        description = next(
+            item for item in sensor.SENSORS if item.key == "sessions_today"
+        )
+        entity = sensor.OralBLiveSensor(c, description)
+        entity.hass = MagicMock()
+        entity.async_get_last_state = AsyncMock(
+            return_value=types.SimpleNamespace(
+                state="3",
+                attributes={"count_date": "2026-09-17"},
+            )
+        )
+        now = datetime(2026, 9, 18, 8, tzinfo=timezone.utc)
+
+        with (
+            patch.object(coordinator.dt_util, "now", return_value=now),
+            patch.object(sensor, "async_dispatcher_connect", return_value=lambda: None),
+            patch.object(entity, "async_write_ha_state"),
+        ):
+            await entity.async_added_to_hass()
+
+        self.assertEqual(c.data["sessions_today"], 0)
+        self.assertEqual(entity.native_value, 0)
+        self.assertEqual(entity.extra_state_attributes["count_date"], "2026-09-18")
 
 
 class LastSessionDisplayFaceSensorTests(unittest.IsolatedAsyncioTestCase):

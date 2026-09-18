@@ -73,14 +73,16 @@ def parse_comino_sensor_snapshot(
 
 def parse_battery_status(
     payload: bytes | bytearray,
-) -> dict[str, int | float]:
+    *,
+    protocol_version: int | None = None,
+) -> dict[str, int | float | None]:
     """Decode the fields available in ff05.
 
     Protocol 6 added remaining seconds. Protocol 8 extended the payload with
     voltage, current and battery temperature. Length checks keep this safe for
     older brushes.
     """
-    result: dict[str, int | float] = {}
+    result: dict[str, int | float | None] = {}
     if not payload:
         return result
 
@@ -89,7 +91,13 @@ def parse_battery_status(
 
     if len(payload) >= 3:
         seconds = int.from_bytes(payload[1:3], "little")
-        if seconds != 0xFFFF:
+        if seconds == 0xFFFF or (protocol_version == 6 and seconds == 0):
+            # Captured protocol-6 brushes return 00 00 while reporting a
+            # non-empty battery. It is an unavailable sentinel, not a claim
+            # that no brushing time remains. An explicit sentinel must also
+            # clear an older estimate instead of leaving it stale.
+            result["battery_time_remaining"] = None
+        else:
             result["battery_time_remaining"] = seconds
 
     if len(payload) >= 5:

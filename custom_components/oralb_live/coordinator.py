@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -30,6 +30,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.components.bluetooth.match import BluetoothCallbackMatcher
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
@@ -88,6 +89,7 @@ from .const import (
     SESSION_DISPLAY_FACE_PRE_END_GRACE_SECONDS,
     SESSION_DISPLAY_FACE_READ_RETRY_DELAYS,
     SESSION_DISPLAY_FACE_RESULT_MIN_RAW,
+    SESSION_LATE_CONTINUATION_WINDOW_SECONDS,
     SESSION_PAUSE_GRACE_SECONDS,
     SESSION_RECONCILE_WINDOW_SECONDS,
     SESSION_RECORD_SETTLE_SECONDS,
@@ -154,6 +156,17 @@ class _PendingSession:
     duration_source: str
     display_face: str | None = None
     display_face_source: str | None = None
+    logical_generation: int = 0
+    counted: bool = False
+
+
+@dataclass(frozen=True)
+class _SyncOutcome:
+    """Independent results from one short brush connection."""
+
+    session_result: str = "failed"
+    battery_refreshed: bool = False
+    any_value_read: bool = False
 
 
 class OralBLiveCoordinator:
@@ -243,6 +256,7 @@ class OralBLiveCoordinator:
         self._last_activity = 0.0
         self._unsub_bluetooth: callback | None = None
         self._unsub_unavailable: callback | None = None
+        self._unsub_midnight: callback | None = None
         self._stopping = False
         # --- session tracking (live mode / passive adverts) ---
         self._session_active = False
@@ -270,6 +284,13 @@ class OralBLiveCoordinator:
         self._resume_timer_baseline: int | None = None
         self._resume_saw_selection_menu = False
         self._session_generation_marked = False
+        self._session_started_via_selection_menu = False
+        self._session_already_counted = False
+        self._session_base_display_face: str | None = None
+        self._session_base_display_face_source: str | None = None
+        self._late_continuation_candidate: _PendingSession | None = None
+        self._recent_finalized_session: _PendingSession | None = None
+        self._recent_finalized_at = 0.0
         # FF0A and FF04 are independent characteristics, and advertisements
         # carry both fields in one packet only on the passive path. Correlate a
         # transient result with exactly one completed session regardless of
@@ -296,6 +317,14 @@ class OralBLiveCoordinator:
         self._processed_session_generation = 0
         self._session_sync_retry_count = 0
         self._session_sync_retry_not_before = 0.0
+        self._maintenance_pending = True
+        self._maintenance_sync_retry_count = 0
+        self._maintenance_sync_retry_not_before = 0.0
+        self._sessions_today_date: date | None = None
+        self._sessions_today_changed = False
+        self._pending_legacy_sessions_today: int | None = None
+        self._last_session_restore_complete = False
+        self._last_protocol6_session_record: bytes | None = None
         self._charger_timer_anchor: tuple[int, float] | None = None
         self._charger_tick_task: asyncio.Task | None = None
         self._pacer_anchor: tuple[int, int, int] | None = None
@@ -305,6 +334,7 @@ class OralBLiveCoordinator:
         self._pacer_configuration_read = False
         self._pacer_configuration_valid = False
         self._charger_session_record: bytes | None = None
+        self._charger_session_record_sampled_at: datetime | None = None
         self._charger_session_rtc: bytes | None = None
         self._charger_session_rtc_sampled_at: datetime | None = None
         self.charger: IOSenseBridge | None = (
@@ -325,6 +355,13 @@ class OralBLiveCoordinator:
         )
         self._unsub_unavailable = bluetooth.async_track_unavailable(
             self.hass, self._async_unavailable, self.address, connectable=False
+        )
+        self._unsub_midnight = async_track_time_change(
+            self.hass,
+            self._async_reset_sessions_today,
+            hour=0,
+            minute=0,
+            second=0,
         )
         # Seed from the most recent advertisement, if any.
         if service_info := bluetooth.async_last_service_info(
@@ -369,6 +406,9 @@ class OralBLiveCoordinator:
         if self._unsub_unavailable:
             self._unsub_unavailable()
             self._unsub_unavailable = None
+        if self._unsub_midnight:
+            self._unsub_midnight()
+            self._unsub_midnight = None
         if self.charger:
             await self.charger.async_stop()
         await self._async_disconnect()
@@ -464,7 +504,156 @@ class OralBLiveCoordinator:
         self._advertisement_available = False
         self._push()
 
+    # ---------------------------------------------------------- daily count
+    @callback
+    def _async_reset_sessions_today(self, now: datetime) -> None:
+        """Reset the daily counter at Home Assistant's local midnight."""
+        self._sessions_today_date = now.date()
+        self._sessions_today_changed = True
+        self._pending_legacy_sessions_today = None
+        self.data["sessions_today"] = 0
+        self._push()
+
+    def _normalize_sessions_today(self, today: date | None = None) -> date:
+        """Ensure the in-memory counter belongs to the current local day."""
+        local_today = today or dt_util.now().date()
+        if self._sessions_today_date != local_today:
+            self._sessions_today_date = local_today
+            self._sessions_today_changed = True
+            self._pending_legacy_sessions_today = None
+            self.data["sessions_today"] = 0
+        elif self.data.get("sessions_today") is None:
+            self.data["sessions_today"] = 0
+        return local_today
+
+    def _count_session_for_today(
+        self, start: datetime, *, already_counted: bool = False
+    ) -> None:
+        """Count a newly identified session only on its physical local day."""
+        today = self._normalize_sessions_today()
+        if already_counted or dt_util.as_local(start).date() != today:
+            return
+        self.data["sessions_today"] = int(self.data.get("sessions_today") or 0) + 1
+        self._sessions_today_changed = True
+
+    def restore_sessions_today(
+        self, count: int, count_date: str | date | None
+    ) -> None:
+        """Restore a date-scoped daily count, including legacy state migration."""
+        if self._sessions_today_changed:
+            return
+        restored_date: date | None = None
+        if isinstance(count_date, date):
+            restored_date = count_date
+        elif isinstance(count_date, str):
+            try:
+                restored_date = date.fromisoformat(count_date)
+            except ValueError:
+                restored_date = None
+
+        today = dt_util.now().date()
+        if restored_date is not None:
+            self._sessions_today_date = today
+            self.data["sessions_today"] = count if restored_date == today else 0
+            return
+        if not self._last_session_restore_complete:
+            self._pending_legacy_sessions_today = count
+            return
+        self._restore_legacy_sessions_today(count, today)
+
+    def complete_last_session_restore(self) -> None:
+        """Finish migration once the legacy last-session timestamp is known."""
+        self._last_session_restore_complete = True
+        if self._pending_legacy_sessions_today is None or self._sessions_today_changed:
+            return
+        count = self._pending_legacy_sessions_today
+        self._pending_legacy_sessions_today = None
+        self._restore_legacy_sessions_today(count, dt_util.now().date())
+        self._push()
+
+    def _restore_legacy_sessions_today(self, count: int, today: date) -> None:
+        """Scope an old undated count using its restored last-session time."""
+        previous_start = self.data.get("last_session_start")
+        keep = (
+            isinstance(previous_start, datetime)
+            and dt_util.as_local(previous_start).date() == today
+        )
+        self._sessions_today_date = today
+        self.data["sessions_today"] = count if keep else 0
+
+    @property
+    def sessions_today_date(self) -> date | None:
+        """Return the local date represented by the daily session counter."""
+        return self._sessions_today_date
+
     # --------------------------------------------------------------- active
+    @staticmethod
+    def _core_gatt_service_is_present(client: BleakClientWithServiceCache) -> bool:
+        """Return whether discovery contains the mandatory brush state value."""
+        services = getattr(client, "services", None)
+        if services is None:
+            # Some test/future clients expose services lazily. Let the actual
+            # operation decide instead of forcing a destructive rediscovery.
+            return True
+        get_characteristic = getattr(services, "get_characteristic", None)
+        if not callable(get_characteristic):
+            return True
+        try:
+            return get_characteristic(CHAR_STATE) is not None
+        except (BleakError, RuntimeError):
+            return True
+
+    async def _async_establish_brush_connection(
+        self,
+        ble_device: Any,
+        *,
+        disconnected_callback: Any = None,
+        max_attempts: int,
+    ) -> BleakClientWithServiceCache:
+        """Connect and perform one uncached rediscovery for a stale GATT table."""
+        client = await establish_connection(
+            BleakClientWithServiceCache,
+            ble_device,
+            self.name,
+            disconnected_callback=disconnected_callback,
+            max_attempts=max_attempts,
+        )
+        if self._core_gatt_service_is_present(client):
+            return client
+
+        _LOGGER.debug(
+            "%s: mandatory FF04 characteristic is absent; refreshing services once",
+            self.name,
+        )
+        clear_cache = getattr(client, "clear_cache", None)
+        if callable(clear_cache):
+            try:
+                await clear_cache()
+            except (BleakError, TimeoutError, RuntimeError) as err:
+                _LOGGER.debug("%s: service cache clear failed: %s", self.name, err)
+        try:
+            await client.disconnect()
+        except (BleakError, TimeoutError):
+            pass
+
+        refreshed = await establish_connection(
+            BleakClientWithServiceCache,
+            ble_device,
+            self.name,
+            disconnected_callback=disconnected_callback,
+            max_attempts=max_attempts,
+            use_services_cache=False,
+        )
+        if self._core_gatt_service_is_present(refreshed):
+            return refreshed
+        try:
+            await refreshed.disconnect()
+        except (BleakError, TimeoutError):
+            pass
+        raise BleakError(
+            "Mandatory Oral-B FF04 characteristic missing after service rediscovery"
+        )
+
     def _schedule_connect(self) -> None:
         if self._client and self._client.is_connected:
             return
@@ -483,10 +672,8 @@ class OralBLiveCoordinator:
                 _LOGGER.debug("%s: no connectable path available", self.name)
                 return
             try:
-                client = await establish_connection(
-                    BleakClientWithServiceCache,
+                client = await self._async_establish_brush_connection(
                     ble_device,
-                    self.name,
                     disconnected_callback=self._on_disconnect,
                     max_attempts=CONNECT_RETRIES,
                 )
@@ -547,7 +734,8 @@ class OralBLiveCoordinator:
             client, CHAR_BRUSH_TIME, "brushing time"
         )
 
-        self._apply_battery_status(status, DATA_SOURCE_DIRECT)
+        if self._apply_battery_status(status, DATA_SOURCE_DIRECT):
+            self._mark_maintenance_sync_success()
         self._apply_device_info(model_info)
         self._apply_pacer(pacer)
         self._apply_available_modes(available_modes)
@@ -580,7 +768,8 @@ class OralBLiveCoordinator:
         elif uuid == CHAR_PRESSURE and payload:
             self._apply_pressure(payload, DATA_SOURCE_DIRECT)
         elif uuid == CHAR_STATUS_BLOB:
-            self._apply_battery_status(payload, DATA_SOURCE_DIRECT)
+            if self._apply_battery_status(payload, DATA_SOURCE_DIRECT):
+                self._mark_maintenance_sync_success()
         elif uuid == CHAR_SMILEY:
             self._apply_smiley(payload, source=DATA_SOURCE_DIRECT)
         self._push()
@@ -626,7 +815,8 @@ class OralBLiveCoordinator:
         elif short_uuid == "FF02":
             self._apply_device_info(raw)
         elif short_uuid == "FF05":
-            self._apply_battery_status(raw, DATA_SOURCE_CHARGER)
+            if self._apply_battery_status(raw, DATA_SOURCE_CHARGER):
+                self._mark_maintenance_sync_success()
         elif short_uuid == "FF07" and raw:
             self._apply_mode(raw[0])
         elif short_uuid == "FF08" and len(raw) >= 2:
@@ -650,6 +840,7 @@ class OralBLiveCoordinator:
             self._apply_pacer(raw)
         elif short_uuid == "FF29":
             self._charger_session_record = raw
+            self._charger_session_record_sampled_at = dt_util.utcnow()
         elif short_uuid == "FF2B":
             self._apply_ring_color(raw)
         elif short_uuid == "FF2D":
@@ -661,12 +852,17 @@ class OralBLiveCoordinator:
             and self._pending_session is None
         ):
             record, rtc = self._charger_session_record, self._charger_session_rtc
+            record_sampled_at = self._charger_session_record_sampled_at
             rtc_sampled_at = self._charger_session_rtc_sampled_at
             self._charger_session_record = None
+            self._charger_session_record_sampled_at = None
             self._charger_session_rtc = None
             self._charger_session_rtc_sampled_at = None
             result = await self._async_apply_session_record(
-                record, rtc, rtc_sampled_at=rtc_sampled_at
+                record,
+                rtc,
+                record_sampled_at=record_sampled_at,
+                rtc_sampled_at=rtc_sampled_at,
             )
             if result in _SESSION_SYNC_RESOLVED_RESULTS:
                 if result == "new":
@@ -674,7 +870,6 @@ class OralBLiveCoordinator:
                 self._session_pending_sync = False
                 self._processed_session_generation = self._session_generation
                 self._reset_session_sync_retry()
-                self._last_sync_ok = time.monotonic()
         self._push()
 
     def _schedule_deferred_charger_session_record(self) -> None:
@@ -687,14 +882,17 @@ class OralBLiveCoordinator:
         ):
             return
         record, rtc = self._charger_session_record, self._charger_session_rtc
+        record_sampled_at = self._charger_session_record_sampled_at
         rtc_sampled_at = self._charger_session_rtc_sampled_at
         self._charger_session_record = None
+        self._charger_session_record_sampled_at = None
         self._charger_session_rtc = None
         self._charger_session_rtc_sampled_at = None
         self.hass.async_create_background_task(
             self._async_apply_deferred_charger_session_record(
                 record,
                 rtc,
+                record_sampled_at,
                 rtc_sampled_at,
             ),
             "oralb_live_deferred_session_record",
@@ -704,12 +902,14 @@ class OralBLiveCoordinator:
         self,
         record: bytes,
         rtc: bytes,
+        record_sampled_at: datetime | None,
         rtc_sampled_at: datetime | None,
     ) -> None:
         """Reconcile one retained charger record after logical finalization."""
         result = await self._async_apply_session_record(
             record,
             rtc,
+            record_sampled_at=record_sampled_at,
             rtc_sampled_at=rtc_sampled_at,
         )
         if result in _SESSION_SYNC_RESOLVED_RESULTS:
@@ -718,7 +918,6 @@ class OralBLiveCoordinator:
             self._session_pending_sync = False
             self._processed_session_generation = self._session_generation
             self._reset_session_sync_retry()
-            self._last_sync_ok = time.monotonic()
             self._push()
 
     def _advance_charger_timer(self) -> None:
@@ -767,23 +966,47 @@ class OralBLiveCoordinator:
         self._session_sync_retry_count = 0
         self._session_sync_retry_not_before = 0.0
 
+    def _reset_maintenance_sync_retry(self) -> None:
+        """Reset battery/status retry state after a fresh valid FF05."""
+        self._maintenance_sync_retry_count = 0
+        self._maintenance_sync_retry_not_before = 0.0
+
+    def _maintenance_sync_due(self, now: float) -> bool:
+        """Return whether current-value maintenance is due."""
+        return (
+            self._maintenance_pending
+            or self._last_sync_ok == 0.0
+            or now - self._last_sync_ok > PERIODIC_SYNC_INTERVAL_SECONDS
+        )
+
+    def _mark_maintenance_sync_success(self) -> None:
+        """Record a fresh valid battery/status read independently of FF29."""
+        self._last_sync_ok = time.monotonic()
+        self._maintenance_pending = False
+        self._reset_maintenance_sync_retry()
+        if self._session_generation == 0:
+            self._session_pending_sync = False
+
+    def _defer_maintenance_sync(self) -> None:
+        """Back off a failed maintenance read without losing session state."""
+        retry_index = min(
+            self._maintenance_sync_retry_count,
+            len(SESSION_SYNC_RETRY_BACKOFF_SECONDS) - 1,
+        )
+        retry_delay = SESSION_SYNC_RETRY_BACKOFF_SECONDS[retry_index]
+        self._maintenance_sync_retry_count = min(
+            self._maintenance_sync_retry_count + 1,
+            len(SESSION_SYNC_RETRY_BACKOFF_SECONDS),
+        )
+        self._maintenance_sync_retry_not_before = time.monotonic() + retry_delay
+        self._maintenance_pending = True
+
     def _session_sync_resolved(self) -> bool:
         """Return whether the current observed generation was applied."""
         return (
             self._session_generation > 0
             and self._processed_session_generation >= self._session_generation
         )
-
-    def _charger_handles_session_sync(self, generation: int) -> bool:
-        """Return whether a verified iO Sense now owns session recovery."""
-        if not self.charger or not self.charger.address:
-            return False
-        _LOGGER.debug(
-            "%s: leaving session generation %s pending for the iO Sense",
-            self.name,
-            generation,
-        )
-        return True
 
     def _maybe_schedule_sync(self) -> None:
         """Rate-limited trigger for a post-session / periodic sync."""
@@ -794,14 +1017,15 @@ class OralBLiveCoordinator:
         now = time.monotonic()
         if now - self._last_sync_attempt < SYNC_MIN_INTERVAL_SECONDS:
             return
-        if now < self._session_sync_retry_not_before:
-            return
-        due = (
-            self._session_pending_sync
-            or self._last_sync_ok == 0.0
-            or now - self._last_sync_ok > PERIODIC_SYNC_INTERVAL_SECONDS
+        session_due = (
+            self._session_generation > self._processed_session_generation
+            and now >= self._session_sync_retry_not_before
         )
-        if not due:
+        maintenance_due = (
+            self._maintenance_sync_due(now)
+            and now >= self._maintenance_sync_retry_not_before
+        )
+        if not session_due and not maintenance_due:
             return
         self._sync_task = self.hass.async_create_background_task(
             self._async_sync_sequence(), "oralb_live_sync_sequence"
@@ -810,17 +1034,30 @@ class OralBLiveCoordinator:
     async def _async_sync_sequence(self) -> None:
         """Sync every session generation, including back-to-back sessions."""
         while not self._stopping:
+            now = time.monotonic()
             target_generation = self._session_generation
-            session_observed = target_generation > self._processed_session_generation
-            deferred_retry = session_observed and self._session_sync_retry_count > 0
+            session_outstanding = (
+                target_generation > self._processed_session_generation
+            )
+            session_requested = (
+                session_outstanding and now >= self._session_sync_retry_not_before
+            )
+            maintenance_requested = (
+                self._maintenance_sync_due(now)
+                and now >= self._maintenance_sync_retry_not_before
+            )
+            if not session_requested and not maintenance_requested:
+                return
+            deferred_retry = session_requested and self._session_sync_retry_count > 0
             attempts = (
                 1
                 if deferred_retry
-                else SYNC_RETRY_ATTEMPTS if session_observed else 1
+                else SYNC_RETRY_ATTEMPTS if session_requested else 1
             )
-            result = "failed"
+            outcome = _SyncOutcome()
+            battery_refreshed = False
 
-            if session_observed and not deferred_retry:
+            if session_requested and not deferred_retry:
                 _LOGGER.debug(
                     "%s: waiting %ss for session generation %s to settle",
                     self.name,
@@ -832,13 +1069,13 @@ class OralBLiveCoordinator:
             # The iO Sense can finish the same generation while this task is
             # settling. It can also be verified after the direct task was
             # scheduled. Re-check both facts before touching the brush slot.
-            if self._session_sync_resolved():
+            if self._session_generation > target_generation:
+                continue
+            if self._session_sync_resolved() and not maintenance_requested:
                 self._session_pending_sync = False
                 self._reset_session_sync_retry()
                 return
-            if self._session_generation > target_generation:
-                continue
-            if self._charger_handles_session_sync(target_generation):
+            if self.charger and self.charger.address:
                 return
 
             for attempt in range(1, attempts + 1):
@@ -848,7 +1085,6 @@ class OralBLiveCoordinator:
                 while (
                     not self._stopping
                     and self._session_generation == target_generation
-                    and not self._session_sync_resolved()
                     and not (self.charger and self.charger.address)
                     and self.data.get("state_raw") not in SYNC_STATES
                 ):
@@ -857,16 +1093,19 @@ class OralBLiveCoordinator:
                     return
                 if self._session_generation > target_generation:
                     break
-                if self._session_sync_resolved():
+                if self._session_sync_resolved() and not maintenance_requested:
                     break
-                if self._charger_handles_session_sync(target_generation):
+                if self.charger and self.charger.address:
                     return
 
                 self._last_sync_attempt = time.monotonic()
-                result = await self._async_sync_once()
+                outcome = await self._async_sync_once()
+                battery_refreshed = (
+                    battery_refreshed or outcome.battery_refreshed
+                )
                 if (
-                    result in _SESSION_SYNC_RESOLVED_RESULTS
-                    or not session_observed
+                    outcome.session_result in _SESSION_SYNC_RESOLVED_RESULTS
+                    or not session_requested
                     or self._processed_session_generation >= target_generation
                     or self._session_generation > target_generation
                 ):
@@ -876,14 +1115,19 @@ class OralBLiveCoordinator:
                         "%s: generation %s session record %s; retrying in %ss (%s/%s)",
                         self.name,
                         target_generation,
-                        result,
+                        outcome.session_result,
                         SYNC_RETRY_DELAY_SECONDS,
                         attempt,
                         attempts,
                     )
                     await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
 
-            if result in _SESSION_SYNC_RESOLVED_RESULTS:
+            if battery_refreshed:
+                self._mark_maintenance_sync_success()
+            elif maintenance_requested:
+                self._defer_maintenance_sync()
+
+            if outcome.session_result in _SESSION_SYNC_RESOLVED_RESULTS:
                 self._processed_session_generation = max(
                     self._processed_session_generation, target_generation
                 )
@@ -907,8 +1151,9 @@ class OralBLiveCoordinator:
                 )
                 continue
 
-            if not session_observed:
-                self._session_pending_sync = False
+            if not session_requested:
+                if target_generation == 0:
+                    self._session_pending_sync = False
                 return
 
             retry_index = min(
@@ -927,13 +1172,13 @@ class OralBLiveCoordinator:
                 "leaving it pending for a later advertisement in %ss",
                 self.name,
                 target_generation,
-                result,
+                outcome.session_result,
                 attempts,
                 retry_delay,
             )
             return
 
-    async def _async_sync_once(self) -> str:
+    async def _async_sync_once(self) -> _SyncOutcome:
         """Connect briefly, read the last-session record, disconnect.
 
         Total connected time is a few seconds -- far below the brush's
@@ -942,27 +1187,26 @@ class OralBLiveCoordinator:
         """
         async with self._connect_lock:
             if self._stopping:
-                return "failed"
+                return _SyncOutcome()
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, self.address, connectable=True
             )
             if ble_device is None:
                 _LOGGER.debug("%s: sync skipped, no connectable path", self.name)
-                return "failed"
+                return _SyncOutcome()
             try:
-                client = await establish_connection(
-                    BleakClientWithServiceCache,
+                client = await self._async_establish_brush_connection(
                     ble_device,
-                    self.name,
                     max_attempts=2,
                 )
             except (BleakError, TimeoutError) as err:
                 _LOGGER.debug("%s: sync connect failed: %s", self.name, err)
-                return "failed"
+                return _SyncOutcome()
             try:
                 record = await self._async_sync_read(
                     client, CHAR_SESSION_DATA, "session record"
                 )
+                record_sampled_at = dt_util.utcnow() if record is not None else None
                 rtc = await self._async_sync_read(client, CHAR_RTC, "RTC")
                 rtc_sampled_at = dt_util.utcnow() if rtc is not None else None
                 status = await self._async_sync_read(client, CHAR_STATUS_BLOB, "status")
@@ -996,7 +1240,9 @@ class OralBLiveCoordinator:
                     await client.disconnect()
                 except (BleakError, TimeoutError):
                     pass
-        self._apply_battery_status(status, DATA_SOURCE_DIRECT)
+        battery_refreshed = self._apply_battery_status(
+            status, DATA_SOURCE_DIRECT
+        )
         self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
         self._apply_refill(refill)
         self._apply_device_info(model_info)
@@ -1008,9 +1254,12 @@ class OralBLiveCoordinator:
         result = "missing"
         if record is not None:
             result = await self._async_apply_session_record(
-                record, rtc, rtc_sampled_at=rtc_sampled_at
+                record,
+                rtc,
+                record_sampled_at=record_sampled_at,
+                rtc_sampled_at=rtc_sampled_at,
             )
-        if any(
+        any_value_read = any(
             value is not None
             for value in (
                 record,
@@ -1024,11 +1273,15 @@ class OralBLiveCoordinator:
                 available_modes,
                 ring_color,
             )
-        ):
-            self._last_sync_ok = time.monotonic()
+        )
         self._push()
-        _LOGGER.debug("%s: sync complete (session record: %s)", self.name, result)
-        return result
+        _LOGGER.debug(
+            "%s: sync complete (session record: %s, battery refreshed: %s)",
+            self.name,
+            result,
+            battery_refreshed,
+        )
+        return _SyncOutcome(result, battery_refreshed, any_value_read)
 
     async def _async_sync_read(
         self,
@@ -1048,6 +1301,7 @@ class OralBLiveCoordinator:
         record: bytes | bytearray,
         rtc: bytes | bytearray | None,
         *,
+        record_sampled_at: datetime | None = None,
         rtc_sampled_at: datetime | None = None,
     ) -> str:
         """Parse the ff29 last-session record and log new sessions.
@@ -1068,6 +1322,24 @@ class OralBLiveCoordinator:
             firmware_revision=self.data.get("firmware_revision"),
         )
         if decoded.status != "decoded":
+            if self.data.get("protocol_version") == 6:
+                previous = self._last_protocol6_session_record
+                self._last_protocol6_session_record = raw_record
+                _LOGGER.debug(
+                    "%s: protocol-6 capture generation=%s FF29_at=%s FF29=%s "
+                    "changed=%s FF22_at=%s FF22=%s local_start=%s "
+                    "local_duration=%s local_mode=%s",
+                    self.name,
+                    self._session_generation,
+                    record_sampled_at.isoformat() if record_sampled_at else None,
+                    raw_hex,
+                    previous is None or previous != raw_record,
+                    rtc_sampled_at.isoformat() if rtc_sampled_at else None,
+                    bytes(rtc).hex(" ") if rtc is not None else None,
+                    self.data.get("last_session_start"),
+                    self.data.get("last_session_duration"),
+                    self.data.get("last_session_mode"),
+                )
             _LOGGER.debug(
                 "%s: FF29 decode %s: %s",
                 self.name,
@@ -1127,7 +1399,6 @@ class OralBLiveCoordinator:
         else:
             start = dt_util.utcnow()
 
-        today = dt_util.now().date()
         previous_start = self.data.get("last_session_start")
         matched_passive_start = None
         if not refines_same_timestamp and self._pending_passive_sessions:
@@ -1154,13 +1425,7 @@ class OralBLiveCoordinator:
             )
 
         if not reconciles_passive_session:
-            count = self.data.get("sessions_today") or 0
-            if (
-                previous_start is not None
-                and dt_util.as_local(previous_start).date() != today
-            ):
-                count = 0
-            self.data["sessions_today"] = count + 1
+            self._count_session_for_today(start)
 
         updates_latest_session = (
             previous_start is None
@@ -1233,6 +1498,7 @@ class OralBLiveCoordinator:
         """Apply brush state and report whether it recorded a completed session."""
         session_recorded = False
         previous_tracked = self._tracked_state_raw
+        was_recent_tail_candidate = self._late_continuation_candidate is not None
         self.data["state_raw"] = raw
         self.data["state"] = STATES.get(raw, f"unknown_state_{raw}")
 
@@ -1268,18 +1534,24 @@ class OralBLiveCoordinator:
             # judgement merely because its transport changed.
             self._clear_pressure()
 
+        summary_state = raw in SESSION_SEEN_STATES and raw not in session_states
+        summary_only_edge = previous_tracked not in SESSION_SEEN_STATES
+        unconfirmed_menu_summary = (
+            previous_tracked == 8
+            and not self._session_generation_marked
+            and not was_recent_tail_candidate
+        )
         if (
             track_session
             and self.mode != CONNECTION_MODE_LIVE
-            and raw in SESSION_SEEN_STATES
-            and raw not in session_states
-            and previous_tracked not in SESSION_SEEN_STATES
+            and summary_state
+            and (summary_only_edge or unconfirmed_menu_summary)
         ):
             # Summary-only observations still need retained-session recovery
             # when the active running/menu edge was missed entirely.
-            self._session_generation += 1
-            self._session_pending_sync = True
-            self._reset_session_sync_retry()
+            if self._session_generation_marked:
+                self._session_generation_marked = False
+            self._mark_session_generation()
             _LOGGER.debug(
                 "%s: observed summary-only session generation %s in state %s",
                 self.name,
@@ -1511,45 +1783,91 @@ class OralBLiveCoordinator:
         self._cancel_session_finalize()
         self._pending_session = None
 
-        today = dt_util.now().date()
-        previous_start = self.data.get("last_session_start")
-        count = self.data.get("sessions_today") or 0
-        if previous_start is not None:
-            previous_day = dt_util.as_local(previous_start).date()
-            if previous_day != today:
-                count = 0
-        self.data["sessions_today"] = count + 1
+        was_counted = pending.counted
+        self._count_session_for_today(
+            pending.start,
+            already_counted=was_counted,
+        )
         self.data["last_session_start"] = pending.start
-        self.data["last_session_duration"] = pending.duration
-        self.data["last_session_mode"] = pending.mode
+        previous_duration = self.data.get("last_session_duration")
+        self.data["last_session_duration"] = (
+            max(previous_duration, pending.duration)
+            if was_counted and isinstance(previous_duration, int)
+            else pending.duration
+        )
+        if was_counted:
+            self.data["last_session_mode"] = (
+                self.data.get("last_session_mode") or pending.mode
+            )
+        else:
+            self.data["last_session_mode"] = pending.mode
         self.data["last_session_display_face"] = pending.display_face
         self.data["last_session_display_face_source"] = pending.display_face_source
-        self.data["last_session_sectors"] = len(pending.sectors)
+        previous_sectors = self.data.get("last_session_sectors")
+        self.data["last_session_sectors"] = (
+            max(previous_sectors, len(pending.sectors))
+            if was_counted and isinstance(previous_sectors, int)
+            else len(pending.sectors)
+        )
         has_pressure_samples = pending.pressure_samples > 0
-        self.data["last_session_high_pressure"] = (
+        high_pressure = (
             pending.high_pressure if has_pressure_samples else None
         )
-        self.data["last_session_low_pressure"] = (
-            pending.low_pressure if has_pressure_samples else None
-        )
-        self.data["last_session_high_pressure_time"] = (
+        low_pressure = pending.low_pressure if has_pressure_samples else None
+        high_pressure_time = (
             round(pending.high_pressure_time, 1) if has_pressure_samples else None
         )
-        self.data["last_session_low_pressure_time"] = (
+        low_pressure_time = (
             round(pending.low_pressure_time, 1) if has_pressure_samples else None
         )
-        self.data["last_session_average_pressure"] = (
+        average_pressure = (
             round(pending.pressure_force_total / pending.pressure_force_samples)
             if pending.pressure_force_samples
             else None
         )
-        self.data["last_session_maximum_pressure"] = pending.pressure_force_max
-        self.data["last_session_battery_end"] = None
-        self.data["last_session_target_duration"] = pending.target_duration
-        self.data["last_session_id"] = None
-        self.data["last_session_source"] = pending.source
-        self._pending_passive_sessions.append(pending.start)
-        self._pending_passive_sessions = self._pending_passive_sessions[-10:]
+        pressure_updates = {
+            "last_session_high_pressure": high_pressure,
+            "last_session_low_pressure": low_pressure,
+            "last_session_high_pressure_time": high_pressure_time,
+            "last_session_low_pressure_time": low_pressure_time,
+            "last_session_maximum_pressure": pending.pressure_force_max,
+        }
+        for key, value in pressure_updates.items():
+            previous = self.data.get(key)
+            self.data[key] = (
+                max(previous, value)
+                if was_counted and previous is not None and value is not None
+                else previous if was_counted and previous is not None else value
+            )
+        if not was_counted or self.data.get("last_session_average_pressure") is None:
+            self.data["last_session_average_pressure"] = average_pressure
+        if not was_counted:
+            self.data["last_session_battery_end"] = None
+            self.data["last_session_target_duration"] = pending.target_duration
+            self.data["last_session_id"] = None
+            self.data["last_session_source"] = pending.source
+        else:
+            if self.data.get("last_session_target_duration") is None:
+                self.data["last_session_target_duration"] = pending.target_duration
+            if self.data.get("last_session_source") is None:
+                self.data["last_session_source"] = pending.source
+        if not was_counted:
+            self._pending_passive_sessions.append(pending.start)
+            self._pending_passive_sessions = self._pending_passive_sessions[-10:]
+
+        pending.counted = True
+        self._recent_finalized_session = replace(
+            pending,
+            sectors=set(pending.sectors),
+        )
+        self._recent_finalized_at = time.monotonic()
+
+        if was_counted and self.mode != CONNECTION_MODE_LIVE:
+            # A late continuation can finish after an earlier maintenance read.
+            # Request one ordinary refresh without reopening or renumbering the
+            # already resolved logical session.
+            self._maintenance_pending = True
+            self._maintenance_sync_retry_not_before = 0.0
 
         # If a resumed fragment was still ambiguous when the predecessor timed
         # out, it is now necessarily a distinct logical session.
@@ -1607,6 +1925,7 @@ class OralBLiveCoordinator:
         self._resume_saw_selection_menu = False
         # Any charger-retained record read at the interim stop is provisional.
         self._charger_session_record = None
+        self._charger_session_record_sampled_at = None
         self._charger_session_rtc = None
         self._charger_session_rtc_sampled_at = None
         _LOGGER.debug(
@@ -1652,7 +1971,12 @@ class OralBLiveCoordinator:
             selection_menu_route if resuming_pending else False
         )
         self._session_generation_marked = False
-        if not resuming_pending:
+        self._session_started_via_selection_menu = selection_menu_route
+        self._session_already_counted = False
+        self._session_base_display_face = None
+        self._session_base_display_face_source = None
+        self._late_continuation_candidate = None
+        if not resuming_pending and confirmed:
             self._mark_session_generation()
         _LOGGER.debug(
             "%s: %s started",
@@ -1663,8 +1987,74 @@ class OralBLiveCoordinator:
     def _confirm_session(self) -> None:
         """Mark a provisional charger/menu observation as real brushing."""
         if self._session_active and not self._session_confirmed:
+            if self._late_continuation_candidate is not None:
+                self._resume_finalized_session(
+                    self._late_continuation_candidate,
+                    int(self.data.get("time") or 0),
+                )
+                return
             self._session_confirmed = True
+            self._mark_session_generation()
             _LOGGER.debug("%s: session confirmed by brush data", self.name)
+
+    def _recent_session_matching_timer(
+        self, seconds: int
+    ) -> _PendingSession | None:
+        """Return a just-published session matching a retained menu timer."""
+        recent = self._recent_finalized_session
+        if (
+            not self._session_started_via_selection_menu
+            or recent is None
+            or time.monotonic() - self._recent_finalized_at
+            > SESSION_LATE_CONTINUATION_WINDOW_SECONDS
+            or abs(seconds - recent.duration) > SESSION_TIMER_RESET_MAX_SECONDS
+        ):
+            return None
+        return recent
+
+    def _resume_finalized_session(
+        self, recent: _PendingSession, resumed_seconds: int
+    ) -> None:
+        """Reopen a recently counted session when its timer continues."""
+        self._session_start = recent.start
+        self._session_max_time = max(recent.duration, resumed_seconds)
+        self._session_sectors |= recent.sectors
+        self._session_high_pressure += recent.high_pressure
+        self._session_low_pressure += recent.low_pressure
+        self._session_high_pressure_time += recent.high_pressure_time
+        self._session_low_pressure_time += recent.low_pressure_time
+        self._session_pressure_samples += recent.pressure_samples
+        self._session_pressure_force_total += recent.pressure_force_total
+        self._session_pressure_force_samples += recent.pressure_force_samples
+        if recent.pressure_force_max is not None:
+            self._session_pressure_force_max = (
+                recent.pressure_force_max
+                if self._session_pressure_force_max is None
+                else max(recent.pressure_force_max, self._session_pressure_force_max)
+            )
+        self._session_mode = self._session_mode or recent.mode
+        self._session_confirmed = True
+        self._session_generation_marked = True
+        self._session_already_counted = True
+        same_published_session = self.data.get("last_session_start") == recent.start
+        self._session_base_display_face = (
+            self.data.get("last_session_display_face")
+            if same_published_session
+            else recent.display_face
+        )
+        self._session_base_display_face_source = (
+            self.data.get("last_session_display_face_source")
+            if same_published_session
+            else recent.display_face_source
+        )
+        self._session_timer_baseline = resumed_seconds
+        self._late_continuation_candidate = None
+        _LOGGER.debug(
+            "%s: reopened counted session generation %s at %ss",
+            self.name,
+            recent.logical_generation,
+            resumed_seconds,
+        )
 
     def _end_session(self) -> bool:
         """Hold a physical stop provisionally until its pause grace expires.
@@ -1687,6 +2077,7 @@ class OralBLiveCoordinator:
         self._cancel_charger_ticker()
         if not self._session_confirmed:
             self._session_started_monotonic = None
+            self._late_continuation_candidate = None
             _LOGGER.debug(
                 "%s: provisional session ended without brush evidence; ignored",
                 self.name,
@@ -1737,6 +2128,10 @@ class OralBLiveCoordinator:
             target_duration=self.data.get("target_duration"),
             source=self.data.get("data_source"),
             duration_source=duration_source,
+            display_face=self._session_base_display_face,
+            display_face_source=self._session_base_display_face_source,
+            logical_generation=self._session_generation,
+            counted=self._session_already_counted,
         )
         self._open_session_display_face_capture()
         _LOGGER.debug(
@@ -1809,6 +2204,34 @@ class OralBLiveCoordinator:
             return
         if confirm_session and not self._session_confirmed:
             previous_baseline = self._session_timer_baseline
+            if self._late_continuation_candidate is not None:
+                if seconds < (previous_baseline or 0):
+                    recent_duration = self._late_continuation_candidate.duration
+                    if (
+                        seconds <= SESSION_TIMER_RESET_MAX_SECONDS
+                        or abs(seconds - recent_duration)
+                        > SESSION_TIMER_RESET_MAX_SECONDS
+                    ):
+                        # A coherent reset or a substantially different timer
+                        # wins over a superficially matching retained value.
+                        self._late_continuation_candidate = None
+                    self._session_timer_baseline = seconds
+                    self._session_max_time = 0
+                    return
+                if previous_baseline is not None and seconds > previous_baseline:
+                    self._resume_finalized_session(
+                        self._late_continuation_candidate,
+                        seconds,
+                    )
+                    return
+                return
+            if previous_baseline is None:
+                recent = self._recent_session_matching_timer(seconds)
+                if recent is not None:
+                    self._late_continuation_candidate = recent
+                    self._session_timer_baseline = seconds
+                    self._session_max_time = 0
+                    return
             self._session_timer_baseline, timer_advanced = (
                 advance_session_timer_evidence(previous_baseline, seconds)
             )
@@ -1953,13 +2376,30 @@ class OralBLiveCoordinator:
         self,
         payload: bytes | bytearray | None,
         source: str | None = None,
-    ) -> None:
-        if payload is not None:
-            parsed = parse_battery_status(payload)
-            self.data.update(parsed)
-            if "battery" in parsed:
-                self.data["battery_updated_at"] = dt_util.utcnow()
-                self.data["battery_source"] = source or self.data.get("data_source")
+    ) -> bool:
+        if payload is None:
+            return False
+        parsed = parse_battery_status(
+            payload,
+            protocol_version=self.data.get("protocol_version"),
+        )
+        self.data.update(parsed)
+        if self.data.get("protocol_version") == 6:
+            _LOGGER.debug(
+                "%s: protocol-6 FF05 capture at %s from %s: %s "
+                "(battery=%s, remaining=%s)",
+                self.name,
+                dt_util.utcnow().isoformat(),
+                source or self.data.get("data_source"),
+                bytes(payload).hex(" "),
+                parsed.get("battery"),
+                parsed.get("battery_time_remaining"),
+            )
+        if "battery" not in parsed:
+            return False
+        self.data["battery_updated_at"] = dt_util.utcnow()
+        self.data["battery_source"] = source or self.data.get("data_source")
+        return True
 
     def _apply_device_info(self, payload: bytes | bytearray | None) -> None:
         if payload is None:

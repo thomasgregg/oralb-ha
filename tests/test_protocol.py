@@ -65,6 +65,41 @@ class ProtocolDecoderTests(unittest.TestCase):
     def test_battery_status_old_brush(self) -> None:
         self.assertEqual(protocol.parse_battery_status(bytes([80])), {"battery": 80})
 
+    def test_protocol_6_zero_runtime_is_unavailable(self) -> None:
+        self.assertEqual(
+            protocol.parse_battery_status(
+                bytes.fromhex("3b 00 00 00"),
+                protocol_version=6,
+            ),
+            {"battery": 59, "battery_time_remaining": None},
+        )
+
+    def test_protocol_6_nonzero_runtime_is_preserved(self) -> None:
+        self.assertEqual(
+            protocol.parse_battery_status(
+                bytes.fromhex("3b 10 0e 00"),
+                protocol_version=6,
+            )["battery_time_remaining"],
+            3600,
+        )
+
+    def test_protocol_8_zero_runtime_remains_a_real_zero(self) -> None:
+        self.assertEqual(
+            protocol.parse_battery_status(
+                bytes.fromhex("00 00 00"),
+                protocol_version=8,
+            )["battery_time_remaining"],
+            0,
+        )
+
+    def test_explicit_unknown_runtime_clears_an_old_estimate(self) -> None:
+        self.assertIsNone(
+            protocol.parse_battery_status(
+                bytes.fromhex("50 ff ff"),
+                protocol_version=8,
+            )["battery_time_remaining"]
+        )
+
     def test_battery_status_signed_current(self) -> None:
         payload = bytes([97, 0, 0, 0, 0, 0x42, 0xFD, 35])
         self.assertEqual(

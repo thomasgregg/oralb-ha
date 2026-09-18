@@ -162,6 +162,10 @@ SESSION_RECONCILE_WINDOW_SECONDS = 2 * 60
 # timer. Keep the logical session provisional long enough for the slower
 # advertisement path to expose a resume, then finalize a genuine stop.
 SESSION_PAUSE_GRACE_SECONDS = 20.0
+# A result can be published before sparse advertisements expose the final
+# selection-menu timer tail.  Keep enough aggregate state to reopen that same
+# logical session without counting it twice.
+SESSION_LATE_CONTINUATION_WINDOW_SECONDS = 2 * 60
 # A selection-menu route can disambiguate two very short sessions whose sparse
 # timer samples overlap. Larger continuing values remain authoritative.
 SESSION_TIMER_RESET_MAX_SECONDS = 5
