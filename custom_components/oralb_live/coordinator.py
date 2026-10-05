@@ -533,7 +533,31 @@ class OralBLiveCoordinator:
     @callback
     def _async_unavailable(self, _service_info: BluetoothServiceInfoBleak) -> None:
         self._advertisement_available = False
+        # Losing brush advertisements is normal while a live connection owns
+        # the slot. Only discard an abandoned passive/menu candidate.
+        if not self.data["live"] and not (
+            self.charger and self.charger.session_running
+        ):
+            self._discard_unconfirmed_session()
         self._push()
+
+    def _discard_unconfirmed_session(self) -> None:
+        """Forget a menu wake without finalizing its pending predecessor."""
+        if not self._session_active or self._session_confirmed:
+            return
+        self._session_active = False
+        self._session_started_monotonic = None
+        self._session_timer_baseline = None
+        self._session_max_time = 0
+        self._late_continuation_candidate = None
+        self._resume_timer_baseline = None
+        self._resume_saw_selection_menu = False
+        self._session_generation_marked = False
+        self._tracked_state_raw = None
+        self._cancel_charger_ticker()
+        self._clear_pressure()
+        # Keep the predecessor's finalizer and result token intact. A later
+        # timer can still prove continuation during its original pause grace.
 
     # ---------------------------------------------------------- daily count
     @callback
@@ -1340,10 +1364,11 @@ class OralBLiveCoordinator:
 
     async def _async_sync_once(self) -> _SyncOutcome:
         """Publish current battery first, then recover a settled retained record."""
-        record = rtc = status = smiley = refill = None
+        record = rtc = status = refill = None
         model_info = pacer = available_modes = ring_color = None
         record_sampled_at = rtc_sampled_at = None
         battery_refreshed = False
+        face_read = False
         target_generation = self._session_generation
         result = "missing"
         async with self._connect_lock:
@@ -1378,8 +1403,20 @@ class OralBLiveCoordinator:
                         if self._maintenance_revision == maintenance_revision:
                             self._mark_maintenance_sync_success()
                         self._push()
-                    # A motor pause is still provisional. Battery needs no FF29
-                    # commit delay, but records must wait for the latest stop.
+                    settling = (
+                        self._session_active
+                        or self._pending_session is not None
+                        or time.monotonic() < self._session_record_not_before
+                    )
+                    # FF0A is transient: read/apply it before FF29 settlement
+                    # and before other optional reads can consume its window.
+                    if (
+                        self._pending_session_face_generation is not None
+                        or not settling
+                    ):
+                        face_read = await self._async_quiet_display_face(client)
+                    # Re-check settlement after I/O; a new motor stop may have
+                    # happened while the face read was outstanding.
                     if (
                         self._session_active
                         or self._pending_session is not None
@@ -1395,9 +1432,6 @@ class OralBLiveCoordinator:
                         )
                         rtc = await self._async_quiet_read(client, CHAR_RTC, "RTC")
                         rtc_sampled_at = dt_util.utcnow() if rtc is not None else None
-                        smiley = await self._async_quiet_read(
-                            client, CHAR_SMILEY, "smiley"
-                        )
                         refill = await self._async_quiet_read(
                             client, CHAR_REFILL_REMAINDER, "refill remainder"
                         )
@@ -1421,7 +1455,6 @@ class OralBLiveCoordinator:
             finally:
                 if client is not None:
                     await self._async_close_brief_client(client)
-        self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
         self._apply_refill(refill)
         self._apply_device_info(model_info)
         self._apply_pacer(pacer)
@@ -1443,15 +1476,63 @@ class OralBLiveCoordinator:
                     record_sampled_at=record_sampled_at,
                     rtc_sampled_at=rtc_sampled_at,
                 )
-        any_value_read = any(
+        any_value_read = face_read or any(
             value is not None
             for value in (
-                record, rtc, status, smiley, refill,
+                record, rtc, status, refill,
                 model_info, pacer, available_modes, ring_color,
             )
         )
         self._push()
         return _SyncOutcome(result, battery_refreshed, any_value_read)
+
+    async def _async_quiet_display_face(
+        self, client: BleakClientWithServiceCache
+    ) -> bool:
+        """Read one display result promptly, retaining its original token."""
+        face_generation = self._session_face_generation
+        capture_generation = self._pending_session_face_generation
+        any_value_read = False
+        delays = (
+            SESSION_DISPLAY_FACE_READ_RETRY_DELAYS
+            if capture_generation is not None
+            else (0.0,)
+        )
+        for delay in delays:
+            if delay:
+                await asyncio.sleep(delay)
+            if (
+                not self._fresh_sync_window()
+                or self._session_face_generation != face_generation
+                or self._pending_session_face_generation != capture_generation
+                or (
+                    capture_generation is not None
+                    and not self._session_display_face_capture_is_open(capture_generation)
+                )
+            ):
+                return any_value_read
+            smiley = await self._async_quiet_read(client, CHAR_SMILEY, "smiley")
+            any_value_read = any_value_read or smiley is not None
+            # A read belongs to the token at request time, even if another
+            # session starts/stops or an advertisement supplies its face first.
+            if (
+                self._stopping
+                or self._session_face_generation != face_generation
+                or self._pending_session_face_generation != capture_generation
+                or (
+                    capture_generation is not None
+                    and not self._session_display_face_capture_is_open(capture_generation)
+                )
+            ):
+                return any_value_read
+            self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
+            self._push()
+            if (
+                capture_generation is None
+                or self._pending_session_face_generation != capture_generation
+            ):
+                return any_value_read
+        return any_value_read
 
     async def _async_quiet_read(
         self,
@@ -2193,15 +2274,37 @@ class OralBLiveCoordinator:
     def _confirm_session(self) -> None:
         """Mark a provisional charger/menu observation as real brushing."""
         if self._session_active and not self._session_confirmed:
+            self._expire_late_continuation_candidate()
             if self._late_continuation_candidate is not None:
                 self._resume_finalized_session(
                     self._late_continuation_candidate,
                     int(self.data.get("time") or 0),
                 )
                 return
+            if (
+                self._session_started_via_selection_menu
+                and self._pending_session is None
+            ):
+                # Settings/menu time is not brushing time. Motor state or
+                # advancing native timer evidence dates the actual session,
+                # even when HA has not declared the old menu unavailable yet.
+                seconds = int(self.data.get("time") or 0)
+                seconds = seconds if 0 <= seconds <= MAX_SESSION_SECONDS else 0
+                self._session_start = dt_util.utcnow() - timedelta(seconds=seconds)
+                self._session_started_monotonic = time.monotonic() - seconds
             self._session_confirmed = True
             self._mark_session_generation()
             _LOGGER.debug("%s: session confirmed by brush data", self.name)
+
+    def _expire_late_continuation_candidate(self) -> None:
+        """Do not let a retained menu timer extend the matching window."""
+        if (
+            self._late_continuation_candidate is not None
+            and time.monotonic() - self._recent_finalized_at
+            > SESSION_LATE_CONTINUATION_WINDOW_SECONDS
+        ):
+            self._late_continuation_candidate = None
+            self._session_timer_baseline = None
 
     def _recent_session_matching_timer(
         self, seconds: int
@@ -2414,6 +2517,7 @@ class OralBLiveCoordinator:
             self._merge_pending_session(seconds)
             return
         if confirm_session and not self._session_confirmed:
+            self._expire_late_continuation_candidate()
             previous_baseline = self._session_timer_baseline
             if self._late_continuation_candidate is not None:
                 if seconds < (previous_baseline or 0):
