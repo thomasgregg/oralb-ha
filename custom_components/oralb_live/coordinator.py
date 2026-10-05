@@ -101,7 +101,11 @@ from .const import (
     STALE_CONNECTION_SECONDS,
     STATES,
     STORAGE_VERSION,
+    SYNC_ADVERTISEMENT_MAX_AGE_SECONDS,
+    SYNC_CONNECTION_TIMEOUT_SECONDS,
+    SYNC_DISCONNECT_TIMEOUT_SECONDS,
     SYNC_MIN_INTERVAL_SECONDS,
+    SYNC_READ_TIMEOUT_SECONDS,
     SYNC_RETRY_ATTEMPTS,
     SYNC_RETRY_DELAY_SECONDS,
     SYNC_STATES,
@@ -309,6 +313,13 @@ class OralBLiveCoordinator:
         self._tracked_state_raw: int | None = None
         # --- charger-priority sync state ---
         self._sync_task: asyncio.Task | None = None
+        self._sync_wakeup: asyncio.TimerHandle | None = None
+        self._registering_bluetooth = False
+        self._sync_started_at: float | None = None
+        self._fresh_advertisement_seen = False
+        self._sync_waiting = False
+        self._maintenance_revision = 0
+        self._session_record_not_before = 0.0
         self._session_pending_sync = True  # seed on startup
         self._last_sync_attempt = 0.0
         self._last_sync_ok = 0.0
@@ -347,12 +358,18 @@ class OralBLiveCoordinator:
     @callback
     def async_start(self) -> None:
         """Register passive advertisement listeners."""
-        self._unsub_bluetooth = bluetooth.async_register_callback(
-            self.hass,
-            self._async_advertisement,
-            BluetoothCallbackMatcher(address=self.address),
-            BluetoothScanningMode.PASSIVE,
-        )
+        self._sync_started_at = time.monotonic()
+        # Registration synchronously replays cached packets in Home Assistant.
+        self._registering_bluetooth = True
+        try:
+            self._unsub_bluetooth = bluetooth.async_register_callback(
+                self.hass,
+                self._async_advertisement,
+                BluetoothCallbackMatcher(address=self.address),
+                BluetoothScanningMode.PASSIVE,
+            )
+        finally:
+            self._registering_bluetooth = False
         self._unsub_unavailable = bluetooth.async_track_unavailable(
             self.hass, self._async_unavailable, self.address, connectable=False
         )
@@ -371,6 +388,8 @@ class OralBLiveCoordinator:
             # identity and last-known values, but must never open a new local
             # session after an integration reload.
             self._parse_advertisement(service_info, track_session=False)
+        if self.mode != CONNECTION_MODE_LIVE:
+            self._arm_sync_wakeup()
         if self.charger:
             self.charger.async_start()
         if self.mode == CONNECTION_MODE_LIVE:
@@ -383,6 +402,10 @@ class OralBLiveCoordinator:
 
     async def async_stop(self) -> None:
         self._stopping = True
+        sync_task = self._sync_task
+        if self._sync_wakeup:
+            self._sync_wakeup.cancel()
+            self._sync_wakeup = None
         # Do not lose an already stopped session merely because the integration
         # is being reloaded during its pause grace period.
         self._finalize_pending_session()
@@ -412,13 +435,21 @@ class OralBLiveCoordinator:
         if self.charger:
             await self.charger.async_stop()
         await self._async_disconnect()
+        if sync_task and sync_task is not asyncio.current_task():
+            # The brief client is local to its task. Wait for its bounded
+            # disconnect before allowing a replacement coordinator to start.
+            await asyncio.gather(sync_task, return_exceptions=True)
 
     # -------------------------------------------------------------- passive
     @callback
     def _async_advertisement(
         self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange
     ) -> None:
-        self._parse_advertisement(service_info)
+        if not self._registering_bluetooth:
+            self._fresh_advertisement_seen = True
+        self._parse_advertisement(
+            service_info, track_session=not self._registering_bluetooth
+        )
 
     def _parse_advertisement(
         self,
@@ -486,7 +517,7 @@ class OralBLiveCoordinator:
             )
         self._push()
 
-        if self._stopping:
+        if self._stopping or not track_session:
             return
         if self.mode == CONNECTION_MODE_LIVE:
             if state_raw in AWAKE_STATES:
@@ -502,7 +533,31 @@ class OralBLiveCoordinator:
     @callback
     def _async_unavailable(self, _service_info: BluetoothServiceInfoBleak) -> None:
         self._advertisement_available = False
+        # Losing brush advertisements is normal while a live connection owns
+        # the slot. Only discard an abandoned passive/menu candidate.
+        if not self.data["live"] and not (
+            self.charger and self.charger.session_running
+        ):
+            self._discard_unconfirmed_session()
         self._push()
+
+    def _discard_unconfirmed_session(self) -> None:
+        """Forget a menu wake without finalizing its pending predecessor."""
+        if not self._session_active or self._session_confirmed:
+            return
+        self._session_active = False
+        self._session_started_monotonic = None
+        self._session_timer_baseline = None
+        self._session_max_time = 0
+        self._late_continuation_candidate = None
+        self._resume_timer_baseline = None
+        self._resume_saw_selection_menu = False
+        self._session_generation_marked = False
+        self._tracked_state_raw = None
+        self._cancel_charger_ticker()
+        self._clear_pressure()
+        # Keep the predecessor's finalizer and result token intact. A later
+        # timer can still prove continuation during its original pause grace.
 
     # ---------------------------------------------------------- daily count
     @callback
@@ -618,41 +673,51 @@ class OralBLiveCoordinator:
             disconnected_callback=disconnected_callback,
             max_attempts=max_attempts,
         )
-        if self._core_gatt_service_is_present(client):
-            return client
-
-        _LOGGER.debug(
-            "%s: mandatory FF04 characteristic is absent; refreshing services once",
-            self.name,
-        )
-        clear_cache = getattr(client, "clear_cache", None)
-        if callable(clear_cache):
-            try:
-                await clear_cache()
-            except (BleakError, TimeoutError, RuntimeError) as err:
-                _LOGGER.debug("%s: service cache clear failed: %s", self.name, err)
+        handed_off = False
         try:
-            await client.disconnect()
-        except (BleakError, TimeoutError):
-            pass
+            if self._core_gatt_service_is_present(client):
+                handed_off = True
+                return client
 
-        refreshed = await establish_connection(
-            BleakClientWithServiceCache,
-            ble_device,
-            self.name,
-            disconnected_callback=disconnected_callback,
-            max_attempts=max_attempts,
-            use_services_cache=False,
-        )
-        if self._core_gatt_service_is_present(refreshed):
-            return refreshed
+            _LOGGER.debug(
+                "%s: mandatory FF04 characteristic is absent; refreshing services once",
+                self.name,
+            )
+            clear_cache = getattr(client, "clear_cache", None)
+            if callable(clear_cache):
+                try:
+                    await clear_cache()
+                except (BleakError, TimeoutError, RuntimeError) as err:
+                    _LOGGER.debug("%s: service cache clear failed: %s", self.name, err)
+            await self._async_close_brief_client(client)
+            client = None
+            client = await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                self.name,
+                disconnected_callback=disconnected_callback,
+                max_attempts=max_attempts,
+                use_services_cache=False,
+            )
+            if self._core_gatt_service_is_present(client):
+                handed_off = True
+                return client
+            raise BleakError(
+                "Mandatory Oral-B FF04 characteristic missing after service rediscovery"
+            )
+        finally:
+            # A timeout/unload can cancel cache recovery before its client is
+            # returned to the caller. The helper still owns that connection.
+            if client is not None and not handed_off:
+                await self._async_close_brief_client(client)
+
+    async def _async_close_brief_client(self, client: BleakClientWithServiceCache) -> None:
+        """Release a temporary connection without an unbounded disconnect wait."""
         try:
-            await refreshed.disconnect()
-        except (BleakError, TimeoutError):
-            pass
-        raise BleakError(
-            "Mandatory Oral-B FF04 characteristic missing after service rediscovery"
-        )
+            async with asyncio.timeout(SYNC_DISCONNECT_TIMEOUT_SECONDS):
+                await client.disconnect()
+        except (BleakError, TimeoutError) as err:
+            _LOGGER.debug("%s: temporary disconnect failed: %s", self.name, err)
 
     def _schedule_connect(self) -> None:
         if self._client and self._client.is_connected:
@@ -976,7 +1041,7 @@ class OralBLiveCoordinator:
         return (
             self._maintenance_pending
             or self._last_sync_ok == 0.0
-            or now - self._last_sync_ok > PERIODIC_SYNC_INTERVAL_SECONDS
+            or now - self._last_sync_ok >= PERIODIC_SYNC_INTERVAL_SECONDS
         )
 
     def _mark_maintenance_sync_success(self) -> None:
@@ -1010,16 +1075,18 @@ class OralBLiveCoordinator:
 
     def _maybe_schedule_sync(self) -> None:
         """Rate-limited trigger for a post-session / periodic sync."""
-        if self.charger and self.charger.address:
+        if self._stopping or (self.charger and self.charger.address):
             return
         if self._sync_task and not self._sync_task.done():
             return
+        self._arm_sync_wakeup()
         now = time.monotonic()
         if now - self._last_sync_attempt < SYNC_MIN_INTERVAL_SECONDS:
             return
         session_due = (
             self._session_generation > self._processed_session_generation
             and now >= self._session_sync_retry_not_before
+            and now >= self._session_record_not_before
         )
         maintenance_due = (
             self._maintenance_sync_due(now)
@@ -1027,9 +1094,108 @@ class OralBLiveCoordinator:
         )
         if not session_due and not maintenance_due:
             return
+        maintenance_revision = self._maintenance_revision
         self._sync_task = self.hass.async_create_background_task(
             self._async_sync_sequence(), "oralb_live_sync_sequence"
         )
+        self._sync_task.add_done_callback(
+            lambda task: self._sync_finished(task, maintenance_revision)
+        )
+
+    def _sync_finished(self, _task: asyncio.Task, maintenance_revision: int) -> None:
+        # Only a newer request can trigger immediately. An unavailable device
+        # with recent history must not turn task completion into a busy loop.
+        if (
+            self._maintenance_revision != maintenance_revision
+            and self._fresh_sync_window()
+        ):
+            self._maybe_schedule_sync()
+        else:
+            self._arm_sync_wakeup()
+
+    def _request_battery_refresh(self) -> None:
+        """A new stop must not be consumed by an older read or retry wait."""
+        self._maintenance_revision += 1
+        self._maintenance_pending = True
+        self._reset_maintenance_sync_retry()
+        if self._sync_waiting and self._sync_task and not self._sync_task.done():
+            self._sync_task.cancel()
+
+    async def _async_sync_delay(self, seconds: float) -> None:
+        self._sync_waiting = True
+        try:
+            await asyncio.sleep(seconds)
+        finally:
+            self._sync_waiting = False
+
+    def _arm_sync_wakeup(self) -> None:
+        """Recheck history even when HA suppresses unchanged advertisements."""
+        if self._sync_wakeup:
+            self._sync_wakeup.cancel()
+            self._sync_wakeup = None
+        if self._stopping or self.mode == CONNECTION_MODE_LIVE:
+            return
+        if self.charger and self.charger.address:
+            return
+        now = time.monotonic()
+        cooldown = self._last_sync_attempt + SYNC_MIN_INTERVAL_SECONDS
+        maintenance_at = (
+            self._maintenance_sync_retry_not_before
+            if self._maintenance_sync_due(now)
+            else self._last_sync_ok + PERIODIC_SYNC_INTERVAL_SECONDS
+        )
+        deadlines = [max(cooldown, maintenance_at)]
+        if self._session_generation > self._processed_session_generation:
+            deadlines.append(
+                max(
+                    cooldown,
+                    self._session_record_not_before,
+                    self._session_sync_retry_not_before,
+                )
+            )
+        delay = min(deadlines) - now
+        # When already due but asleep/stale, poll history at a bounded cadence.
+        # There is no connection without a new, recent quiet packet.
+        if delay <= 0:
+            delay = SYNC_ADVERTISEMENT_MAX_AGE_SECONDS
+        self._sync_wakeup = self.hass.loop.call_later(delay, self._sync_history_wakeup)
+
+    @callback
+    def _sync_history_wakeup(self) -> None:
+        self._sync_wakeup = None
+        if self._fresh_sync_window():
+            self._maybe_schedule_sync()
+        else:
+            self._arm_sync_wakeup()
+
+    def _fresh_sync_window(self) -> bool:
+        """Authorize a short read only from recent quiet, connectable history."""
+        if self._stopping or self.mode == CONNECTION_MODE_LIVE:
+            return False
+        if self.charger and self.charger.address:
+            return False
+        for connectable in (False, True):
+            info = bluetooth.async_last_service_info(
+                self.hass, self.address, connectable=connectable
+            )
+            if info is None:
+                return False
+            if (
+                self._sync_started_at is not None
+                and not self._fresh_advertisement_seen
+                and info.time <= self._sync_started_at
+            ):
+                return False
+            age = time.monotonic() - info.time
+            payload = info.manufacturer_data.get(ORALB_MANUFACTURER_ID)
+            if (
+                not 0 <= age <= SYNC_ADVERTISEMENT_MAX_AGE_SECONDS
+                or not payload
+                or len(payload) < 11
+                or payload[ADV_IDX_STATE] not in SYNC_STATES
+            ):
+                return False
+        return True
 
     async def _async_sync_sequence(self) -> None:
         """Sync every session generation, including back-to-back sessions."""
@@ -1046,6 +1212,7 @@ class OralBLiveCoordinator:
                 self._maintenance_sync_due(now)
                 and now >= self._maintenance_sync_retry_not_before
             )
+            maintenance_revision = self._maintenance_revision
             if not session_requested and not maintenance_requested:
                 return
             deferred_retry = session_requested and self._session_sync_retry_count > 0
@@ -1057,14 +1224,19 @@ class OralBLiveCoordinator:
             outcome = _SyncOutcome()
             battery_refreshed = False
 
-            if session_requested and not deferred_retry:
+            if (
+                session_requested
+                and not deferred_retry
+                and not maintenance_requested
+                and self._session_record_not_before == 0.0
+            ):
                 _LOGGER.debug(
                     "%s: waiting %ss for session generation %s to settle",
                     self.name,
                     SESSION_RECORD_SETTLE_SECONDS,
                     target_generation,
                 )
-                await asyncio.sleep(SESSION_RECORD_SETTLE_SECONDS)
+                await self._async_sync_delay(SESSION_RECORD_SETTLE_SECONDS)
 
             # The iO Sense can finish the same generation while this task is
             # settling. It can also be verified after the direct task was
@@ -1082,13 +1254,8 @@ class OralBLiveCoordinator:
                 # A newer brushing session can begin during the settle/retry
                 # window. Never connect until the latest advertisement is
                 # quiet again.
-                while (
-                    not self._stopping
-                    and self._session_generation == target_generation
-                    and not (self.charger and self.charger.address)
-                    and self.data.get("state_raw") not in SYNC_STATES
-                ):
-                    await asyncio.sleep(1)
+                if self.data.get("state_raw") not in SYNC_STATES:
+                    return
                 if self._stopping:
                     return
                 if self._session_generation > target_generation:
@@ -1098,33 +1265,47 @@ class OralBLiveCoordinator:
                 if self.charger and self.charger.address:
                     return
 
-                self._last_sync_attempt = time.monotonic()
                 outcome = await self._async_sync_once()
                 battery_refreshed = (
                     battery_refreshed or outcome.battery_refreshed
                 )
                 if (
                     outcome.session_result in _SESSION_SYNC_RESOLVED_RESULTS
+                    or outcome.session_result in {"settling", "deferred"}
                     or not session_requested
                     or self._processed_session_generation >= target_generation
                     or self._session_generation > target_generation
                 ):
                     break
                 if attempt < attempts:
+                    retry_delay = max(
+                        SYNC_RETRY_DELAY_SECONDS,
+                        self._last_sync_attempt
+                        + SYNC_MIN_INTERVAL_SECONDS
+                        - time.monotonic(),
+                    )
                     _LOGGER.debug(
                         "%s: generation %s session record %s; retrying in %ss (%s/%s)",
                         self.name,
                         target_generation,
                         outcome.session_result,
-                        SYNC_RETRY_DELAY_SECONDS,
+                        retry_delay,
                         attempt,
                         attempts,
                     )
-                    await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
+                    await self._async_sync_delay(retry_delay)
 
-            if battery_refreshed:
+            if (
+                battery_refreshed
+                and self._maintenance_revision == maintenance_revision
+            ):
                 self._mark_maintenance_sync_success()
-            elif maintenance_requested:
+            elif (
+                maintenance_requested
+                and not battery_refreshed
+                and self._maintenance_revision == maintenance_revision
+                and outcome.session_result != "deferred"
+            ):
                 self._defer_maintenance_sync()
 
             if outcome.session_result in _SESSION_SYNC_RESOLVED_RESULTS:
@@ -1156,6 +1337,9 @@ class OralBLiveCoordinator:
                     self._session_pending_sync = False
                 return
 
+            if outcome.session_result in {"settling", "deferred"}:
+                return
+
             retry_index = min(
                 self._session_sync_retry_count,
                 len(SESSION_SYNC_RETRY_BACKOFF_SECONDS) - 1,
@@ -1179,109 +1363,192 @@ class OralBLiveCoordinator:
             return
 
     async def _async_sync_once(self) -> _SyncOutcome:
-        """Connect briefly, read the last-session record, disconnect.
-
-        Total connected time is a few seconds -- far below the brush's
-        own ~30 s idle timeout, and only ever in quiet states, so the
-        charger and app never notice us.
-        """
+        """Publish current battery first, then recover a settled retained record."""
+        record = rtc = status = refill = None
+        model_info = pacer = available_modes = ring_color = None
+        record_sampled_at = rtc_sampled_at = None
+        battery_refreshed = False
+        face_read = False
+        target_generation = self._session_generation
+        result = "missing"
         async with self._connect_lock:
-            if self._stopping:
-                return _SyncOutcome()
+            # Both the slot and advertisement may change while acquiring the lock.
+            if (
+                not self._fresh_sync_window()
+                or time.monotonic() - self._last_sync_attempt
+                < SYNC_MIN_INTERVAL_SECONDS
+            ):
+                return _SyncOutcome("deferred")
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, self.address, connectable=True
             )
             if ble_device is None:
-                _LOGGER.debug("%s: sync skipped, no connectable path", self.name)
-                return _SyncOutcome()
+                return _SyncOutcome("deferred")
+            self._last_sync_attempt = time.monotonic()
+            client = None
             try:
-                client = await self._async_establish_brush_connection(
-                    ble_device,
-                    max_attempts=2,
-                )
-            except (BleakError, TimeoutError) as err:
-                _LOGGER.debug("%s: sync connect failed: %s", self.name, err)
-                return _SyncOutcome()
-            try:
-                record = await self._async_sync_read(
-                    client, CHAR_SESSION_DATA, "session record"
-                )
-                record_sampled_at = dt_util.utcnow() if record is not None else None
-                rtc = await self._async_sync_read(client, CHAR_RTC, "RTC")
-                rtc_sampled_at = dt_util.utcnow() if rtc is not None else None
-                status = await self._async_sync_read(client, CHAR_STATUS_BLOB, "status")
-                state = await self._async_sync_read(client, CHAR_STATE, "state")
-                smiley = await self._async_sync_read(client, CHAR_SMILEY, "smiley")
-                refill = await self._async_sync_read(
-                    client, CHAR_REFILL_REMAINDER, "refill remainder"
-                )
-                model_info = (
-                    await self._async_sync_read(client, CHAR_MODEL_ID, "device info")
-                    if self.data["model_id"] is None
-                    else None
-                )
-                pacer = (
-                    await self._async_sync_read(client, CHAR_PACER, "pacer")
-                    if self.data["sector_times"] is None
-                    else None
-                )
-                available_modes = (
-                    await self._async_sync_read(
-                        client, CHAR_AVAILABLE_MODES, "available modes"
+                async with asyncio.timeout(SYNC_CONNECTION_TIMEOUT_SECONDS):
+                    client = await self._async_establish_brush_connection(
+                        ble_device,
+                        max_attempts=2,
                     )
-                    if self.data["available_modes"] is None
-                    else None
-                )
-                ring_color = await self._async_sync_read(
-                    client, CHAR_RING_COLOR, "SmartRing color"
-                )
+                    maintenance_revision = self._maintenance_revision
+                    status = await self._async_quiet_read(
+                        client, CHAR_STATUS_BLOB, "status"
+                    )
+                    battery_refreshed = self._apply_battery_status(
+                        status, DATA_SOURCE_DIRECT
+                    )
+                    if battery_refreshed:
+                        if self._maintenance_revision == maintenance_revision:
+                            self._mark_maintenance_sync_success()
+                        self._push()
+                    settling = (
+                        self._session_active
+                        or self._pending_session is not None
+                        or time.monotonic() < self._session_record_not_before
+                    )
+                    # FF0A is transient: read/apply it before FF29 settlement
+                    # and before other optional reads can consume its window.
+                    if (
+                        self._pending_session_face_generation is not None
+                        or not settling
+                    ):
+                        face_read = await self._async_quiet_display_face(client)
+                    # Re-check settlement after I/O; a new motor stop may have
+                    # happened while the face read was outstanding.
+                    if (
+                        self._session_active
+                        or self._pending_session is not None
+                        or time.monotonic() < self._session_record_not_before
+                    ):
+                        result = "settling"
+                    else:
+                        record = await self._async_quiet_read(
+                            client, CHAR_SESSION_DATA, "session record"
+                        )
+                        record_sampled_at = (
+                            dt_util.utcnow() if record is not None else None
+                        )
+                        rtc = await self._async_quiet_read(client, CHAR_RTC, "RTC")
+                        rtc_sampled_at = dt_util.utcnow() if rtc is not None else None
+                        refill = await self._async_quiet_read(
+                            client, CHAR_REFILL_REMAINDER, "refill remainder"
+                        )
+                        if self.data["model_id"] is None:
+                            model_info = await self._async_quiet_read(
+                                client, CHAR_MODEL_ID, "device info"
+                            )
+                        if self.data["sector_times"] is None:
+                            pacer = await self._async_quiet_read(
+                                client, CHAR_PACER, "pacer"
+                            )
+                        if self.data["available_modes"] is None:
+                            available_modes = await self._async_quiet_read(
+                                client, CHAR_AVAILABLE_MODES, "available modes"
+                            )
+                        ring_color = await self._async_quiet_read(
+                            client, CHAR_RING_COLOR, "SmartRing color"
+                        )
+            except (BleakError, TimeoutError) as err:
+                _LOGGER.debug("%s: brief sync failed: %s", self.name, err)
             finally:
-                try:
-                    await client.disconnect()
-                except (BleakError, TimeoutError):
-                    pass
-        battery_refreshed = self._apply_battery_status(
-            status, DATA_SOURCE_DIRECT
-        )
-        self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
+                if client is not None:
+                    await self._async_close_brief_client(client)
         self._apply_refill(refill)
         self._apply_device_info(model_info)
         self._apply_pacer(pacer)
         self._apply_available_modes(available_modes)
         self._apply_ring_color(ring_color)
-        if state:
-            self._apply_state(state[0])
-        result = "missing"
+        # Maintenance does not replace the fresh passive state or create edges.
         if record is not None:
-            result = await self._async_apply_session_record(
-                record,
-                rtc,
-                record_sampled_at=record_sampled_at,
-                rtc_sampled_at=rtc_sampled_at,
-            )
-        any_value_read = any(
+            if (
+                self._session_generation != target_generation
+                or self._session_active
+                or self._pending_session is not None
+                or time.monotonic() < self._session_record_not_before
+            ):
+                result = "settling"
+            else:
+                result = await self._async_apply_session_record(
+                    record,
+                    rtc,
+                    record_sampled_at=record_sampled_at,
+                    rtc_sampled_at=rtc_sampled_at,
+                )
+        any_value_read = face_read or any(
             value is not None
             for value in (
-                record,
-                rtc,
-                status,
-                state,
-                smiley,
-                refill,
-                model_info,
-                pacer,
-                available_modes,
-                ring_color,
+                record, rtc, status, refill,
+                model_info, pacer, available_modes, ring_color,
             )
         )
         self._push()
-        _LOGGER.debug(
-            "%s: sync complete (session record: %s, battery refreshed: %s)",
-            self.name,
-            result,
-            battery_refreshed,
-        )
         return _SyncOutcome(result, battery_refreshed, any_value_read)
+
+    async def _async_quiet_display_face(
+        self, client: BleakClientWithServiceCache
+    ) -> bool:
+        """Read one display result promptly, retaining its original token."""
+        face_generation = self._session_face_generation
+        capture_generation = self._pending_session_face_generation
+        any_value_read = False
+        delays = (
+            SESSION_DISPLAY_FACE_READ_RETRY_DELAYS
+            if capture_generation is not None
+            else (0.0,)
+        )
+        for delay in delays:
+            if delay:
+                await asyncio.sleep(delay)
+            if (
+                not self._fresh_sync_window()
+                or self._session_face_generation != face_generation
+                or self._pending_session_face_generation != capture_generation
+                or (
+                    capture_generation is not None
+                    and not self._session_display_face_capture_is_open(capture_generation)
+                )
+            ):
+                return any_value_read
+            smiley = await self._async_quiet_read(client, CHAR_SMILEY, "smiley")
+            any_value_read = any_value_read or smiley is not None
+            # A read belongs to the token at request time, even if another
+            # session starts/stops or an advertisement supplies its face first.
+            if (
+                self._stopping
+                or self._session_face_generation != face_generation
+                or self._pending_session_face_generation != capture_generation
+                or (
+                    capture_generation is not None
+                    and not self._session_display_face_capture_is_open(capture_generation)
+                )
+            ):
+                return any_value_read
+            self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
+            self._push()
+            if (
+                capture_generation is None
+                or self._pending_session_face_generation != capture_generation
+            ):
+                return any_value_read
+        return any_value_read
+
+    async def _async_quiet_read(
+        self,
+        client: BleakClientWithServiceCache,
+        char_uuid: str,
+        label: str,
+    ) -> bytearray | None:
+        """Bound each optional read and stop reading when the quiet window ends."""
+        if not self._fresh_sync_window():
+            return None
+        try:
+            async with asyncio.timeout(SYNC_READ_TIMEOUT_SECONDS):
+                return await self._async_sync_read(client, char_uuid, label)
+        except TimeoutError:
+            _LOGGER.debug("%s: %s read timed out", self.name, label)
+            return None
 
     async def _async_sync_read(
         self,
@@ -1289,7 +1556,7 @@ class OralBLiveCoordinator:
         char_uuid: str,
         label: str,
     ) -> bytearray | None:
-        """Read one sync characteristic without suppressing later reads."""
+        """Read one characteristic without suppressing later reads."""
         try:
             return await client.read_gatt_char(char_uuid)
         except (BleakError, TimeoutError) as err:
@@ -1363,11 +1630,28 @@ class OralBLiveCoordinator:
             )
             return "invalid"
         battery_end = parsed.get("battery_end")
-        if isinstance(battery_end, int):
-            # The retained record remains a useful last-known battery reading
-            # even when this session was already counted before a restart.
+        battery_measured_at = None
+        if rtc is not None and len(rtc) >= 4:
+            rtc_value = int.from_bytes(rtc[:4], "little")
+            if rtc_value >= session_ts + duration:
+                battery_measured_at = (rtc_sampled_at or dt_util.utcnow()) - timedelta(
+                    seconds=rtc_value - session_ts - duration
+                )
+        previous_battery_at = self.data.get("battery_updated_at")
+        if isinstance(battery_end, int) and (
+            self.data.get("battery") is None
+            or (
+                battery_measured_at is not None
+                and isinstance(previous_battery_at, datetime)
+                and previous_battery_at.tzinfo is not None
+                and battery_measured_at > previous_battery_at
+            )
+        ):
+            # FF29 is historical, including on duplicate reads. Use its actual
+            # end time, and never make it look fresh merely because it was read.
+            # Without a usable RTC it can only fill an unknown value.
             self.data["battery"] = battery_end
-            self.data["battery_updated_at"] = dt_util.utcnow()
+            self.data["battery_updated_at"] = battery_measured_at
             self.data["battery_source"] = DATA_SOURCE_SESSION
         if self._last_synced_session_ts is None:
             stored = await self._store.async_load() or {}
@@ -1552,6 +1836,9 @@ class OralBLiveCoordinator:
             if self._session_generation_marked:
                 self._session_generation_marked = False
             self._mark_session_generation()
+            self._session_record_not_before = (
+                time.monotonic() + SESSION_RECORD_SETTLE_SECONDS
+            )
             _LOGGER.debug(
                 "%s: observed summary-only session generation %s in state %s",
                 self.name,
@@ -1728,6 +2015,7 @@ class OralBLiveCoordinator:
         self._session_generation += 1
         self._session_pending_sync = True
         self._reset_session_sync_retry()
+        self._request_battery_refresh()
         _LOGGER.debug(
             "%s: observed logical session generation %s",
             self.name,
@@ -1866,8 +2154,7 @@ class OralBLiveCoordinator:
             # A late continuation can finish after an earlier maintenance read.
             # Request one ordinary refresh without reopening or renumbering the
             # already resolved logical session.
-            self._maintenance_pending = True
-            self._maintenance_sync_retry_not_before = 0.0
+            self._request_battery_refresh()
 
         # If a resumed fragment was still ambiguous when the predecessor timed
         # out, it is now necessarily a distinct logical session.
@@ -1987,15 +2274,37 @@ class OralBLiveCoordinator:
     def _confirm_session(self) -> None:
         """Mark a provisional charger/menu observation as real brushing."""
         if self._session_active and not self._session_confirmed:
+            self._expire_late_continuation_candidate()
             if self._late_continuation_candidate is not None:
                 self._resume_finalized_session(
                     self._late_continuation_candidate,
                     int(self.data.get("time") or 0),
                 )
                 return
+            if (
+                self._session_started_via_selection_menu
+                and self._pending_session is None
+            ):
+                # Settings/menu time is not brushing time. Motor state or
+                # advancing native timer evidence dates the actual session,
+                # even when HA has not declared the old menu unavailable yet.
+                seconds = int(self.data.get("time") or 0)
+                seconds = seconds if 0 <= seconds <= MAX_SESSION_SECONDS else 0
+                self._session_start = dt_util.utcnow() - timedelta(seconds=seconds)
+                self._session_started_monotonic = time.monotonic() - seconds
             self._session_confirmed = True
             self._mark_session_generation()
             _LOGGER.debug("%s: session confirmed by brush data", self.name)
+
+    def _expire_late_continuation_candidate(self) -> None:
+        """Do not let a retained menu timer extend the matching window."""
+        if (
+            self._late_continuation_candidate is not None
+            and time.monotonic() - self._recent_finalized_at
+            > SESSION_LATE_CONTINUATION_WINDOW_SECONDS
+        ):
+            self._late_continuation_candidate = None
+            self._session_timer_baseline = None
 
     def _recent_session_matching_timer(
         self, seconds: int
@@ -2083,6 +2392,11 @@ class OralBLiveCoordinator:
                 self.name,
             )
             return False
+        if self.mode != CONNECTION_MODE_LIVE:
+            self._session_record_not_before = (
+                time.monotonic() + SESSION_RECORD_SETTLE_SECONDS
+            )
+            self._request_battery_refresh()
         duration = self._session_max_time or 0
         duration_source = "brush timer"
         if duration <= 0 and self._session_started_monotonic is not None:
@@ -2203,6 +2517,7 @@ class OralBLiveCoordinator:
             self._merge_pending_session(seconds)
             return
         if confirm_session and not self._session_confirmed:
+            self._expire_late_continuation_candidate()
             previous_baseline = self._session_timer_baseline
             if self._late_continuation_candidate is not None:
                 if seconds < (previous_baseline or 0):
@@ -2471,9 +2786,10 @@ class OralBLiveCoordinator:
         parsed = parse_refill_remainder(payload)
         if parsed:
             self.data.update(parsed)
-            self.data["refill_brushing_time_hours"] = (
-                parsed["refill_brushing_time"] / 3600
-            )
+            if "refill_brushing_time" in parsed:
+                self.data["refill_brushing_time_hours"] = (
+                    parsed["refill_brushing_time"] / 3600
+                )
             state_raw = parsed["refill_state_raw"]
             self.data["refill_state"] = REFILL_STATES.get(
                 state_raw, f"state_{state_raw}"

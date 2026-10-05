@@ -230,6 +230,17 @@ successful brush read. They remain `unknown` until the charger or direct brush
 connection has returned the corresponding characteristic; Oral-B Live does not
 invent placeholder values for unsupported or not-yet-read fields.
 
+In charger-priority mode without a matched charger, a recent idle, charging or
+post-brushing summary advertisement can trigger a brief battery read. Battery
+refresh does not wait for the retained session result to settle. Connection
+attempts remain at least 60 seconds apart, and retries require recent quiet
+Bluetooth observations. A matched charger supplies battery through its bridge.
+
+The battery entity's `last_read` attribute represents the current sample time,
+or the estimated session-end time when a retained result supplies the value.
+It remains unknown for a retained result without a usable brush clock. An older
+retained result cannot replace a newer battery sample.
+
 Battery voltage, current and temperature, oscillation angle and raw drive
 target, plus both brush-head remainder entities, are disabled by default. The
 first drive word is converted from hundredths of a degree to degrees; the

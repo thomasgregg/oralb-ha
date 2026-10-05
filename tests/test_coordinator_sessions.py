@@ -54,12 +54,12 @@ def _payload(
             0x32,  # firmware
             state,
             pressure,  # pressure/status flags
-            seconds // 256,
-            seconds % 256,
+            seconds // 60,  # minutes
+            seconds % 60,  # seconds
             0x00,  # mode
             sector | (face << 3),
-            0x00,  # total sectors
             0x00,  # sector timer
+            0x00,  # total sectors
         ]
     )
 
@@ -437,7 +437,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         self.assertNotIn("battery_status_source", c.data)
         self.assertNotIn("last_session_record_raw", c.data)
 
-    def test_valid_duplicate_session_record_refreshes_battery(self) -> None:
+    def test_valid_duplicate_session_record_fills_unknown_battery(self) -> None:
         """A previously counted real record remains useful for battery state."""
         c = self._coordinator()
         c.data["protocol_version"] = 8
@@ -448,7 +448,8 @@ class PassiveSessionDurationTests(unittest.TestCase):
 
         self.assertEqual(result, "duplicate")
         self.assertEqual(c.data["battery"], 94)
-        self.assertIsNotNone(c.data["battery_updated_at"])
+        # No RTC means the measurement time is unknown, not the read time.
+        self.assertIsNone(c.data["battery_updated_at"])
         self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_SESSION)
 
     def test_same_timestamp_longer_record_refines_without_recounting(self) -> None:
