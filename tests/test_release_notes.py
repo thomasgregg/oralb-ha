@@ -27,3 +27,31 @@ def test_reject_orphan_and_wrong_heading_levels():
 
 def test_ignore_code_headings():
     assert not notes.validate('v1.0.0', 'v1.0.0 — Diagnostics', '## Changes\n\n```text\n# example\n```\n')
+
+
+def test_nested_fence_markers_do_not_close_the_outer_block():
+    for inner in ['```', '~~~', '````text']:
+        body = f'## Changes\n\n````text\n{inner}\n# example\n````\n'
+        assert not notes.validate('v1.0.0', 'v1.0.0 — Diagnostics', body)
+
+
+def test_fence_closes_with_same_marker_and_sufficient_length():
+    for opening, closing in [('```', '```'), ('```', '````'), ('~~~', '~~~~')]:
+        body = f'## Changes\n\n{opening}\n# example\n{closing}\n# Wrong level\n'
+        assert notes.validate('v1.0.0', 'v1.0.0 — Diagnostics', body)
+
+
+def test_indented_headings_obey_the_same_rules():
+    for indent in ['', ' ', '  ', '   ']:
+        for wrong in ['# Wrong level', '#### Wrong level', '#']:
+            body = f'## Changes\n{indent}{wrong}\n'
+            assert notes.validate('v1.0.0', 'v1.0.0 — Diagnostics', body)
+        assert not notes.validate('v1.0.0', 'v1.0.0 — Diagnostics', f'{indent}## Changes\n')
+    # Four leading spaces make an indented code block, not a heading.
+    assert not notes.validate('v1.0.0', 'v1.0.0 — Diagnostics', '## Changes\n\n    # example\n')
+
+
+def test_indented_fences_preserve_code_headings():
+    for indent in [' ', '  ', '   ']:
+        body = f'## Changes\n\n{indent}```text\n# example\n{indent}```\n'
+        assert not notes.validate('v1.0.0', 'v1.0.0 — Diagnostics', body)

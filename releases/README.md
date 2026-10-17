@@ -17,5 +17,6 @@ Before publishing or editing a release:
 4. Read the release back through the GitHub API and compare title and body.
 
 CI validates the archive on every push and pull request. The release workflow
-also validates live release titles and bodies on publication, edits, and manual
-runs. Publication validation runs before uploading the integration ZIP.
+also validates live release titles and bodies on publication and edits. Manual
+runs validate the archived notes. Publication validation runs before uploading
+the integration ZIP.

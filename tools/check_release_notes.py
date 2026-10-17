@@ -12,13 +12,22 @@ def validate(tag, title, body):
     if "\\n" in body or "\\r" in body:
         errors.append("body contains escaped line breaks; use a UTF-8 notes file")
     headings = []
-    fenced = False
+    fence = None
     for line in body.splitlines():
-        if line.startswith(('```', '~~~')):
-            fenced = not fenced
-        if fenced:
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence is not None:
+            if (
+                marker
+                and marker[1][0] == fence[0]
+                and len(marker[1]) >= fence[1]
+                and not marker[2].strip()
+            ):
+                fence = None
             continue
-        match = re.match(r"^(#+)\s+(.+)$", line)
+        if marker and (marker[1][0] != '`' or '`' not in marker[2]):
+            fence = (marker[1][0], len(marker[1]))
+            continue
+        match = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+|$)(.*)$", line)
         if match:
             depth = len(match[1])
             if depth not in (2, 3):
