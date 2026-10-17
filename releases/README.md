@@ -1,7 +1,9 @@
 # Release notes
 
-Every historical release is archived here. Use `vX.Y.Z — Sentence case summary`
+Every historical release is archived here. Use a sentence-case summary (for example, `Off-charger battery refresh`)
 for the GitHub release title and the first `#` heading in its archive file.
+Do not include the version in the title: HACS adds the release tag before it,
+so a version-prefixed title appears twice. The archive filename retains the tag.
 Use `##` for body sections and `###` only for subsections within a section.
 Prefer `## Changes`, followed by relevant validation, compatibility, or testing
 sections. Preserve historical facts, caveats, credits, and links; do not invent
