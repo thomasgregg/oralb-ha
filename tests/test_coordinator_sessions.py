@@ -443,6 +443,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c.data["protocol_version"] = 8
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = int.from_bytes(record[0:4], "little")
+        c._store.async_save = AsyncMock()
 
         result = asyncio.run(c._async_apply_session_record(record, None))
 
@@ -451,6 +452,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         # No RTC means the measurement time is unknown, not the read time.
         self.assertIsNone(c.data["battery_updated_at"])
         self.assertEqual(c.data["battery_source"], const.DATA_SOURCE_SESSION)
+        c._store.async_save.assert_awaited_once()
 
     def test_same_timestamp_longer_record_refines_without_recounting(self) -> None:
         """A final FF29 may extend an interim record from the same timer run."""
@@ -486,6 +488,7 @@ class PassiveSessionDurationTests(unittest.TestCase):
         c.data["protocol_version"] = 8
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
         c._last_synced_session_ts = int.from_bytes(record[0:4], "little")
+        c._store.async_save = AsyncMock()
         c.data["last_session_duration"] = 50
         c.data["last_session_id"] = None
         c.data["last_session_source"] = const.DATA_SOURCE_ADVERTISEMENT
@@ -509,8 +512,8 @@ class PassiveSessionDurationTests(unittest.TestCase):
         result = asyncio.run(
             c._async_apply_session_record(
                 record,
-                record[:4],
-                rtc_sampled_at=passive_start,
+                (int.from_bytes(record[:4], "little") + 128).to_bytes(4, "little"),
+                rtc_sampled_at=passive_start + timedelta(seconds=128),
             )
         )
 
@@ -532,8 +535,8 @@ class PassiveSessionDurationTests(unittest.TestCase):
         result = asyncio.run(
             c._async_apply_session_record(
                 record,
-                record[:4],
-                rtc_sampled_at=passive_start,
+                (int.from_bytes(record[:4], "little") + 128).to_bytes(4, "little"),
+                rtc_sampled_at=passive_start + timedelta(seconds=128),
             )
         )
         c._apply_smiley(b"\x06", source=const.DATA_SOURCE_CHARGER)
@@ -555,8 +558,8 @@ class PassiveSessionDurationTests(unittest.TestCase):
         result = asyncio.run(
             c._async_apply_session_record(
                 record,
-                record[:4],
-                rtc_sampled_at=now,
+                (int.from_bytes(record[:4], "little") + 128).to_bytes(4, "little"),
+                rtc_sampled_at=now + timedelta(seconds=128),
             )
         )
 
@@ -577,8 +580,8 @@ class PassiveSessionDurationTests(unittest.TestCase):
         result = asyncio.run(
             c._async_apply_session_record(
                 record,
-                record[:4],
-                rtc_sampled_at=newer_wall_time,
+                (int.from_bytes(record[:4], "little") + 128).to_bytes(4, "little"),
+                rtc_sampled_at=newer_wall_time + timedelta(seconds=128),
             )
         )
         c._apply_smiley(b"\x06", source=const.DATA_SOURCE_DIRECT)
@@ -933,8 +936,8 @@ class PauseResumeSessionTests(unittest.TestCase):
         result = asyncio.run(
             c._async_apply_session_record(
                 record,
-                record[:4],
-                rtc_sampled_at=local_start,
+                (int.from_bytes(record[:4], "little") + 128).to_bytes(4, "little"),
+                rtc_sampled_at=local_start + timedelta(seconds=128),
             )
         )
 
@@ -1003,7 +1006,15 @@ class PauseResumeTimeoutTests(unittest.IsolatedAsyncioTestCase):
         record = bytes.fromhex("26e4ff3161017800800064000a001321280201045e")
 
         await c._async_apply_charger_passthrough("FF29", record)
-        await c._async_apply_charger_passthrough("FF22", record[:4])
+        # A completed record needs a clock at/after its end, with a matching
+        # wall sample. A clock equal to its start is an uncommitted pair.
+        with patch.object(
+            coordinator.dt_util, "utcnow",
+            return_value=c._session_start + timedelta(seconds=128),
+        ):
+            await c._async_apply_charger_passthrough(
+                "FF22", (int.from_bytes(record[:4], "little") + 128).to_bytes(4, "little"),
+            )
         self.assertIsNone(c.data["last_session_duration"])
         self.assertIsNotNone(c._charger_session_record)
 

@@ -164,6 +164,9 @@ SYNC_RETRY_ATTEMPTS = 4
 # session, so the authoritative record can refine the fallback without
 # incrementing the daily count twice.
 SESSION_RECONCILE_WINDOW_SECONDS = 2 * 60
+# Bound persisted record identities while retaining roughly a month of twice-
+# daily brushing. Replayed older records must not be counted after a reload.
+SESSION_RECORD_HISTORY_SIZE = 64
 # A motor stop can be a temporary pause while the handle keeps the same brush
 # timer. Keep the logical session provisional long enough for the slower
 # advertisement path to expose a resume, then finalize a genuine stop.

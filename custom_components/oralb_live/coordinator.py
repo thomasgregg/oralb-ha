@@ -92,6 +92,7 @@ from .const import (
     SESSION_LATE_CONTINUATION_WINDOW_SECONDS,
     SESSION_PAUSE_GRACE_SECONDS,
     SESSION_RECONCILE_WINDOW_SECONDS,
+    SESSION_RECORD_HISTORY_SIZE,
     SESSION_RECORD_SETTLE_SECONDS,
     SESSION_SEEN_STATES,
     SESSION_SYNC_RETRY_BACKOFF_SECONDS,
@@ -324,6 +325,10 @@ class OralBLiveCoordinator:
         self._last_sync_attempt = 0.0
         self._last_sync_ok = 0.0
         self._last_synced_session_ts: int | None = None
+        self._session_record_keys: list[tuple[int, int, int]] = []
+        self._latest_session_record_key: tuple[int, int, int] | None = None
+        self._session_records_loaded = False
+        self._session_record_lock = asyncio.Lock()
         self._session_generation = 0
         self._processed_session_generation = 0
         self._session_sync_retry_count = 0
@@ -490,7 +495,11 @@ class OralBLiveCoordinator:
             # brush was still advertising as running, up to a full advertising
             # interval short of what the brush displayed.
             self._track_session_time(self.data["time"], confirm_session=track_session)
-        self._apply_state(state_raw, track_session=track_session)
+        self._apply_state(
+            state_raw,
+            track_session=track_session,
+            session_seconds=self.data["time"] if not adv_live else None,
+        )
         if not adv_live:
             self._apply_advertisement_pressure(
                 payload[ADV_IDX_PRESSURE], current=track_session
@@ -923,17 +932,19 @@ class OralBLiveCoordinator:
             self._charger_session_record_sampled_at = None
             self._charger_session_rtc = None
             self._charger_session_rtc_sampled_at = None
+            generation = self._session_generation
             result = await self._async_apply_session_record(
                 record,
                 rtc,
                 record_sampled_at=record_sampled_at,
                 rtc_sampled_at=rtc_sampled_at,
             )
-            if result in _SESSION_SYNC_RESOLVED_RESULTS:
-                if result == "new":
-                    self.data["last_session_source"] = DATA_SOURCE_SESSION
+            if (
+                result in _SESSION_SYNC_RESOLVED_RESULTS
+                and self._session_generation == generation
+            ):
                 self._session_pending_sync = False
-                self._processed_session_generation = self._session_generation
+                self._processed_session_generation = generation
                 self._reset_session_sync_retry()
         self._push()
 
@@ -971,17 +982,19 @@ class OralBLiveCoordinator:
         rtc_sampled_at: datetime | None,
     ) -> None:
         """Reconcile one retained charger record after logical finalization."""
+        generation = self._session_generation
         result = await self._async_apply_session_record(
             record,
             rtc,
             record_sampled_at=record_sampled_at,
             rtc_sampled_at=rtc_sampled_at,
         )
-        if result in _SESSION_SYNC_RESOLVED_RESULTS:
-            if result == "new":
-                self.data["last_session_source"] = DATA_SOURCE_SESSION
+        if (
+            result in _SESSION_SYNC_RESOLVED_RESULTS
+            and self._session_generation == generation
+        ):
             self._session_pending_sync = False
-            self._processed_session_generation = self._session_generation
+            self._processed_session_generation = generation
             self._reset_session_sync_retry()
             self._push()
 
@@ -1571,14 +1584,86 @@ class OralBLiveCoordinator:
         record_sampled_at: datetime | None = None,
         rtc_sampled_at: datetime | None = None,
     ) -> str:
+        """Serialize identity loading, reconciliation and persistence."""
+        generation = (self._session_generation, self._session_face_generation)
+        async with self._session_record_lock:
+            return await self._async_reconcile_session_record(
+                record,
+                rtc,
+                generation,
+                record_sampled_at=record_sampled_at,
+                rtc_sampled_at=rtc_sampled_at,
+            )
+
+    @staticmethod
+    def _session_record_key(value: Any) -> tuple[int, int, int] | None:
+        """Validate an optional identity from the version-1 storage extension."""
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) == 3
+            and all(type(part) is int for part in value)
+            and 0 < value[0] <= 0xFFFFFFFF
+            and 0 <= value[1] <= 0x1FFF
+            and 0 <= value[2] <= 7
+        ):
+            return (value[0], value[1], value[2])
+        return None
+
+    async def _async_load_session_records(self) -> None:
+        """Read old timestamp-only stores and the bounded identity history."""
+        if self._session_records_loaded:
+            return
+        stored = (
+            await self._store.async_load()
+            if self._last_synced_session_ts is None
+            else {}
+        )
+        stored = stored if isinstance(stored, dict) else {}
+        if self._last_synced_session_ts is None:
+            timestamp = stored.get("last_session_ts", 0)
+            self._last_synced_session_ts = (
+                timestamp if type(timestamp) is int and timestamp >= 0 else 0
+            )
+        records = stored.get("session_records", [])
+        if isinstance(records, list):
+            for value in records[-SESSION_RECORD_HISTORY_SIZE:]:
+                if (key := self._session_record_key(value)) is not None:
+                    if key not in self._session_record_keys:
+                        self._session_record_keys.append(key)
+        self._latest_session_record_key = self._session_record_key(
+            stored.get("last_session_key")
+        )
+        self._session_records_loaded = True
+
+    async def _async_save_session_records(self) -> None:
+        """Persist record identities alongside the backwards-compatible marker."""
+        await self._store.async_save({
+            "last_session_ts": self._last_synced_session_ts,
+            "last_session_key": (
+                list(self._latest_session_record_key)
+                if self._latest_session_record_key is not None
+                else None
+            ),
+            "session_records": [list(value) for value in self._session_record_keys],
+        })
+
+    async def _async_reconcile_session_record(
+        self,
+        record: bytes | bytearray,
+        rtc: bytes | bytearray | None,
+        generation: tuple[int, int],
+        *,
+        record_sampled_at: datetime | None = None,
+        rtc_sampled_at: datetime | None = None,
+    ) -> str:
         """Parse the ff29 last-session record and log new sessions.
 
         The brush clock drifts (observed ~8 days off wall time), so the
         start time is derived RELATIVE to the matching RTC sample:
         wall_start = wall_at_rtc_read - (rtc - record_ts). Keeping the wall
         timestamp with the RTC also makes a delayed charger pair accurate.
-        The raw record timestamp is used only for deduplication, persisted so
-        restarts do not double-count.
+        A timestamp/session/user identity is persisted so older replays and
+        brush-clock resets do not masquerade as new or duplicate sessions.
         """
         raw_record = bytes(record)
         raw_hex = raw_record.hex(" ")
@@ -1629,14 +1714,25 @@ class OralBLiveCoordinator:
                 raw_hex,
             )
             return "invalid"
+        await self._async_load_session_records()
+        if (
+            self._stopping
+            or generation != (self._session_generation, self._session_face_generation)
+            or self._session_active
+            or self._pending_session is not None
+        ):
+            return "settling"
+        key = (session_ts, int(parsed["session_id"]), int(parsed["user_id"]))
         battery_end = parsed.get("battery_end")
         battery_measured_at = None
+        start = None
         if rtc is not None and len(rtc) >= 4:
             rtc_value = int.from_bytes(rtc[:4], "little")
             if rtc_value >= session_ts + duration:
-                battery_measured_at = (rtc_sampled_at or dt_util.utcnow()) - timedelta(
-                    seconds=rtc_value - session_ts - duration
+                start = (rtc_sampled_at or dt_util.utcnow()) - timedelta(
+                    seconds=rtc_value - session_ts
                 )
+                battery_measured_at = start + timedelta(seconds=duration)
         previous_battery_at = self.data.get("battery_updated_at")
         if isinstance(battery_end, int) and (
             self.data.get("battery") is None
@@ -1653,18 +1749,55 @@ class OralBLiveCoordinator:
             self.data["battery"] = battery_end
             self.data["battery_updated_at"] = battery_measured_at
             self.data["battery_source"] = DATA_SOURCE_SESSION
-        if self._last_synced_session_ts is None:
-            stored = await self._store.async_load() or {}
-            self._last_synced_session_ts = stored.get("last_session_ts", 0)
         current_duration = self.data.get("last_session_duration")
-        refines_same_timestamp = (
-            session_ts == self._last_synced_session_ts
-            and isinstance(current_duration, int)
-            and duration > current_duration
-            and self.data.get("last_session_source") == DATA_SOURCE_SESSION
+        previous_start = self.data.get("last_session_start")
+        current_identity = (
+            self._latest_session_record_key == key
+            or (
+                self._latest_session_record_key is None
+                and self._last_synced_session_ts == session_ts
+            )
+        ) and (
+            self.data.get("last_session_source") == DATA_SOURCE_SESSION
             and self.data.get("last_session_id") == parsed["session_id"]
         )
-        if session_ts == self._last_synced_session_ts and not refines_same_timestamp:
+        refines_same_timestamp = (
+            current_identity
+            and isinstance(current_duration, int)
+            and duration > current_duration
+        )
+        matched_passive_start = None
+        if (
+            start is not None
+            and not refines_same_timestamp
+            and self._pending_passive_sessions
+        ):
+            candidate = min(
+                self._pending_passive_sessions,
+                key=lambda value: abs((start - value).total_seconds()),
+            )
+            if (
+                abs((start - candidate).total_seconds())
+                <= SESSION_RECONCILE_WINDOW_SECONDS
+            ):
+                matched_passive_start = candidate
+
+        legacy_duplicate = (
+            not self._session_record_keys
+            and session_ts == self._last_synced_session_ts
+            and self.data.get("last_session_id") in (None, parsed["session_id"])
+            and matched_passive_start is None
+        )
+        if (
+            key in self._session_record_keys or legacy_duplicate
+        ) and not refines_same_timestamp:
+            if legacy_duplicate:
+                # Migrate the known record even when no new summary is needed.
+                # Otherwise the first newer record would erase this identity,
+                # allowing a later replay to be counted again.
+                self._session_record_keys.append(key)
+                self._latest_session_record_key = key
+                await self._async_save_session_records()
             _LOGGER.debug(
                 "%s: ff29 still contains the previous session "
                 "(timestamp=%s, duration=%ss)",
@@ -1673,34 +1806,25 @@ class OralBLiveCoordinator:
                 duration,
             )
             return "duplicate"
-
-        rtc_now: int | None = None
-        if rtc is not None and len(rtc) >= 4:
-            rtc_now = int.from_bytes(rtc[0:4], "little")
-        if rtc_now is not None and rtc_now >= session_ts:
-            wall_reference = rtc_sampled_at or dt_util.utcnow()
-            start = wall_reference - timedelta(seconds=rtc_now - session_ts)
-        else:
-            start = dt_util.utcnow()
-
-        previous_start = self.data.get("last_session_start")
-        matched_passive_start = None
-        if not refines_same_timestamp and self._pending_passive_sessions:
-            matched_passive_start = min(
-                self._pending_passive_sessions,
-                key=lambda candidate: abs((start - candidate).total_seconds()),
-            )
-            if (
-                abs((start - matched_passive_start).total_seconds())
-                > SESSION_RECONCILE_WINDOW_SECONDS
-            ):
-                matched_passive_start = None
+        if refines_same_timestamp:
+            # Identity already ties this refinement to a counted session.
+            start = previous_start
+        if start is None:
+            # A read time is not a session start. Keep recovery pending until
+            # a usable clock can date this unseen record without inventing a
+            # count, changing its day or attaching it to an arbitrary session.
+            _LOGGER.debug("%s: FF29 identity %s needs a usable clock", self.name, key)
+            return "missing"
         reconciles_passive_session = (
             refines_same_timestamp or matched_passive_start is not None
         )
         if matched_passive_start is not None:
             self._pending_passive_sessions.remove(matched_passive_start)
-        elif not refines_same_timestamp and previous_start is not None:
+        elif (
+            not refines_same_timestamp
+            and previous_start is not None
+            and self.data.get("last_session_id") is None
+        ):
             # After an integration reload only the most recent passive session
             # is restored, not the in-memory queue.
             reconciles_passive_session = (
@@ -1741,8 +1865,14 @@ class OralBLiveCoordinator:
             self.data["last_session_maximum_pressure"] = parsed["maximum_pressure"]
             self.data["last_session_battery_end"] = parsed.get("battery_end")
             self.data["last_session_source"] = DATA_SOURCE_SESSION
-        self._last_synced_session_ts = session_ts
-        await self._store.async_save({"last_session_ts": session_ts})
+            self._last_synced_session_ts = session_ts
+            self._latest_session_record_key = key
+        if key not in self._session_record_keys:
+            self._session_record_keys.append(key)
+            self._session_record_keys = self._session_record_keys[
+                -SESSION_RECORD_HISTORY_SIZE:
+            ]
+        await self._async_save_session_records()
         if reconciles_passive_session:
             if updates_latest_session:
                 _LOGGER.debug(
@@ -1778,6 +1908,7 @@ class OralBLiveCoordinator:
         *,
         track_session: bool = True,
         confirm_session: bool | None = None,
+        session_seconds: int | None = None,
     ) -> bool:
         """Apply brush state and report whether it recorded a completed session."""
         session_recorded = False
@@ -1800,6 +1931,7 @@ class OralBLiveCoordinator:
                 self._begin_session(
                     confirmed=confirms_brushing,
                     selection_menu_route=(raw == 8 or previous_tracked == 8),
+                    initial_seconds=session_seconds,
                 )
             elif raw in session_states and confirms_brushing:
                 self._confirm_session()
@@ -2226,6 +2358,7 @@ class OralBLiveCoordinator:
         *,
         confirmed: bool = False,
         selection_menu_route: bool = False,
+        initial_seconds: int | None = None,
     ) -> None:
         """Start a physical fragment, pending timer-based boundary evidence."""
         resuming_pending = self._pending_session is not None
@@ -2240,6 +2373,16 @@ class OralBLiveCoordinator:
         self._session_timer_baseline = None
         self._session_start = dt_util.utcnow()
         self._session_started_monotonic = time.monotonic()
+        if (
+            confirmed
+            and not resuming_pending
+            and initial_seconds is not None
+            and 0 <= initial_seconds <= MAX_SESSION_SECONDS
+        ):
+            # The first advertisement can arrive near the end of a session.
+            # Its native timer dates the start before HA first saw the brush.
+            self._session_start -= timedelta(seconds=initial_seconds)
+            self._session_started_monotonic -= initial_seconds
         self._session_max_time = 0
         self._session_sectors = set()
         self._session_high_pressure = 0

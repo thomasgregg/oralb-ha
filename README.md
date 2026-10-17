@@ -292,6 +292,13 @@ like every `special_*` verdict; only `off` means that no result was exposed. If
 the handle supplies only `off` or no usable face, `display_face` remains `null`
 rather than inheriting an older session's face.
 
+If Home Assistant first sees a running brush partway through a session, its
+advertised timer is used to estimate the original start. Retained recovery
+needs a usable brush clock to date an unfamiliar record. Until then, the
+observed session and count are preserved and recovery can retry; fresh battery
+reads still update independently. Recent recovered record identities survive
+integration reloads so an older replay does not count as another brushing.
+
 `FF29` is selected through an exact protocol-version decoder registry. The
 verified protocol-7/8 layout remains in use there, with protocol 9 retaining
 its existing compatibility. Protocol 6 exposes a different payload, so
