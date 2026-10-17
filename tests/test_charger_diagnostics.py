@@ -81,9 +81,7 @@ def test_timeout_names_failure_and_cleans_pending_read(caplog):
         instance._client.write_gatt_char = AsyncMock()
         with (
             caplog.at_level(logging.DEBUG, logger=charger.__name__),
-            patch.object(
-                charger.asyncio, "wait_for", AsyncMock(side_effect=TimeoutError)
-            ),
+            patch.object(charger, "CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS", 0.01),
         ):
             assert await instance._async_passthrough("FF29") is None
         assert instance._pending_future is None

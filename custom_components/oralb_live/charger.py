@@ -179,7 +179,7 @@ class IOSenseBridge:
     @callback
     def async_start(self) -> None:
         """Listen for any iO Sense and identify its paired brush locally."""
-        self._trace("diagnostic_start", build="0.7.40b1")
+        self._trace("diagnostic_start", build="0.7.40b2")
         self._unsub_bluetooth = bluetooth.async_register_callback(
             self.hass,
             self._async_advertisement,
@@ -515,15 +515,16 @@ class IOSenseBridge:
             started = loop.time()
             self._trace("get_start", command=command.name)
             try:
-                await client.write_gatt_char(
-                    IOSENSE_COMMAND_UUID, build_charger_get(command), response=True
-                )
-                await client.write_gatt_char(
-                    IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
-                )
-                packet = await asyncio.wait_for(
-                    future, timeout=CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS
-                )
+                # Writes can stall too. One wire deadline bounds their total
+                # plus the reply; queueing for the lock retains its own turn.
+                async with asyncio.timeout(CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS):
+                    await client.write_gatt_char(
+                        IOSENSE_COMMAND_UUID, build_charger_get(command), response=True
+                    )
+                    await client.write_gatt_char(
+                        IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
+                    )
+                    packet = await future
                 self.data["last_response_latency_ms"] = round(
                     (loop.time() - started) * 1000, 1
                 )
@@ -564,22 +565,23 @@ class IOSenseBridge:
             started = loop.time()
             self._trace("passthrough_start", characteristic=short_uuid)
             try:
-                await client.write_gatt_char(
-                    IOSENSE_COMMAND_UUID,
-                    bytes((0xC1, ChargerCommand.BRUSH_PASSTHROUGH)),
-                    response=True,
-                )
-                await client.write_gatt_char(
-                    IOSENSE_WRITE_UUID,
-                    build_passthrough_read(short_uuid),
-                    response=True,
-                )
-                await client.write_gatt_char(
-                    IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
-                )
-                record = await asyncio.wait_for(
-                    future, timeout=CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS
-                )
+                # Writes can stall too. One wire deadline bounds their total
+                # plus the reply; queueing for the lock retains its own turn.
+                async with asyncio.timeout(CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS):
+                    await client.write_gatt_char(
+                        IOSENSE_COMMAND_UUID,
+                        bytes((0xC1, ChargerCommand.BRUSH_PASSTHROUGH)),
+                        response=True,
+                    )
+                    await client.write_gatt_char(
+                        IOSENSE_WRITE_UUID,
+                        build_passthrough_read(short_uuid),
+                        response=True,
+                    )
+                    await client.write_gatt_char(
+                        IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
+                    )
+                    record = await future
                 self.data["last_response_latency_ms"] = round(
                     (loop.time() - started) * 1000, 1
                 )
