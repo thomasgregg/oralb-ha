@@ -1,4 +1,4 @@
-"""Timing diagnostics must observe transport behavior without changing it."""
+"""Stable charger transport behavior and logging privacy regressions."""
 
 import asyncio
 import importlib
@@ -29,7 +29,7 @@ def bridge():
 
 
 @pytest.mark.parametrize("level", [logging.DEBUG, logging.WARNING])
-def test_diagnostic_read_keeps_exact_transport_sequence(level, caplog):
+def test_logging_level_preserves_exact_transport_sequence(level, caplog):
     async def exercise():
         instance = bridge()
 
@@ -52,11 +52,8 @@ def test_diagnostic_read_keeps_exact_transport_sequence(level, caplog):
         assert instance._pending_future is None
 
     asyncio.run(exercise())
-    if level == logging.DEBUG:
-        assert "passthrough_result" in caplog.text
-        assert "payload='0012'" in caplog.text
-    else:
-        assert "trace" not in caplog.text
+    assert "iO Sense trace" not in caplog.text
+    assert "payload='0012'" not in caplog.text
 
 
 def test_negative_ack_remains_an_ack_not_a_brush_read(caplog):
@@ -71,11 +68,11 @@ def test_negative_ack_remains_an_ack_not_a_brush_read(caplog):
         instance._pending_future.cancel()
 
     asyncio.run(exercise())
-    assert "pending_characteristic='FF29'" in caplog.text
-    assert "raw='37c1ff'" in caplog.text
+    assert "iO Sense status: 37c1ff" in caplog.text
+    assert "iO Sense trace" not in caplog.text
 
 
-def test_timeout_names_failure_and_cleans_pending_read(caplog):
+def test_timeout_logs_failure_and_cleans_pending_read(caplog):
     async def exercise():
         instance = bridge()
         instance._client.write_gatt_char = AsyncMock()
@@ -88,8 +85,8 @@ def test_timeout_names_failure_and_cleans_pending_read(caplog):
         assert instance._pending_short_uuid is None
 
     asyncio.run(exercise())
-    assert "passthrough_failed" in caplog.text
-    assert "error_type='TimeoutError'" in caplog.text
+    assert "iO Sense passthrough FF29 failed" in caplog.text
+    assert "iO Sense trace" not in caplog.text
 
 
 def test_unsampled_fields_are_not_dumped(caplog):
@@ -105,5 +102,5 @@ def test_unsampled_fields_are_not_dumped(caplog):
             assert await instance._async_passthrough("FF05") == b"SUS"
 
     asyncio.run(exercise())
-    assert "payload='omitted'" in caplog.text
+    assert "payload=" not in caplog.text
     assert "535553" not in caplog.text

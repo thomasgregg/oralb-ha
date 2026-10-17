@@ -158,18 +158,6 @@ class IOSenseBridge:
         self._last_connection_bits: int | None = None
         self._stopping = False
         self._discovery_announced = False
-        self._diagnostic_advertisement_at: float | None = None
-
-    def _trace(self, event: str, **fields: Any) -> None:
-        """Emit local timing evidence only when integration debug is enabled."""
-        if _LOGGER.isEnabledFor(logging.DEBUG):
-            _LOGGER.debug(
-                "iO Sense trace %s mono=%.3f charger=%s %s",
-                event,
-                time.monotonic(),
-                self.address,
-                " ".join(f"{key}={value!r}" for key, value in fields.items()),
-            )
 
     @property
     def session_running(self) -> bool:
@@ -179,7 +167,6 @@ class IOSenseBridge:
     @callback
     def async_start(self) -> None:
         """Listen for any iO Sense and identify its paired brush locally."""
-        self._trace("diagnostic_start", build="0.7.40b2")
         self._unsub_bluetooth = bluetooth.async_register_callback(
             self.hass,
             self._async_advertisement,
@@ -215,18 +202,6 @@ class IOSenseBridge:
 
         previous_bits = self._last_connection_bits
         current_bits = int(decoded["connection_bits"])
-        self._diagnostic_advertisement_at = time.monotonic()
-        self._trace(
-            "advertisement",
-            source=service_info.source,
-            rssi=service_info.rssi,
-            age_ms=round((time.monotonic() - service_info.time) * 1000, 1),
-            previous_bits=previous_bits,
-            bits=f"0x{current_bits:02x}",
-            brush_connected=decoded.get("brush_connected"),
-            brush_charging=decoded.get("brush_charging"),
-            bridge_connected=self.data["bridge_connected"],
-        )
         self._last_connection_bits = current_bits
         self.available = True
         self.data.update(
@@ -277,22 +252,10 @@ class IOSenseBridge:
                 else CHARGER_IDLE_PROBE_INTERVAL_SECONDS
             )
             if state_changed or now - self._last_probe_monotonic >= probe_interval:
-                self._trace(
-                    "probe_due",
-                    state_changed=state_changed,
-                    since_probe_s=round(now - self._last_probe_monotonic, 3),
-                )
                 self._schedule_connect(self.address)
-            else:
-                self._trace(
-                    "probe_deferred",
-                    interval_s=probe_interval,
-                    since_probe_s=round(now - self._last_probe_monotonic, 3),
-                )
 
     @callback
     def _async_unavailable(self, _service_info: BluetoothServiceInfoBleak) -> None:
-        self._trace("unavailable", running=self._session_running)
         self.available = False
         self.data["state"] = "unavailable"
         self._end_session(schedule_disconnect=False)
@@ -301,25 +264,16 @@ class IOSenseBridge:
 
     def _schedule_connect(self, address: str) -> None:
         if self._stopping:
-            self._trace("connect_skipped", reason="stopping")
             return
         if self._connect_task and not self._connect_task.done():
-            self._trace("connect_skipped", reason="task_pending")
             return
-        self._trace("connect_scheduled", target=address)
         self._connect_task = self.hass.async_create_task(self._async_connect(address))
 
     async def _async_connect(self, address: str) -> None:
-        queued_at = time.monotonic()
         async with self._connect_lock:
-            self._trace(
-                "connect_lock_acquired",
-                wait_ms=round((time.monotonic() - queued_at) * 1000, 1),
-            )
             if self._stopping:
                 return
             if self._client and self._client.is_connected:
-                self._trace("connect_skipped", reason="already_connected")
                 if self.address == address:
                     self._ensure_live_task()
                 return
@@ -328,13 +282,10 @@ class IOSenseBridge:
                 self.hass, address, connectable=True
             )
             if ble_device is None:
-                self._trace("connect_skipped", reason="no_connectable_path")
                 _LOGGER.debug("iO Sense %s has no connectable path", address)
                 self._candidate_addresses.discard(address)
                 return
             try:
-                self._trace("connect_start", target=address)
-                connect_started = time.monotonic()
                 client = await establish_connection(
                     BleakClientWithServiceCache,
                     ble_device,
@@ -343,27 +294,11 @@ class IOSenseBridge:
                     max_attempts=3,
                 )
             except (BleakError, TimeoutError) as err:
-                self._trace(
-                    "connect_failed",
-                    error_type=type(err).__name__,
-                    elapsed_ms=round((time.monotonic() - connect_started) * 1000, 1),
-                )
                 _LOGGER.debug("iO Sense %s connection failed: %s", address, err)
                 self._candidate_addresses.discard(address)
                 return
 
             self._client = client
-            self._trace(
-                "connect_ready",
-                elapsed_ms=round((time.monotonic() - connect_started) * 1000, 1),
-                since_advertisement_ms=(
-                    round(
-                        (time.monotonic() - self._diagnostic_advertisement_at) * 1000, 1
-                    )
-                    if self._diagnostic_advertisement_at is not None
-                    else None
-                ),
-            )
             self.data["bridge_connected"] = True
             self.data["state"] = "connected"
             try:
@@ -424,13 +359,7 @@ class IOSenseBridge:
                         )
 
                 if self.data.get("brush_connected"):
-                    self._trace("refresh_session_state")
                     await self._async_refresh_session_state()
-                else:
-                    self._trace(
-                        "refresh_session_skipped",
-                        reason="advertisement_brush_disconnected",
-                    )
                 snapshot_due = (
                     not self._snapshot_complete
                     or time.monotonic() - self._last_snapshot_monotonic
@@ -443,8 +372,6 @@ class IOSenseBridge:
                 else:
                     if self.data.get("brush_connected"):
                         await self._async_post_session_sync()
-                    else:
-                        self._trace("post_session_skipped", reason="brush_disconnected")
                     await self._async_disconnect()
             except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
                 _LOGGER.debug("iO Sense setup/read failed: %s", err)
@@ -455,11 +382,9 @@ class IOSenseBridge:
                 self._push()
 
     async def _async_snapshot(self) -> None:
-        self._trace("snapshot_start")
         successful = 0
         for command in CHARGER_SNAPSHOT_COMMANDS:
             if self._stopping or self._session_running:
-                self._trace("snapshot_interrupted", successful_reads=successful)
                 return
             packet = await self._async_get(command)
             if packet is None:
@@ -468,7 +393,6 @@ class IOSenseBridge:
         self._snapshot_complete = successful > len(CHARGER_SNAPSHOT_COMMANDS) // 2
         if successful:
             self._last_snapshot_monotonic = time.monotonic()
-        self._trace("snapshot_end", successful_reads=successful)
 
     async def _async_refresh_session_state(self) -> None:
         """Read the two short charger values that gate live forwarding."""
@@ -484,13 +408,7 @@ class IOSenseBridge:
             time.monotonic() - self._last_session_sync_monotonic
             < CHARGER_SESSION_SYNC_INTERVAL_SECONDS
         ):
-            self._trace("post_session_skipped", reason="cooldown", force=force)
             return
-        self._trace(
-            "post_session_start",
-            force=force,
-            brush_status=self.data.get("brush_status"),
-        )
         successful = 0
         for short_uuid in CHARGER_POST_SESSION_READS:
             if self._stopping or self._session_running:
@@ -500,7 +418,6 @@ class IOSenseBridge:
                 successful += 1
         if successful:
             self._last_session_sync_monotonic = time.monotonic()
-        self._trace("post_session_end", successful_reads=successful)
 
     async def _async_get(self, command: ChargerCommand) -> ChargerPacket | None:
         client = self._client
@@ -513,10 +430,9 @@ class IOSenseBridge:
             self._pending_command = command
             self._pending_short_uuid = None
             started = loop.time()
-            self._trace("get_start", command=command.name)
             try:
-                # Writes can stall too. One wire deadline bounds their total
-                # plus the reply; queueing for the lock retains its own turn.
+                # Bound writes and response together; a stalled write must not
+                # retain the lock and block queued post-session reads.
                 async with asyncio.timeout(CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS):
                     await client.write_gatt_char(
                         IOSENSE_COMMAND_UUID, build_charger_get(command), response=True
@@ -528,25 +444,8 @@ class IOSenseBridge:
                 self.data["last_response_latency_ms"] = round(
                     (loop.time() - started) * 1000, 1
                 )
-                self._trace(
-                    "get_result",
-                    command=command.name,
-                    elapsed_ms=self.data["last_response_latency_ms"],
-                    value=(
-                        packet.value
-                        if command
-                        in {ChargerCommand.SESSION_STATUS, ChargerCommand.BRUSH_STATUS}
-                        else "received"
-                    ),
-                )
                 return packet
             except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
-                self._trace(
-                    "get_failed",
-                    command=command.name,
-                    error_type=type(err).__name__,
-                    elapsed_ms=round((loop.time() - started) * 1000, 1),
-                )
                 _LOGGER.debug("iO Sense GET %s failed: %s", command.name, err)
                 return None
             finally:
@@ -563,10 +462,9 @@ class IOSenseBridge:
             self._pending_command = ChargerCommand.BRUSH_PASSTHROUGH
             self._pending_short_uuid = short_uuid
             started = loop.time()
-            self._trace("passthrough_start", characteristic=short_uuid)
             try:
-                # Writes can stall too. One wire deadline bounds their total
-                # plus the reply; queueing for the lock retains its own turn.
+                # Bound writes and response together; a stalled write must not
+                # retain the lock and block queued post-session reads.
                 async with asyncio.timeout(CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS):
                     await client.write_gatt_char(
                         IOSENSE_COMMAND_UUID,
@@ -585,25 +483,8 @@ class IOSenseBridge:
                 self.data["last_response_latency_ms"] = round(
                     (loop.time() - started) * 1000, 1
                 )
-                self._trace(
-                    "passthrough_result",
-                    characteristic=short_uuid,
-                    success=record.get("success"),
-                    elapsed_ms=self.data["last_response_latency_ms"],
-                    payload=(
-                        bytes(record.get("data", b"")).hex()
-                        if short_uuid in {"FF04", "FF08", "FF22", "FF29"}
-                        else "omitted"
-                    ),
-                )
                 return record["data"] if record.get("success") else None
             except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
-                self._trace(
-                    "passthrough_failed",
-                    characteristic=short_uuid,
-                    error_type=type(err).__name__,
-                    elapsed_ms=round((loop.time() - started) * 1000, 1),
-                )
                 _LOGGER.debug("iO Sense passthrough %s failed: %s", short_uuid, err)
                 return None
             finally:
@@ -637,29 +518,8 @@ class IOSenseBridge:
         # Status packets acknowledge delivery; the read response carries the
         # actual value and is the only packet used to complete a request.
         _LOGGER.debug("iO Sense status: %s", bytes(payload).hex())
-        self._trace(
-            "ack",
-            raw=bytes(payload).hex(),
-            pending_command=(
-                self._pending_command.name
-                if self._pending_command is not None
-                else None
-            ),
-            pending_characteristic=self._pending_short_uuid,
-        )
 
     def _apply_native_packet(self, packet: ChargerPacket) -> None:
-        if packet.command in {
-            ChargerCommand.BRUSH_STATUS,
-            ChargerCommand.SESSION_STATUS,
-        }:
-            self._trace(
-                "native_state",
-                command=packet.command.name,
-                value=packet.value,
-                running=self._session_running,
-                confirmed=self._session_confirmed,
-            )
         if packet.command in _CHARGER_DATA_KEYS:
             self.data[_CHARGER_DATA_KEYS[packet.command]] = packet.value
         if packet.command == ChargerCommand.BRUSH_STATUS:
@@ -693,9 +553,6 @@ class IOSenseBridge:
         )
         self._cancel_disconnect()
         if not self._session_running:
-            self._trace(
-                "session_provisional_start", brush_status=self.data.get("brush_status")
-            )
             self._session_running = True
             self._session_confirmed = False
             self._provisional_timer_baseline = None
@@ -711,9 +568,6 @@ class IOSenseBridge:
         """Promote provisional charger ownership to a real brush session."""
         if not self._session_running or self._session_confirmed:
             return
-        self._trace(
-            "session_confirmed", timer_baseline=self._provisional_timer_baseline
-        )
         self._session_confirmed = True
         self._provisional_timer_baseline = None
         self.parent._charger_session_started(confirmed=True)
@@ -723,12 +577,6 @@ class IOSenseBridge:
     ) -> bool:
         """Use authoritative brush values to confirm a provisional pre_run."""
         raw = bytes(payload)
-        self._trace(
-            "provisional_evidence",
-            characteristic=short_uuid,
-            payload=raw.hex(),
-            timer_baseline=self._provisional_timer_baseline,
-        )
         if self._session_confirmed:
             return True
         if short_uuid == "FF04" and raw and raw[0] == RUNNING_STATE:
@@ -750,12 +598,6 @@ class IOSenseBridge:
         """Finish a charger-managed stream once the brush is genuinely quiet."""
         if not self._session_running:
             return
-        self._trace(
-            "session_end",
-            confirmed=self._session_confirmed,
-            brush_status=self.data.get("brush_status"),
-            parent_timer=self.parent.data.get("time"),
-        )
         confirmed = self._session_confirmed
         self._session_running = False
         self._session_confirmed = False
@@ -881,7 +723,6 @@ class IOSenseBridge:
         self._disconnect_task = None
 
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
-        self._trace("transport_disconnected", running=self._session_running)
         self._client = None
         self.data["bridge_connected"] = False
         self.data["state"] = "available" if self.available else "unavailable"
@@ -896,7 +737,6 @@ class IOSenseBridge:
         self.parent._push()
 
     async def _async_disconnect(self) -> None:
-        self._trace("disconnect_requested", running=self._session_running)
         client, self._client = self._client, None
         self.data["bridge_connected"] = False
         self.data["state"] = "available" if self.available else "unavailable"
