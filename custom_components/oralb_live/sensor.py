@@ -555,11 +555,14 @@ class OralBLiveSensor(SensorEntity, RestoreEntity):
             # Restore into the shared coordinator too. This lets a later
             # ff29 read recognize and refine a passively recorded session
             # after an integration reload, instead of counting it twice.
-            if self.coordinator.data.get(self.entity_description.data_key) is None:
+            restored_into_coordinator = (
+                self.coordinator.data.get(self.entity_description.data_key) is None
+            )
+            if restored_into_coordinator:
                 self.coordinator.data[self.entity_description.data_key] = (
                     self._attr_native_value
                 )
-            if self.entity_description.key == "battery":
+            if self.entity_description.key == "battery" and restored_into_coordinator:
                 last_read = last.attributes.get("last_read")
                 self.coordinator.data["battery_updated_at"] = (
                     dt_util.parse_datetime(last_read)

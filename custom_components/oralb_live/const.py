@@ -146,7 +146,13 @@ RELEASE_STATES = {115, 116}
 # running -> summary transitions remain part of the same generation.
 SESSION_SEEN_STATES = {3, 8, 9, 10}
 # Advert states quiet enough to sync in without disturbing anyone.
-SYNC_STATES = {2, 4}
+SYNC_STATES = {2, 4, 9, 10}
+# Cached summary packets must not authorize connections after the brush sleeps.
+SYNC_ADVERTISEMENT_MAX_AGE_SECONDS = 15
+# Bound both individual GATT reads and the entire brief connection.
+SYNC_READ_TIMEOUT_SECONDS = 3
+SYNC_CONNECTION_TIMEOUT_SECONDS = 20
+SYNC_DISCONNECT_TIMEOUT_SECONDS = 3
 # Never attempt syncs more often than this.
 SYNC_MIN_INTERVAL_SECONDS = 60
 # Give the brush time to commit ff29 after returning to a quiet state.
@@ -158,6 +164,9 @@ SYNC_RETRY_ATTEMPTS = 4
 # session, so the authoritative record can refine the fallback without
 # incrementing the daily count twice.
 SESSION_RECONCILE_WINDOW_SECONDS = 2 * 60
+# Bound persisted record identities while retaining roughly a month of twice-
+# daily brushing. Replayed older records must not be counted after a reload.
+SESSION_RECORD_HISTORY_SIZE = 64
 # A motor stop can be a temporary pause while the handle keeps the same brush
 # timer. Keep the logical session provisional long enough for the slower
 # advertisement path to expose a resume, then finalize a genuine stop.
