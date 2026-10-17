@@ -35,8 +35,8 @@ from .charger_protocol import (
     ChargerPacket,
     build_charger_get,
     build_passthrough_read,
-    charger_session_confirmed,
     charger_live_auxiliary,
+    charger_session_confirmed,
     decode_charger_advertisement,
     decode_charger_read,
     normalize_mac,
@@ -47,10 +47,10 @@ from .const import (
     CHARGER_BATTERY_EVERY_TICKS,
     CHARGER_BRIDGE_INTERVAL_SECONDS,
     CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS,
+    CHARGER_BRUSH_STATUS_EVERY_TICKS,
     CHARGER_IDLE_DISCONNECT_SECONDS,
     CHARGER_IDLE_PROBE_INTERVAL_SECONDS,
     CHARGER_POST_SESSION_READS,
-    CHARGER_BRUSH_STATUS_EVERY_TICKS,
     CHARGER_SESSION_SYNC_INTERVAL_SECONDS,
     CHARGER_SNAPSHOT_INTERVAL_SECONDS,
     DATA_SOURCE_CHARGER,
@@ -431,15 +431,16 @@ class IOSenseBridge:
             self._pending_short_uuid = None
             started = loop.time()
             try:
-                await client.write_gatt_char(
-                    IOSENSE_COMMAND_UUID, build_charger_get(command), response=True
-                )
-                await client.write_gatt_char(
-                    IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
-                )
-                packet = await asyncio.wait_for(
-                    future, timeout=CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS
-                )
+                # Bound writes and response together; a stalled write must not
+                # retain the lock and block queued post-session reads.
+                async with asyncio.timeout(CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS):
+                    await client.write_gatt_char(
+                        IOSENSE_COMMAND_UUID, build_charger_get(command), response=True
+                    )
+                    await client.write_gatt_char(
+                        IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
+                    )
+                    packet = await future
                 self.data["last_response_latency_ms"] = round(
                     (loop.time() - started) * 1000, 1
                 )
@@ -462,22 +463,23 @@ class IOSenseBridge:
             self._pending_short_uuid = short_uuid
             started = loop.time()
             try:
-                await client.write_gatt_char(
-                    IOSENSE_COMMAND_UUID,
-                    bytes((0xC1, ChargerCommand.BRUSH_PASSTHROUGH)),
-                    response=True,
-                )
-                await client.write_gatt_char(
-                    IOSENSE_WRITE_UUID,
-                    build_passthrough_read(short_uuid),
-                    response=True,
-                )
-                await client.write_gatt_char(
-                    IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
-                )
-                record = await asyncio.wait_for(
-                    future, timeout=CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS
-                )
+                # Bound writes and response together; a stalled write must not
+                # retain the lock and block queued post-session reads.
+                async with asyncio.timeout(CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS):
+                    await client.write_gatt_char(
+                        IOSENSE_COMMAND_UUID,
+                        bytes((0xC1, ChargerCommand.BRUSH_PASSTHROUGH)),
+                        response=True,
+                    )
+                    await client.write_gatt_char(
+                        IOSENSE_WRITE_UUID,
+                        build_passthrough_read(short_uuid),
+                        response=True,
+                    )
+                    await client.write_gatt_char(
+                        IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
+                    )
+                    record = await future
                 self.data["last_response_latency_ms"] = round(
                     (loop.time() - started) * 1000, 1
                 )
@@ -627,10 +629,7 @@ class IOSenseBridge:
                     # pre_run is also emitted while the handle is only in its
                     # settings/menu flow.  Probe authoritative state/timer
                     # values without exposing pressure or a synthetic session.
-                    if (
-                        tick > 0
-                        and tick % CHARGER_BRUSH_STATUS_EVERY_TICKS == 0
-                    ):
+                    if tick > 0 and tick % CHARGER_BRUSH_STATUS_EVERY_TICKS == 0:
                         await self._async_get(ChargerCommand.BRUSH_STATUS)
                         if not self._session_running:
                             break
