@@ -7,8 +7,10 @@ import re
 
 def validate(tag, title, body):
     errors = []
-    if not re.fullmatch(re.escape(tag) + r" — [A-Z0-9].+", title):
-        errors.append("title must be '<tag> — <Sentence case summary>'")
+    if not re.fullmatch(r"[A-Z0-9].+", title) or title != title.strip():
+        errors.append("title must be a sentence-case summary")
+    if re.search(r"(?<![\w.])v?\d+\.\d+\.\d+(?:[a-z]\d+)?(?![\w.])", title, re.I):
+        errors.append("title must omit release versions; HACS adds the tag itself")
     if "\\n" in body or "\\r" in body:
         errors.append("body contains escaped line breaks; use a UTF-8 notes file")
     headings = []
