@@ -466,6 +466,27 @@ class OralBLiveCoordinator:
         if not payload or len(payload) < 11:
             return
         self._advertisement_available = True
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            observed_at = getattr(service_info, "time", None)
+            age_ms = (
+                round((time.monotonic() - observed_at) * 1000, 1)
+                if isinstance(observed_at, (float, int))
+                else None
+            )
+            _LOGGER.debug(
+                "%s: brush advertisement source=%s rssi=%s age_ms=%s state=%s "
+                "timer=%s:%02d track_session=%s charger_running=%s live=%s",
+                self.name,
+                getattr(service_info, "source", None),
+                service_info.rssi,
+                age_ms,
+                payload[ADV_IDX_STATE],
+                payload[ADV_IDX_TIME_HI],
+                payload[ADV_IDX_TIME_LO],
+                track_session,
+                bool(self.charger and self.charger.session_running),
+                self.data["live"],
+            )
         self.data["rssi"] = service_info.rssi
         self._apply_device_identity(
             payload[ADV_IDX_MODEL],
@@ -883,6 +904,16 @@ class OralBLiveCoordinator:
     ) -> None:
         """Apply a read-only brush value forwarded by the iO Sense."""
         raw = bytes(payload)
+        if short_uuid in {"FF04", "FF08", "FF22", "FF29"}:
+            _LOGGER.debug(
+                "%s: charger apply %s raw=%s session_active=%s confirmed=%s timer=%s",
+                self.name,
+                short_uuid,
+                raw.hex(),
+                self._session_active,
+                self._session_confirmed,
+                self.data.get("time"),
+            )
         self.data["data_source"] = DATA_SOURCE_CHARGER
         if short_uuid == "FF04" and raw:
             self._apply_state(raw[0])
@@ -1587,13 +1618,20 @@ class OralBLiveCoordinator:
         """Serialize identity loading, reconciliation and persistence."""
         generation = (self._session_generation, self._session_face_generation)
         async with self._session_record_lock:
-            return await self._async_reconcile_session_record(
+            result = await self._async_reconcile_session_record(
                 record,
                 rtc,
                 generation,
                 record_sampled_at=record_sampled_at,
                 rtc_sampled_at=rtc_sampled_at,
             )
+            _LOGGER.debug(
+                "%s: retained reconciliation result=%s generation=%s",
+                self.name,
+                result,
+                generation,
+            )
+            return result
 
     @staticmethod
     def _session_record_key(value: Any) -> tuple[int, int, int] | None:
