@@ -29,6 +29,7 @@ the Oral-B cloud.
 - [How it works](#how-it-works)
 - [Connection options](#connection-options)
 - [Comparison with Home Assistant's built-in Oral-B integration](#comparison-with-home-assistants-built-in-oral-b-integration)
+- [Protocol and hardware compatibility](#protocol-and-hardware-compatibility)
 - [Data sources and fallbacks](#data-sources-and-fallbacks)
 - [Entities](#entities)
 - [Installation](#installation)
@@ -110,6 +111,32 @@ reconnects automatically if the brush releases an idle connection. The
 complete direct BLE characteristic and advertisement findings are preserved
 in the [protocol reference](docs/protocol.md#direct-toothbrush-ble).
 
+## Protocol and hardware compatibility
+
+Features depend on the brush's BLE protocol, firmware and available
+characteristics, rather than the marketing series alone. The device information
+shows the reported model, protocol and firmware. Optional readings remain
+`unknown` when the handle does not provide them.
+
+| BLE protocol | Current support and evidence | Retained session (`FF29`) |
+|---|---|---|
+| 6 | Live values, locally reconstructed sessions and `FF05` battery readings; battery/session fixes confirmed on affected protocol-6 hardware, including firmware 107 | Different payload layout; decoding is disabled to protect valid battery and session data |
+| 7 | Supported decoder; v0.7.39 beta testing on an iO Series 5, firmware 36 confirmed off-charger battery refresh, dates/counts and pause/separate-session handling | Registered protocol-7/8 layout |
+| 8 | Supported decoder and detailed local captures on an iO Series 10 with iO Sense | Verified protocol-7/8 layout |
+| 9 | Existing decoder compatibility is retained; this does not establish full hardware validation of every feature | Explicitly registered with the protocol-7/8 decoder |
+| Other or unidentified | Available live/advertisement readings depend on the handle; full compatibility is not established | Unregistered versions are not decoded; missing identity can be retried |
+
+On protocol 6, a zero remaining-runtime field means unavailable rather than zero
+seconds; the valid battery percentage is preserved. Extended battery diagnostics
+also depend on the returned payload and are not guaranteed on every handle.
+
+Display-face support is independent of retained-session decoding. The tested
+protocol-7 iO Series 5 did not expose `FF0A`, so direct reads could not provide a
+face. Advertisement faces can still be used when supplied; missing results
+remain unavailable. See the [v0.7.39 release notes](releases/v0.7.39.md) for the
+hardware feedback and remaining observations, and the
+[protocol reference](docs/protocol.md) for packet layouts and evidence.
+
 ## Comparison with Home Assistant's built-in Oral-B integration
 
 Home Assistant already includes an official **Oral-B** integration. Both
@@ -165,8 +192,14 @@ is docked or otherwise inactive. Oral-B Live keeps the last valid toothbrush
 values available in that situation and marks them as assumed until a fresh
 advertisement, direct connection or charger update arrives.
 
-Completed sessions are saved immediately from the live or passive stream. The
-brush retains one authoritative summary containing exact duration, mode,
+Completed sessions are reconstructed from the live or passive stream. A brief
+motor pause remains provisional for up to 20 seconds: resuming with a continuing
+brush timer keeps one logical session, while a confirmed timer reset starts a
+separate session. Menu-only wakes do not create brushing sessions. Sessions today
+uses the Home Assistant local date and resets at local midnight.
+
+On supported protocols, the brush retains one authoritative summary containing
+exact duration, mode,
 pressure totals, event counts and ending battery. Through the charger it
 becomes readable on the next charger-managed brush connection and refines the
 already-recorded session without counting it twice.
@@ -215,7 +248,9 @@ from high pressure but do not carry a separate active low-pressure state.
 The **Smiley** entity follows the face currently shown by the brush. Passive
 advertisements carry faces `off` through `special_7`; direct FF0A notifications
 and reads, plus iO Sense charger-forwarded FF0A reads, can additionally expose
-newer face values supported by the firmware.
+newer face values supported by the firmware. Its `smiley_raw` and `source`
+attributes distinguish the wire value and transport; the Last session entity
+records `display_face_source` alongside a captured `display_face`.
 
 The entities used by Toothbrush Card deliberately retain the same meanings as
 Home Assistant's built-in Oral-B integration. In particular, the `sector`
@@ -268,7 +303,8 @@ calibration and current model-scope limitation are documented in the
 The **Battery** entity keeps its last valid percentage across Home Assistant
 restarts and exposes `last_read` and `source` attributes. A fresh brush reading
 is preferred; the ending percentage from a newly retained session result is
-used as a local fallback when a current reading is unavailable.
+used as a local fallback when a current reading is unavailable. Percentages
+are reported by the brush; Oral-B Live does not smooth drops or rebounds.
 
 The **Last session** attributes can include:
 
@@ -281,7 +317,8 @@ The **Last session** attributes can include:
 - battery percentage at the end of the session.
 
 Live sessions immediately save the observed mode and a locally sampled
-pressure summary. When the brush later exposes its retained `FF29` result,
+pressure summary. When a registered protocol decoder can interpret the brush's
+retained `FF29` result,
 Oral-B Live replaces those estimates with the brush's exact pressure totals,
 event counts and ending battery without creating a second session. The
 captured display face remains attached to that session because `FF29` does not
@@ -290,7 +327,10 @@ after the session because optional notifications can be missed; the connection
 is retained throughout. Raw `standard` is the lowest result face and is stored
 like every `special_*` verdict; only `off` means that no result was exposed. If
 the handle supplies only `off` or no usable face, `display_face` remains `null`
-rather than inheriting an older session's face.
+rather than inheriting an older session's face. Without a matched charger, a
+quiet post-session connection reads battery first and attempts the transient
+face early, before waiting for the retained record. Capture remains best effort
+when `FF0A` is absent or the connection opportunity is missed.
 
 If Home Assistant first sees a running brush partway through a session, its
 advertised timer is used to estimate the original start. Retained recovery
@@ -542,7 +582,8 @@ kept there rather than duplicated in this user guide.
   request time.
 - The charger can forward brush data only while it is connected to the brush.
   Static diagnostics and retained results are collected opportunistically.
-- The current session's exact retained summary becomes available through the
+- On protocols with a registered decoder, the exact retained summary becomes
+  available through the
   charger on its next brush connection. The immediate session record is built
   locally from the live stream and reconciled later.
 - The brush retains only its latest summary. The charger's richer durable
@@ -550,8 +591,11 @@ kept there rather than duplicated in this user guide.
 - Connecting to the charger uses its BLE peripheral connection. If the phone
   app is changing charger settings at the same moment, one client may need to
   retry; the integration disconnects from an idle charger to minimise this.
-- Protocol support is verified on one iO Series 10/iO Sense pair. Unsupported
-  characteristics remain unknown rather than being guessed.
+- Hardware evidence spans protocols 6, 7 and 8, with different feature coverage;
+  protocol 9 retains decoder compatibility. See the
+  [compatibility table](#protocol-and-hardware-compatibility) before assuming
+  that a feature is available on a particular model. Unsupported characteristics
+  remain unknown rather than being guessed.
 
 ## Troubleshooting
 
@@ -629,9 +673,12 @@ to leave the brush connection with the charger/app.
 
 ### Session details update later
 
-The immediate session is reconstructed locally. Exact pressure totals and
-ending battery come from the retained result on the next managed connection
-and update the same session instead of creating a duplicate.
+The immediate session is reconstructed locally, allowing the pause grace period
+to finish. On protocols with a registered retained-session decoder, exact
+pressure totals and ending battery can refine that record on the next managed
+connection without creating a duplicate. Protocol 6 keeps the locally observed
+summary instead. Recovery may wait for a usable brush clock; fresh battery reads
+do not need to wait for that recovery.
 
 ### Entities remain unavailable
 
