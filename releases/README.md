@@ -22,3 +22,16 @@ CI validates the archive on every push and pull request. The release workflow
 also validates live release titles and bodies on publication and edits. Manual
 runs validate the archived notes. Publication validation runs before uploading
 the integration ZIP.
+
+## HACS publication checks
+
+Keep `custom_components/oralb_live/manifest.json` aligned with the release tag.
+Run the complete pinned test suite and wait for unit tests, HACS and Hassfest
+checks before publishing the tested commit. The release workflow attaches
+`oralb_live.zip` with the integration files at the ZIP root, as configured by
+`hacs.json`; standalone tools are downloaded from repository source instead.
+
+After publication, wait for the Release workflow to finish, download the
+published ZIP, and verify its manifest version and source against the released
+commit. Check that the release is stable/latest when that is intended. Updating
+README or protocol documentation alone does not require another HACS release.

@@ -107,7 +107,8 @@ same time.
 
 A connection acquired while the brush is docked remains active when brushing
 starts, so Home Assistant receives the entire session directly. Oral-B Live
-reconnects automatically if the brush releases an idle connection. The
+reconnects automatically if the brush releases an idle connection. It finishes
+cleaning up the old Bluetooth client before reconnecting. The
 complete direct BLE characteristic and advertisement findings are preserved
 in the [protocol reference](docs/protocol.md#direct-toothbrush-ble).
 
@@ -132,9 +133,14 @@ also depend on the returned payload and are not guaranteed on every handle.
 
 Display-face support is independent of retained-session decoding. The tested
 protocol-7 iO Series 5 did not expose `FF0A`, so direct reads could not provide a
-face. Advertisement faces can still be used when supplied; missing results
-remain unavailable. See the [v0.7.39 release notes](releases/v0.7.39.md) for the
-hardware feedback and remaining observations, and the
+face. Confirmed absence stops further direct FF0A reads for that connection's
+service table; transient failures still get bounded retries. Capability is
+reconsidered after reconnects, service changes or a real FF0A notification.
+Advertisement faces can still be used when supplied; missing results remain
+unavailable. This does not add face support to unsupported hardware. See the
+[v0.7.42 release notes](releases/v0.7.42.md) for optional-read handling,
+[v0.7.39 release notes](releases/v0.7.39.md) for the hardware feedback and
+remaining observations, and the
 [protocol reference](docs/protocol.md) for packet layouts and evidence.
 
 ## Comparison with Home Assistant's built-in Oral-B integration
@@ -330,7 +336,11 @@ the handle supplies only `off` or no usable face, `display_face` remains `null`
 rather than inheriting an older session's face. Without a matched charger, a
 quiet post-session connection reads battery first and attempts the transient
 face early, before waiting for the retained record. Capture remains best effort
-when `FF0A` is absent or the connection opportunity is missed.
+when the connection opportunity is missed or the handle supplies no result.
+Once an FF0A-not-found error is corroborated by a usable service table,
+unnecessary retries stop for that client/table. Reconnects and service changes
+allow a fresh capability check. Battery and retained-session reads continue
+independently.
 
 If Home Assistant first sees a running brush partway through a session, its
 advertised timer is used to estimate the original start. Retained recovery
@@ -397,6 +407,10 @@ Alternatively, install it as a custom repository:
 
 HACS tracks GitHub releases. After a new release is published, open HACS and
 select **Redownload** or install the offered update, then restart Home Assistant.
+The current stable release is [v0.7.42](releases/v0.7.42.md), which includes the
+[bounded charger requests](releases/v0.7.40.md),
+[Bluetooth client cleanup](releases/v0.7.41.md) and
+[optional display-result handling](releases/v0.7.42.md) improvements.
 
 ### Manual
 
@@ -648,8 +662,9 @@ discovery reports, including possible newer charger hardware revisions.
 
 The tool runs independently of Home Assistant and does not use ESPHome or
 Shelly Bluetooth proxies. It never sends POST/SET commands. A scan-only mode is
-available when no connection or GATT write should occur. The standalone script
-is attached to each GitHub release as `iosense_probe.py`. Its separate
+available when no connection or GATT write should occur. Download the standalone
+script from the repository using the commands in the guide below; the HACS
+release asset contains only the integration. Its separate
 `--brush-pacer` mode captures raw FF02 plus initial/final FF25/FF26/FF09 reads,
 and one complete stream of FF04/FF07/FF08/FF09 toothbrush notifications for
 sector-count diagnostics.
@@ -679,6 +694,31 @@ pressure totals and ending battery can refine that record on the next managed
 connection without creating a duplicate. Protocol 6 keeps the locally observed
 summary instead. Recovery may wait for a usable brush clock; fresh battery reads
 do not need to wait for that recovery.
+
+### Smiley or Last session display face is missing
+
+Some handles do not expose `FF0A`; others return `off` or provide no result in
+the available capture window. An unavailable face stays `null` and does not
+inherit a previous session's result. On v0.7.42 or later, confirmed missing
+FF0A stops repeated direct brush reads for that client/service table, in both
+live and quiet post-session capture. Generic read errors and timeouts still
+retry briefly. This behavior does not disable battery or
+retained-session recovery and does not require a model-specific setting.
+
+### Charger reads stall or connections repeatedly drop
+
+Use v0.7.42 or later to include the charger request and Bluetooth cleanup fixes.
+Each charger request has one 1.5-second budget for its writes and response once
+it acquires the shared request lock. A timeout releases the lock so queued
+reads can proceed; it is not a deadline for an entire brushing session or for
+time spent waiting in the queue.
+
+Brush and charger clients are cleaned up even after a remote disconnect, and
+reconnection waits for pending cleanup. These fixes do not establish that every
+missed session or disconnect has the same cause. If problems continue, include
+the installed version, connection mode, adapter/proxy setup and an Oral-B Live
+debug log covering the failure. Detailed temporary beta timing traces are no
+longer emitted; normal debug logs remain available.
 
 ### Entities remain unavailable
 

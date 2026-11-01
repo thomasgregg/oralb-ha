@@ -4,6 +4,13 @@ This working log correlates the physical Oral-B handle display with the raw
 display-face value exposed by Oral-B Live. It supports
 [Toothbrush Card issue #20](https://github.com/mtheli/toothbrush-card/issues/20).
 
+This is a historical hardware-observation log, not the current retry policy.
+The observations below are preserved as captured. See the
+[current FF0A handling](protocol.md#direct-notification-stream) and
+[v0.7.42 release notes](../releases/v0.7.42.md) for confirmed-absence suppression
+and the limits of software-only validation. Changes to retries do not change
+the face mappings or establish support on additional handles.
+
 ## Test device
 
 | Field | Value |

@@ -57,9 +57,9 @@ Two captured behaviours shape direct mode:
   brush is picked up and used. State, timer, pressure, mode and zone
   notifications continue through the session.
 - The brush can disconnect an idle client approximately 30 seconds after
-  activity stops. Oral-B Live reconnects immediately after that callback and
-  also retries every 30 seconds while it has no direct connection. A separate
-  stale-link watchdog rebuilds a connection that remains present but stops
+  activity stops. Oral-B Live schedules reconnection after that callback,
+  waiting for the old client's backend cleanup first, and also retries every
+  30 seconds while it has no direct connection. A separate stale-link watchdog rebuilds a connection that remains present but stops
   delivering activity.
 
 Direct mode deliberately reacquires the brush slot. The charger display and
@@ -68,6 +68,17 @@ released for sleeping and transport states.
 
 No pairing or bonding is required for the normal read/notify characteristics
 used by the integration.
+
+Both the direct brush and charger bridge call `disconnect()` even when the
+radio link is already down. Pending cleanup survives cancellation of its
+caller; reconnect and unload await it. Late or duplicate disconnect callbacks
+from an old client cannot clear a replacement connection. This matters on
+bleak 3.0.2's BlueZ backend, where explicit disconnect closes the private bus;
+the minimum test version, bleak 0.21.1, already closes it during remote cleanup.
+The software tests reproduce missing cleanup calls, not duplicate Oral-B
+notifications on physical Linux hardware. These persistent-client cleanup
+paths have no short outer timeout; temporary battery/history connections keep
+their separate bounded-disconnect policy.
 
 ### Toothbrush vendor service
 
@@ -134,6 +145,19 @@ immediately with a few short retries. The optional notification is not reliable
 on every observed session. These reads retain the existing brush connection;
 the integration does not disconnect to force an advertisement and risk losing
 the brush's single connection slot.
+
+For both direct-live and quiet post-session capture, a specific FF0A-not-found
+error suppresses further reads only when the same connected client's service
+table contains `FF04` state and `FF05` battery but no `FF0A`. A table alone or
+a generic read error does not establish absence. Timeouts, empty/off values,
+lazy/incomplete discovery and failed lookup APIs retain bounded retries.
+Negative evidence is scoped to the client/table and revalidated on use;
+reconnects, changed tables (including in-place addition of FF0A), and actual
+FF0A notifications invalidate it. A table changed during an outstanding read
+cannot inherit that old read's negative evidence. Initial FF0A reads share this
+handling with post-session capture. This does not blacklist models/protocols,
+change battery or FF29 recovery, or apply direct GATT capability assumptions to
+charger passthrough responses.
 
 `FF02` and the corresponding advertisement bytes identify the protocol model,
 not necessarily the marketing model printed on the brush. In the reconstructed
@@ -463,6 +487,17 @@ The returned value is:
 The tested firmware rejects a request containing several records but accepts
 the same records as sequential commands. The implementation therefore sends
 exactly one outstanding request and matches each response by short UUID.
+
+Each production native GET or brush passthrough transaction has one 1.5-second
+deadline after acquiring the shared request lock. The deadline covers every
+Bluetooth write and the response wait together. A timeout or cancellation
+clears the pending response state and releases the lock, allowing queued
+post-session reads to continue. Time waiting to acquire the lock is outside
+that transaction budget. Cancellation cannot retract commands already sent,
+and identical late responses remain indistinguishable because the protocol
+has no transaction IDs. Standard failure/latency diagnostics remain available;
+the temporary detailed timing and raw-payload traces from v0.7.40 betas were
+removed in the stable release.
 
 Passthrough succeeds only while the charger is connected to the brush. It does
 not force the charger to establish that private connection.

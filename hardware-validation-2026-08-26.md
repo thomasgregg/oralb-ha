@@ -1,5 +1,12 @@
 # Oral-B Live hardware validation — 2026-08-26
 
+This dated log preserves the software versions, observations and issue status
+at the time of testing. It is not a current support or open-issue list. See the
+[README](README.md), [protocol reference](docs/protocol.md) and
+[latest release](https://github.com/thomasgregg/oralb-ha/releases/latest) for
+current behavior; later software fixes have not retroactively changed these
+hardware results.
+
 ## Test environment
 
 - Oral-B Live: `v0.7.34b5`

@@ -61,8 +61,9 @@ Home Assistant, HACS or an Oral-B account.
 ### Installation
 
 The easiest method does not require cloning the repository. Download the
-standalone `iosense_probe.py` attached to the latest GitHub release into a
-dedicated directory.
+standalone `iosense_probe.py` from the repository into a dedicated directory.
+The latest HACS release provides `oralb_live.zip`; the probe is not a separate
+asset on that release. The commands below fetch the current source script.
 
 macOS or Linux:
 
@@ -70,7 +71,7 @@ macOS or Linux:
 mkdir -p "$HOME/iosense-diagnostic"
 cd "$HOME/iosense-diagnostic"
 curl --fail --location --output iosense_probe.py \
-  https://github.com/thomasgregg/oralb-ha/releases/latest/download/iosense_probe.py
+  https://raw.githubusercontent.com/thomasgregg/oralb-ha/main/tools/iosense_probe.py
 ```
 
 On macOS, create the environment with Python 3.12 specifically:
@@ -100,7 +101,7 @@ $ProbeDirectory = Join-Path $HOME "iosense-diagnostic"
 New-Item -ItemType Directory -Force $ProbeDirectory | Out-Null
 Set-Location $ProbeDirectory
 Invoke-WebRequest `
-  -Uri "https://github.com/thomasgregg/oralb-ha/releases/latest/download/iosense_probe.py" `
+  -Uri "https://raw.githubusercontent.com/thomasgregg/oralb-ha/main/tools/iosense_probe.py" `
   -OutFile "iosense_probe.py"
 py -3.12 -m venv .venv-iosense
 .venv-iosense\Scripts\python.exe -m pip install --upgrade pip bleak
@@ -125,7 +126,7 @@ still in the home directory, running `tools/iosense_probe.py` would produce a
 | Error | Cause and correction |
 | --- | --- |
 | `Failed building wheel for pyobjc-core` on macOS, or a package reports that it requires a newer Python | The environment was created with an unsupported Python version. Recreate it with Python 3.12 on macOS or Python 3.10 or newer on Windows/Linux. |
-| `can't open file .../tools/iosense_probe.py` | A source-checkout command was run outside the cloned repository. Change to the `oralb-ha` directory, or use the recommended release download and run `iosense_probe.py` directly. |
+| `can't open file .../tools/iosense_probe.py` | A source-checkout command was run outside the cloned repository. Change to the `oralb-ha` directory, or use the recommended standalone source download and run `iosense_probe.py` directly. |
 | `No module named bleak` | Bleak was installed into a different Python. Run `.venv-iosense/bin/python -m pip install bleak` and invoke the probe with that same Python path. |
 | Bluetooth permission or authorization error on macOS | Enable Bluetooth access for Terminal, iTerm or the application hosting the shell in System Settings, then reopen it. |
 
@@ -266,7 +267,7 @@ on scanner mode, proxy reachability and Home Assistant Bluetooth diagnostics.
 
 ## Toothbrush pacer capture
 
-The same release tool has a `--brush-pacer` mode for cases where the handle's
+The same standalone tool has a `--brush-pacer` mode for cases where the handle's
 reported sector count disagrees with its physical pacing. It captures the
 evidence needed for [issue #20](https://github.com/thomasgregg/oralb-ha/issues/20)
 in one run:
@@ -290,13 +291,13 @@ the tool removes every successful subscription before disconnecting.
 ### Download and run it
 
 The reporter does not need a repository checkout. These macOS/Linux commands
-download the current standalone release and run the complete capture:
+download the current standalone source script and run the complete capture:
 
 ```bash
 mkdir -p "$HOME/oralb-pacer-test"
 cd "$HOME/oralb-pacer-test"
 curl --fail --location --output iosense_probe.py \
-  https://github.com/thomasgregg/oralb-ha/releases/latest/download/iosense_probe.py
+  https://raw.githubusercontent.com/thomasgregg/oralb-ha/main/tools/iosense_probe.py
 python3.12 -m venv .venv-iosense
 .venv-iosense/bin/python -m pip install --upgrade pip bleak
 .venv-iosense/bin/python iosense_probe.py \
@@ -311,7 +312,7 @@ $TestDirectory = Join-Path $HOME "oralb-pacer-test"
 New-Item -ItemType Directory -Force $TestDirectory | Out-Null
 Set-Location $TestDirectory
 Invoke-WebRequest `
-  -Uri "https://github.com/thomasgregg/oralb-ha/releases/latest/download/iosense_probe.py" `
+  -Uri "https://raw.githubusercontent.com/thomasgregg/oralb-ha/main/tools/iosense_probe.py" `
   -OutFile "iosense_probe.py"
 py -3.12 -m venv .venv-iosense
 .venv-iosense\Scripts\python.exe -m pip install --upgrade pip bleak
