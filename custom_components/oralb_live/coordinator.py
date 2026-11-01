@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak_retry_connector import (
@@ -310,6 +311,9 @@ class OralBLiveCoordinator:
         self._last_smiley_sample_generation: int | None = None
         self._last_smiley_sample_source: str | None = None
         self._session_face_read_task: asyncio.Task | None = None
+        # Negative FF0A evidence belongs to one client/service discovery, not
+        # a model or protocol. Weak keys do not retain discarded BLE clients.
+        self._missing_smiley_services: WeakKeyDictionary = WeakKeyDictionary()
         # Keep session-edge tracking separate from the displayed last-known
         # state.  A cached advertisement may seed the latter after restart,
         # but must not consume the next genuine state transition.
@@ -688,6 +692,7 @@ class OralBLiveCoordinator:
             disconnected_callback=disconnected_callback,
             max_attempts=max_attempts,
         )
+        self._missing_smiley_services.pop(client, None)
         handed_off = False
         try:
             if self._core_gatt_service_is_present(client):
@@ -714,6 +719,7 @@ class OralBLiveCoordinator:
                 max_attempts=max_attempts,
                 use_services_cache=False,
             )
+            self._missing_smiley_services.pop(client, None)
             if self._core_gatt_service_is_present(client):
                 handed_off = True
                 return client
@@ -872,6 +878,9 @@ class OralBLiveCoordinator:
             if self._apply_battery_status(payload, DATA_SOURCE_DIRECT):
                 self._mark_maintenance_sync_success()
         elif uuid == CHAR_SMILEY:
+            # A real notification contradicts earlier missing-table evidence.
+            if self._client is not None:
+                self._missing_smiley_services.pop(self._client, None)
             self._apply_smiley(payload, source=DATA_SOURCE_DIRECT)
         self._push()
 
@@ -1570,6 +1579,7 @@ class OralBLiveCoordinator:
             if (
                 capture_generation is None
                 or self._pending_session_face_generation != capture_generation
+                or self._smiley_is_unavailable(client)
             ):
                 return any_value_read
         return any_value_read
@@ -1590,16 +1600,68 @@ class OralBLiveCoordinator:
             _LOGGER.debug("%s: %s read timed out", self.name, label)
             return None
 
+    @staticmethod
+    def _absent_smiley_services(client: BleakClientWithServiceCache) -> Any:
+        """Return a usable table that specifically lacks optional FF0A.
+
+        A lazy/failed discovery or an all-missing table cannot establish an
+        optional capability. Require both mandatory state and battery entries.
+        This alone is not enough to suppress reads: a matching not-found
+        error from that same table must corroborate the absence first.
+        """
+        try:
+            services = client.services
+            lookup = getattr(services, "get_characteristic", None)
+            if (
+                client.is_connected
+                and callable(lookup)
+                and lookup(CHAR_STATE) is not None
+                and lookup(CHAR_STATUS_BLOB) is not None
+                and lookup(CHAR_SMILEY) is None
+            ):
+                return services
+        except (AttributeError, BleakError, RuntimeError):
+            pass
+        return None
+
+    def _smiley_is_unavailable(self, client: BleakClientWithServiceCache) -> bool:
+        """Revalidate negative evidence, including in-place table changes."""
+        services = self._absent_smiley_services(client)
+        if services is not None and self._missing_smiley_services.get(client) is services:
+            return True
+        self._missing_smiley_services.pop(client, None)
+        return False
+
     async def _async_sync_read(
         self,
         client: BleakClientWithServiceCache,
         char_uuid: str,
         label: str,
     ) -> bytearray | None:
-        """Read one characteristic without suppressing later reads."""
+        """Read one characteristic, isolating confirmed optional FF0A absence."""
+        absent_services = None
+        if char_uuid == CHAR_SMILEY:
+            if self._smiley_is_unavailable(client):
+                return None
+            absent_services = self._absent_smiley_services(client)
         try:
-            return await client.read_gatt_char(char_uuid)
+            value = await client.read_gatt_char(char_uuid)
+            if char_uuid == CHAR_SMILEY:
+                self._missing_smiley_services.pop(client, None)
+            return value
         except (BleakError, TimeoutError) as err:
+            # Bleak 0.21 uses BleakError; newer versions use its dedicated
+            # characteristic-not-found subclass with this same message. Do
+            # not classify arbitrary errors containing "not found" as absence.
+            if (
+                char_uuid == CHAR_SMILEY
+                and isinstance(err, BleakError)
+                and str(err).rstrip("!.").casefold()
+                == f"Characteristic {CHAR_SMILEY} was not found".casefold()
+                and absent_services is not None
+                and self._absent_smiley_services(client) is absent_services
+            ):
+                self._missing_smiley_services[client] = absent_services
             _LOGGER.debug("%s: %s read failed: %s", self.name, label, err)
             return None
 
@@ -2156,7 +2218,10 @@ class OralBLiveCoordinator:
                     return
                 self._apply_smiley(smiley, source=DATA_SOURCE_DIRECT)
                 self._push()
-                if self._pending_session_face_generation != generation:
+                if (
+                    self._pending_session_face_generation != generation
+                    or self._smiley_is_unavailable(client)
+                ):
                     return
         except asyncio.CancelledError:
             pass

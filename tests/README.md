@@ -96,3 +96,35 @@ with the reporter confirming no duplicates after v0.32.1. The brush and charger
 cleanup tasks likewise have no short outer timeout and survive cancellation
 of their callers; reconnect and unload await them. Temporary history/battery
 connections retain their existing separate deadline policy.
+
+## Issue 45: unavailable FF0A capability contracts
+
+`test_ff0a_capability.py` started with 26 cases, including three failing
+reproductions. All 47 cases now pass without skips or expected-failure markers.
+The same focused suite passes in the local Home Assistant 2026.8.3 / bleak
+3.0.2 / Python 3.14 environment. The shared Bluetooth advertisement fixture
+accepts both the minimum and newer BLEDevice/service-info constructor forms.
+
+```bash
+.venv-test/bin/python -m pytest tests/test_ff0a_capability.py -q
+```
+
+A matching FF0A-not-found error must be corroborated by the same service table
+containing state and battery but not FF0A before further reads are suppressed.
+Negative evidence belongs to that client/table only. Generic errors, timeouts,
+empty/off results and uncertain discovery preserve the bounded retry budget.
+A rebuilt connection/table, in-place addition of FF0A, or an actual FF0A
+notification invalidates previous absence evidence. Discarded clients are not
+retained by the capability cache.
+
+Coverage includes both capture paths, repeated capture on the same live
+client, initial-read suppression, misleading error text, lazy/incomplete/
+erroring/missing lookup APIs, service changes during an outstanding read,
+reused and replacement client objects, no inheritance of a previous face,
+delayed old-session reads, independent battery publication, and later
+retained-record recovery. Tests use the production tracker and retry delays
+with a virtual clock, simulated transport, and bleak's service-lookup container.
+
+These tests cover software decisions, not firmware capability validation or
+physical service-discovery reliability. Hardware observations remain necessary
+to establish support on a particular handle/firmware.
