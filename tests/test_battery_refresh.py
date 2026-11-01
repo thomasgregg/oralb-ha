@@ -137,14 +137,24 @@ def _service_info(
          0, 1 | (face << 3), 0, 4]
     )
     manufacturer_data = {const.ORALB_MANUFACTURER_ID: payload}
-    device = BLEDevice(ADDRESS, "brush", {}, -60)
+    try:
+        device = BLEDevice(ADDRESS, "brush", {})
+    except TypeError:
+        # The minimum supported bleak requires RSSI on BLEDevice; modern
+        # bleak carries it only on AdvertisementData.
+        device = BLEDevice(ADDRESS, "brush", {}, -60)
     advertisement = AdvertisementData(
         "brush", manufacturer_data, {}, [], None, -60, ()
     )
-    return BluetoothServiceInfoBleak(
+    args = (
         "brush", ADDRESS, -60, manufacturer_data, {}, [], "test_proxy",
         device, advertisement, connectable, observed_at,
     )
+    try:
+        return BluetoothServiceInfoBleak(*args, tx_power=None)
+    except TypeError:
+        # Older habluetooth predates the required tx_power field.
+        return BluetoothServiceInfoBleak(*args)
 
 
 def _record(*, timestamp: int = 1000, duration: int = 120, battery: int = 94) -> bytes:
