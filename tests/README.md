@@ -17,6 +17,22 @@ CI runs the complete suite once against the minimum supported Home Assistant
 and Python versions. This keeps the compatibility guarantee without duplicating
 the same test run against a second dependency environment on every change.
 
+As of v0.7.42, the complete pinned suite has 488 passing cases. In addition,
+the 47 FF0A capability cases pass with Home Assistant 2026.8.3, bleak 3.0.2
+and Python 3.14. That focused run does not claim full-suite validation against
+every newer Home Assistant release.
+
+## Charger transaction deadlines
+
+`test_charger_request_deadlines.py` covers the v0.7.40 fix with 19 cases,
+including stalled writes, a shared write/response budget, queued post-session
+reads, cancellation, response cleanup and late unrelated responses. The
+1.5-second transaction budget starts after acquiring the shared request lock.
+
+```bash
+.venv-test/bin/python -m pytest tests/test_charger_request_deadlines.py -q
+```
+
 ## Issue 39: battery refresh regression coverage
 
 `test_battery_refresh.py` was added before the production fix, with 21 failing
