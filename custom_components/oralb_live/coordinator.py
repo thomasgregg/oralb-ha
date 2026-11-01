@@ -35,6 +35,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .charger import IOSenseBridge
+from .client_cleanup import ClientCleanup
 from .const import (
     ADV_IDX_FIRMWARE,
     ADV_IDX_MODE,
@@ -254,6 +255,7 @@ class OralBLiveCoordinator:
         self._advertisement_available = False
         self._direct_available = False
         self._client: BleakClientWithServiceCache | None = None
+        self._client_cleanup = ClientCleanup(self.hass)
         self._connect_lock = asyncio.Lock()
         self._connect_task: asyncio.Task | None = None
         self._disconnect_task: asyncio.Task | None = None
@@ -415,6 +417,8 @@ class OralBLiveCoordinator:
         # is being reloaded during its pause grace period.
         self._finalize_pending_session()
         for task in (
+            self._connect_task,
+            self._disconnect_task,
             self._reconnect_task,
             self._sync_task,
             self._charger_tick_task,
@@ -439,6 +443,8 @@ class OralBLiveCoordinator:
             self._unsub_midnight = None
         if self.charger:
             await self.charger.async_stop()
+        if self._connect_task:
+            await asyncio.gather(self._connect_task, return_exceptions=True)
         await self._async_disconnect()
         if sync_task and sync_task is not asyncio.current_task():
             # The brief client is local to its task. Wait for its bounded
@@ -729,6 +735,8 @@ class OralBLiveCoordinator:
             _LOGGER.debug("%s: temporary disconnect failed: %s", self.name, err)
 
     def _schedule_connect(self) -> None:
+        if self._stopping:
+            return
         if self._client and self._client.is_connected:
             return
         if self._connect_task and not self._connect_task.done():
@@ -737,7 +745,15 @@ class OralBLiveCoordinator:
 
     async def _async_connect(self) -> None:
         async with self._connect_lock:
+            if self._stopping:
+                return
             if self._client and self._client.is_connected:
+                return
+            if self._client is not None:
+                stale, self._client = self._client, None
+                self._client_cleanup.start(stale)
+            await self._client_cleanup.wait()
+            if self._stopping:
                 return
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, self.address, connectable=True
@@ -759,14 +775,25 @@ class OralBLiveCoordinator:
                     err,
                 )
                 return
+            if self._stopping or not client.is_connected:
+                self._client_cleanup.start(client)
+                await self._client_cleanup.wait()
+                return
             self._client = client
             self._last_activity = time.monotonic()
             try:
                 await self._async_subscribe(client)
                 await self._async_initial_reads(client)
+            except asyncio.CancelledError:
+                await self._async_disconnect()
+                raise
             except (BleakError, TimeoutError) as err:
                 _LOGGER.debug("%s: setup after connect failed: %s", self.name, err)
                 await self._async_disconnect()
+                return
+            if self._stopping or self._client is not client or not client.is_connected:
+                if self._client is client:
+                    await self._async_disconnect()
                 return
             self._direct_available = True
             self.data["live"] = True
@@ -3066,33 +3093,36 @@ class OralBLiveCoordinator:
 
         self._disconnect_task = self.hass.async_create_task(_release())
 
-    def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
+    def _on_disconnect(self, client: BleakClientWithServiceCache) -> None:
+        self.hass.loop.call_soon_threadsafe(self._handle_client_disconnect, client)
+
+    @callback
+    def _handle_client_disconnect(self, client: BleakClientWithServiceCache) -> None:
+        if client is not self._client:
+            return
+        self._client_cleanup.start(client)
+        self._client = None
         self._cancel_session_display_face_read()
         self._direct_available = False
         self.data["live"] = False
-        self._client = None
         if self._stopping:
             return
-        self.hass.loop.call_soon_threadsafe(self._push)
+        self._push()
         if (
             self.mode == CONNECTION_MODE_LIVE
             and self.data.get("state_raw") not in RELEASE_STATES
         ):
-            # The brush drops idle clients after ~30 s. Reconnect
-            # straight away (instead of waiting for the loop) so a
-            # session never starts while the slot sits free.
-            self.hass.loop.call_soon_threadsafe(self._schedule_connect)
+            # _async_connect waits for this client's backend cleanup first.
+            self._schedule_connect()
 
     async def _async_disconnect(self) -> None:
         self._cancel_session_display_face_read()
         client, self._client = self._client, None
         self._direct_available = False
         self.data["live"] = False
-        if client and client.is_connected:
-            try:
-                await client.disconnect()
-            except (BleakError, TimeoutError):
-                pass
+        if client is not None:
+            self._client_cleanup.start(client)
+        await self._client_cleanup.wait()
         self._push()
 
     # --------------------------------------------------------------- update
