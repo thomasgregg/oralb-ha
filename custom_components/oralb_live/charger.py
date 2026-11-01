@@ -42,6 +42,7 @@ from .charger_protocol import (
     normalize_mac,
     resolve_charger_session_running,
 )
+from .client_cleanup import ClientCleanup
 from .const import (
     CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS,
     CHARGER_BATTERY_EVERY_TICKS,
@@ -142,6 +143,7 @@ class IOSenseBridge:
         self._connect_task: asyncio.Task | None = None
         self._live_task: asyncio.Task | None = None
         self._disconnect_task: asyncio.Task | None = None
+        self._client_cleanup = ClientCleanup(self.hass)
         self._connect_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
         self._pending_future: asyncio.Future | None = None
@@ -185,6 +187,8 @@ class IOSenseBridge:
         for task in (self._connect_task, self._live_task, self._disconnect_task):
             if task:
                 task.cancel()
+        if self._connect_task:
+            await asyncio.gather(self._connect_task, return_exceptions=True)
         await self._async_disconnect()
 
     @callback
@@ -277,6 +281,12 @@ class IOSenseBridge:
                 if self.address == address:
                     self._ensure_live_task()
                 return
+            if self._client is not None:
+                stale, self._client = self._client, None
+                self._client_cleanup.start(stale)
+            await self._client_cleanup.wait()
+            if self._stopping:
+                return
             self._last_probe_monotonic = time.monotonic()
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, address, connectable=True
@@ -298,12 +308,22 @@ class IOSenseBridge:
                 self._candidate_addresses.discard(address)
                 return
 
+            if self._stopping or not client.is_connected:
+                self._candidate_addresses.discard(address)
+                self._client_cleanup.start(client)
+                await self._client_cleanup.wait()
+                return
             self._client = client
             self.data["bridge_connected"] = True
             self.data["state"] = "connected"
             try:
                 await client.start_notify(IOSENSE_READ_UUID, self._on_read)
                 await client.start_notify(IOSENSE_STATUS_UUID, self._on_status)
+                if self._stopping or self._client is not client or not client.is_connected:
+                    self._candidate_addresses.discard(address)
+                    if self._client is client:
+                        await self._async_disconnect()
+                    return
                 if self.address is None:
                     identity = await self._async_get(ChargerCommand.BRUSH_DATA)
                     identity_value = (
@@ -373,6 +393,11 @@ class IOSenseBridge:
                     if self.data.get("brush_connected"):
                         await self._async_post_session_sync()
                     await self._async_disconnect()
+            except asyncio.CancelledError:
+                if self.address is None:
+                    self._candidate_addresses.discard(address)
+                await self._async_disconnect()
+                raise
             except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
                 _LOGGER.debug("iO Sense setup/read failed: %s", err)
                 if self.address is None:
@@ -722,11 +747,18 @@ class IOSenseBridge:
             self._disconnect_task.cancel()
         self._disconnect_task = None
 
-    def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
+    def _on_disconnect(self, client: BleakClientWithServiceCache) -> None:
+        self.hass.loop.call_soon_threadsafe(self._handle_client_disconnect, client)
+
+    @callback
+    def _handle_client_disconnect(self, client: BleakClientWithServiceCache) -> None:
+        if client is not self._client:
+            return
+        self._client_cleanup.start(client)
         self._client = None
         self.data["bridge_connected"] = False
         self.data["state"] = "available" if self.available else "unavailable"
-        self.hass.loop.call_soon_threadsafe(self._handle_transport_disconnect)
+        self._handle_transport_disconnect()
 
     @callback
     def _handle_transport_disconnect(self) -> None:
@@ -740,11 +772,10 @@ class IOSenseBridge:
         client, self._client = self._client, None
         self.data["bridge_connected"] = False
         self.data["state"] = "available" if self.available else "unavailable"
-        if client and client.is_connected:
-            try:
-                await client.disconnect()
-            except (BleakError, TimeoutError):
-                pass
+        self._handle_transport_disconnect()
+        if client is not None:
+            self._client_cleanup.start(client)
+        await self._client_cleanup.wait()
 
     def _push(self) -> None:
         async_dispatcher_send(

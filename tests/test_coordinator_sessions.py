@@ -1300,6 +1300,7 @@ class ConnectedSessionDisplayFaceReadTests(unittest.IsolatedAsyncioTestCase):
             return task
 
         hass.async_create_background_task.side_effect = _create_background_task
+        hass.async_create_task.side_effect = asyncio.create_task
         c = coordinator.OralBLiveCoordinator(
             hass,
             "AA:BB:CC:DD:EE:FF",

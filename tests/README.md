@@ -61,3 +61,38 @@ whether all firmware provides FF05 in its summary window. Hardware validation
 remains required. Broader FF29 identity, RTC and asynchronous generation races
 are separate session-recovery work; the battery fix must not bring record
 application forward merely to make a battery test pass.
+
+## Issue 49: disconnected client cleanup
+
+`test_disconnect_cleanup.py` began with eight cases for brush and iO Sense
+charger lifecycles: six failed before the production fix and the two
+connected-client controls passed. All 37 cases now pass, without skips or
+expected-failure markers.
+
+```bash
+.venv-test/bin/python -m pytest tests/test_disconnect_cleanup.py -q
+```
+
+Coverage includes explicit cleanup after remote loss, remote-disconnect
+callbacks, stale-client replacement, waiting for in-flight cleanup before
+reconnect, late and duplicate callbacks, repeated remote losses, callback
+handoff from another thread, intentional disconnect without reconnect,
+cancellation during cleanup or connection setup, unload while cleanup is
+pending, cleanup errors, connections returned after remote loss or shutdown,
+eager Home Assistant task creation, and charger session ownership cleanup.
+
+The fake client keeps connectivity separate from resource ownership and only
+releases resources when `disconnect()` is awaited. This verifies explicit
+cleanup calls, not actual BlueZ notification duplication on physical hardware.
+The minimum environment pins bleak 0.21.1, whose BlueZ `_cleanup_all()` already
+closes the bus on remote loss. Bleak 3.0.2 instead leaves bus closure to
+`disconnect()`, matching the fake's lifecycle. The manifest has no bleak pin,
+so Home Assistant's installed version matters.
+
+The linked [Sonicare fix](https://github.com/mtheli/philips_sonicare_ble/commit/76e32f1)
+uses the same three cleanup paths and removes an outer five-second timeout
+that could cancel cleanup before bleak closes its bus. Sonicare issue #45 ends
+with the reporter confirming no duplicates after v0.32.1. The brush and charger
+cleanup tasks likewise have no short outer timeout and survive cancellation
+of their callers; reconnect and unload await them. Temporary history/battery
+connections retain their existing separate deadline policy.
