@@ -376,7 +376,7 @@ class OralBLiveCoordinator:
             self._unsub_bluetooth = bluetooth.async_register_callback(
                 self.hass,
                 self._async_advertisement,
-                BluetoothCallbackMatcher(address=self.address),
+                BluetoothCallbackMatcher(address=self.address, connectable=False),
                 BluetoothScanningMode.PASSIVE,
             )
         finally:
@@ -482,58 +482,44 @@ class OralBLiveCoordinator:
             payload[ADV_IDX_PROTOCOL],
             payload[ADV_IDX_FIRMWARE],
         )
-        # While the charger bridge owns the brush connection, its forwarded
-        # values are authoritative. A delayed brush advertisement can otherwise
-        # replace logical running with selection_menu/idle mid-session.
-        if self.charger and (self.charger.session_running or self.data["live"]):
+        # A delayed advertisement can report a stale state while the direct
+        # connection or charger bridge is supplying live brushing data.
+        if self.data["live"] or (self.charger and self.charger.session_running):
             self._push()
             return
         state_raw = payload[ADV_IDX_STATE]
-        # While live notifications flow, they are fresher than adverts.
-        adv_live = self.data["live"]
-        if not adv_live:
-            self.data["data_source"] = DATA_SOURCE_ADVERTISEMENT
-            self.data["time"] = _decode_time(
-                payload[ADV_IDX_TIME_HI], payload[ADV_IDX_TIME_LO]
-            )
-            # The advertisement that first reports a quiet state still carries
-            # the timer of the session that just ended, and it is the highest
-            # value the brush ever shows for it. Sampled after _apply_state it
-            # is dropped, because the session is closed by then and
-            # _track_session_time only accepts values while one is active - so
-            # the recorded duration would stay at the last value seen while the
-            # brush was still advertising as running, up to a full advertising
-            # interval short of what the brush displayed.
-            self._track_session_time(self.data["time"], confirm_session=track_session)
+        self.data["data_source"] = DATA_SOURCE_ADVERTISEMENT
+        self.data["time"] = _decode_time(
+            payload[ADV_IDX_TIME_HI], payload[ADV_IDX_TIME_LO]
+        )
+        # Capture the final timer from a quiet advertisement before the state
+        # transition ends the session.
+        self._track_session_time(self.data["time"], confirm_session=track_session)
         self._apply_state(
             state_raw,
             track_session=track_session,
-            session_seconds=self.data["time"] if not adv_live else None,
+            session_seconds=self.data["time"],
         )
-        if not adv_live:
-            self._apply_advertisement_pressure(
-                payload[ADV_IDX_PRESSURE], current=track_session
-            )
-            # The other side of the same transition: a session that begins with
-            # this advertisement was not active when the sample above was
-            # offered, so its first value needs the second chance. Repeating it
-            # is safe - the tracker keeps a maximum, and the timer evidence it
-            # collects only ever counts a value that moved forward.
-            self._track_session_time(self.data["time"], confirm_session=track_session)
-            self._apply_mode(payload[ADV_IDX_MODE])
-            self._apply_smiley(
-                bytes((decode_display_face(payload[ADV_IDX_SECTOR]),)),
-                source=DATA_SOURCE_ADVERTISEMENT,
-            )
-            self._apply_sector(
-                payload[ADV_IDX_SECTOR],
-                (
-                    payload[ADV_IDX_TOTAL_SECTORS]
-                    if self.data["number_of_sectors"] is None
-                    else None
-                ),
-                payload[ADV_IDX_SECTOR_TIMER],
-            )
+        self._apply_advertisement_pressure(
+            payload[ADV_IDX_PRESSURE], current=track_session
+        )
+        # The state transition may also open a session. Offer it the first
+        # timer sample again so the tracker can keep it.
+        self._track_session_time(self.data["time"], confirm_session=track_session)
+        self._apply_mode(payload[ADV_IDX_MODE])
+        self._apply_smiley(
+            bytes((decode_display_face(payload[ADV_IDX_SECTOR]),)),
+            source=DATA_SOURCE_ADVERTISEMENT,
+        )
+        self._apply_sector(
+            payload[ADV_IDX_SECTOR],
+            (
+                payload[ADV_IDX_TOTAL_SECTORS]
+                if self.data["number_of_sectors"] is None
+                else None
+            ),
+            payload[ADV_IDX_SECTOR_TIMER],
+        )
         self._push()
 
         if self._stopping or not track_session:

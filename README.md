@@ -407,10 +407,8 @@ Alternatively, install it as a custom repository:
 
 HACS tracks GitHub releases. After a new release is published, open HACS and
 select **Redownload** or install the offered update, then restart Home Assistant.
-The current stable release is [v0.7.42](releases/v0.7.42.md), which includes the
-[bounded charger requests](releases/v0.7.40.md),
-[Bluetooth client cleanup](releases/v0.7.41.md) and
-[optional display-result handling](releases/v0.7.42.md) improvements.
+The current stable release is [v0.7.43](releases/v0.7.43.md), which restores
+live brush updates when the brush is heard only by a passive Bluetooth scanner.
 
 ### Manual
 
