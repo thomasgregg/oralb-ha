@@ -17,10 +17,19 @@ CI runs the complete suite once against the minimum supported Home Assistant
 and Python versions. This keeps the compatibility guarantee without duplicating
 the same test run against a second dependency environment on every change.
 
-As of v0.7.42, the complete pinned suite has 488 passing cases. In addition,
-the 47 FF0A capability cases pass with Home Assistant 2026.8.3, bleak 3.0.2
-and Python 3.14. That focused run does not claim full-suite validation against
-every newer Home Assistant release.
+For v0.7.43, all 509 cases pass on Home Assistant 2024.4.4 and 2026.8.3.
+
+## Issue 53: passive Bluetooth scanner updates
+
+Run the 21 regression cases with:
+
+```bash
+.venv-test/bin/python -m pytest tests/test_advertisement_callbacks.py -q
+```
+
+The tests feed advertisements through Home Assistant's Bluetooth manager.
+They cover cached setup, passive and mixed scanner sources, session tracking,
+live GATT priority, and charger reachability. Bluetooth transport is simulated.
 
 ## Charger transaction deadlines
 

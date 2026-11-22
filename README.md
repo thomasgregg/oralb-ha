@@ -1,6 +1,9 @@
 # Oral-B Live
 
-[![HACS][hacs-badge]][hacs-url]
+<!-- ha-marketplace:exclude-start -->
+[![Open Oral-B Live in Home Assistant Marketplace][marketplace-badge]][marketplace-url]
+<!-- ha-marketplace:exclude-end -->
+
 [![Release][release-badge]][release-url]
 
 **Local live brushing data for Oral-B iO toothbrushes and iO Sense chargers in Home Assistant.**
@@ -92,9 +95,10 @@ are regularly corrected by fresh values from the brush. Battery and other
 slower-changing diagnostics refresh when the charger can provide them without
 interrupting the live session.
 
-If no matching charger is available, the same option falls back automatically
-to passive brush advertisements and guarded post-session reads. There is no
-additional user setting to manage.
+When live charger data is unavailable, Oral-B Live can fall back to brush
+advertisements from any scanner that hears the brush. If no charger has been
+matched and a connection-capable scanner can reach a recently quiet brush,
+Oral-B Live can also make brief post-session reads.
 
 ### Home Assistant direct
 
@@ -157,7 +161,7 @@ different needs:
 
 | What matters to you | Home Assistant Oral-B | Oral-B Live |
 | --- | --- | --- |
-| Installation | Included with Home Assistant | Installed through HACS |
+| Installation | Included with Home Assistant | Home Assistant Marketplace or manual installation |
 | Live brushing | Time, pressure, timed pacer sector, mode and state when broadcast by the brush | The same card-compatible values through the charger or a direct brush connection |
 | Toothbrush Card mouth graphic | Displays the brush's sequential timed sector | Displays the same sequential timed sector; physical-position protocol research is documented separately and is not exposed as an entity |
 | Completed-session summary | Not provided | Last session, duration and sessions today, retained across Home Assistant restarts |
@@ -191,7 +195,11 @@ The state entity exposes the active `data_source` so the path is always visible:
 | `advertisement` | Passive manufacturer data from the toothbrush |
 
 Sources are selected automatically inside the chosen connection option.
-Entity IDs stay the same when the source changes.
+Entity IDs stay the same when the source changes. Starting with v0.7.43, an
+advertisement-only scanner can supply brush state, time, sector and
+normal or high pressure readings. While the direct brush or charger bridge
+supplies live brushing data, advertisements can still refresh identity and
+signal strength.
 
 The toothbrush is a sleepy Bluetooth device and can stop advertising while it
 is docked or otherwise inactive. Oral-B Live keeps the last valid toothbrush
@@ -387,28 +395,25 @@ update settings.
 
 ## Installation
 
-### HACS
+### Home Assistant Marketplace
 
-[![Open your Home Assistant instance and open Oral-B Live inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=thomasgregg&repository=oralb-ha&category=integration)
+On Home Assistant 2026.11 or later, use the Marketplace badge at the top of
+this README or open **Settings → Marketplace** and search for **Oral-B Live**.
+Open the repository, select **Install**, confirm the version, and restart
+Home Assistant.
 
-Oral-B Live is included in the default HACS catalog. Use the button above or:
+If the catalog lacks the entry, select **Add from link** in the Marketplace
+and enter `https://github.com/thomasgregg/oralb-ha`. Connect GitHub if prompted.
+Select **Integration** if asked for the repository type, then open and install
+Oral-B Live.
 
-1. In HACS, open **Integrations**.
-2. Search for **Oral-B Live**.
-3. Select **Download**.
-4. Restart Home Assistant.
+To update an existing installation, open **Settings → Updates**, install the
+Oral-B Live update, and restart Home Assistant. The current stable release,
+[v0.7.43](releases/v0.7.43.md), includes the passive-scanner fix.
 
-Alternatively, install it as a custom repository:
-
-1. In HACS, open **Custom repositories**.
-2. Add `https://github.com/thomasgregg/oralb-ha` as an **Integration**.
-3. Install **Oral-B Live**.
-4. Restart Home Assistant.
-
-HACS tracks GitHub releases. After a new release is published, open HACS and
-select **Redownload** or install the offered update, then restart Home Assistant.
-The current stable release is [v0.7.43](releases/v0.7.43.md), which restores
-live brush updates when the brush is heard only by a passive Bluetooth scanner.
+On Home Assistant versions earlier than 2026.11, use HACS to install or update
+**Oral-B Live**, then restart Home Assistant. Marketplace migration is automatic
+when you upgrade Home Assistant. [Marketplace documentation](https://www.home-assistant.io/integrations/marketplace/)
 
 ### Manual
 
@@ -499,13 +504,12 @@ Live to detect when brushing starts.
 ## Requirements
 
 - Home Assistant 2024.4 or newer.
-- A connectable Bluetooth adapter or ESPHome Bluetooth proxy with reliable
-  coverage near the iO Sense charger in **Charger/app compatible** mode, or
-  near the brush in **Home Assistant direct** mode. A scanner being marked
-  `connectable` describes its capability; it does not guarantee that it can
-  receive a particular device from its current location.
-- An iO Sense charger for charger-bridge data; the integration still operates
-  without one through its other local sources.
+- For advertisement-based updates, a Home Assistant Bluetooth scanner in range
+  of the brush. Advertisement-only scanners work from v0.7.43 onward.
+- For direct live data or brief battery and retained-session reads, a
+  connection-capable Bluetooth adapter or proxy in range of the brush.
+- For charger-bridge data, an iO Sense charger and a connection-capable
+  Bluetooth adapter or proxy in range of the charger.
 
 ### Bluetooth proxy recommendations
 
@@ -569,11 +573,10 @@ Hardware choices:
   power and can be placed near the Oral-B device, but select the exact board
   profile whenever one exists.
 
-Do not use an advertisement-only scanner for charger-bridge or direct mode.
-For example, a Shelly scanner can forward advertisements but cannot establish
-the required GATT connection. ESPHome also recommends leaving scan timing at
-its defaults and, for the best reception, placing the proxy away from routers,
-switches and other sources of interference. See the ESPHome
+A Shelly scanner can forward brush advertisements. Direct GATT reads and the
+iO Sense bridge require a connection-capable adapter or proxy. ESPHome also
+recommends leaving scan timing at its defaults and placing the proxy away
+from routers, switches and other sources of interference. See the ESPHome
 [Bluetooth Proxy](https://esphome.io/components/bluetooth_proxy/) and
 [ESP32 platform](https://esphome.io/components/esp32/) documentation.
 
@@ -661,8 +664,8 @@ discovery reports, including possible newer charger hardware revisions.
 The tool runs independently of Home Assistant and does not use ESPHome or
 Shelly Bluetooth proxies. It never sends POST/SET commands. A scan-only mode is
 available when no connection or GATT write should occur. Download the standalone
-script from the repository using the commands in the guide below; the HACS
-release asset contains only the integration. Its separate
+script from the repository using the commands in the guide below. The
+`oralb_live.zip` release asset contains the integration. The tool's separate
 `--brush-pacer` mode captures raw FF02 plus initial/final FF25/FF26/FF09 reads,
 and one complete stream of FF04/FF07/FF08/FF09 toothbrush notifications for
 sector-count diagnostics.
@@ -673,11 +676,22 @@ contents, troubleshooting and how to attach a capture to an issue. For a
 sector-count investigation, follow the dedicated
 [toothbrush pacer capture instructions](tools/README.md#toothbrush-pacer-capture).
 
-### Live values use advertisements
+### Live values freeze after setup with a passive scanner
 
-`data_source: advertisement` means no matched charger bridge or direct brush
-connection is currently available. The integration remains functional through
-its passive fallback and will switch sources automatically when possible.
+Update to [v0.7.43 or later](releases/v0.7.43.md) and restart Home Assistant.
+Older versions could show a cached brush state and time at setup, then freeze
+when only an advertisement-only scanner heard the brush. In the
+[Bluetooth Advertisement Monitor](https://my.home-assistant.io/redirect/bluetooth_advertisement_monitor),
+look for changing advertisements from the brush while brushing. Then check
+the toothbrush state entity for `data_source: advertisement` and verify that
+time, sector and pressure follow the brush's broadcasts. If values still
+freeze, include your Oral-B Live version, Home Assistant version and receiving
+scanner in the issue report. [Issue #53](https://github.com/thomasgregg/oralb-ha/issues/53)
+
+`data_source: advertisement` is expected when the integration is reading the
+brush's broadcasts. Direct battery and retained-session reads require a
+connection-capable route to the brush. The iO Sense bridge requires one to the
+charger.
 
 ### Charger display or phone app cannot use the brush
 
@@ -720,10 +734,12 @@ longer emitted; normal debug logs remain available.
 
 ### Entities remain unavailable
 
-Disable another integration that is managing the same brush, verify active
-Bluetooth connectivity, reload the config entry, and wake the brush. Debug
-logging for `custom_components.oralb_live` shows charger matching, source
-selection and read failures without exposing cloud credentials.
+Disable another integration that is managing the same brush, verify that Home
+Assistant sees the awake brush in the Advertisement Monitor, and reload the
+config entry. Check for a connection-capable route if you use direct reads or
+the iO Sense bridge. Debug logging for `custom_components.oralb_live` shows
+charger matching, source selection and read failures without exposing cloud
+credentials.
 
 ## Credits
 
@@ -738,7 +754,7 @@ selection and read failures without exposing cloud credentials.
 Not affiliated with, endorsed by, or connected to Oral-B or Procter & Gamble.
 Protocol behaviour may differ across models and firmware.
 
-[hacs-badge]: https://img.shields.io/badge/HACS-Default-41BDF5.svg
-[hacs-url]: https://github.com/hacs/integration
+[marketplace-badge]: https://my.home-assistant.io/badges/marketplace_repository.svg
+[marketplace-url]: https://my.home-assistant.io/redirect/marketplace_repository/?owner=thomasgregg&repository=oralb-ha&category=integration
 [release-badge]: https://img.shields.io/github/v/release/thomasgregg/oralb-ha
 [release-url]: https://github.com/thomasgregg/oralb-ha/releases
