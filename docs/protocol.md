@@ -291,8 +291,16 @@ value is:
 | `10` | configured number of sectors |
 
 Advertisements provide the passive fallback and are the data source used by
-Home Assistant's built-in Oral-B integration. They are unavailable while any
-client owns the toothbrush connection slot.
+Home Assistant's built-in Oral-B integration. The brush stops broadcasting
+while a client owns the toothbrush connection slot.
+
+Oral-B Live v0.7.43 subscribes by brush address with `connectable=False`, so
+Home Assistant delivers changed advertisements from both scanner types.
+During setup, cached advertisements can seed the displayed values without
+starting a session or triggering a read. While direct GATT or the charger
+bridge supplies live data, advertisements refresh identity and signal
+strength and the live source owns the brushing state. Direct GATT lookups
+and iO Sense discovery require a connection-capable route. [Issue #53](https://github.com/thomasgregg/oralb-ha/issues/53)
 
 Byte 4 is a status bit field, not an enum. Bit 7 (`0x80`) indicates high
 pressure, bit 2 (`0x04`) indicates the mode button and bit 3 (`0x08`) indicates

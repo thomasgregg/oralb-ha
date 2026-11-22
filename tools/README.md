@@ -56,13 +56,13 @@ protocol, use `--no-protocol`.
 - The `bleak` Python package.
 
 The probe does not import the Home Assistant integration and does not require
-Home Assistant, HACS or an Oral-B account.
+Home Assistant or an Oral-B account.
 
 ### Installation
 
 The easiest method does not require cloning the repository. Download the
 standalone `iosense_probe.py` from the repository into a dedicated directory.
-The latest HACS release provides `oralb_live.zip`; the probe is not a separate
+The latest GitHub release provides `oralb_live.zip`; the probe is not a separate
 asset on that release. The commands below fetch the current source script.
 
 macOS or Linux:

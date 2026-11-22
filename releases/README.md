@@ -2,8 +2,8 @@
 
 Every historical release is archived here. Use a sentence-case summary (for example, `Off-charger battery refresh`)
 for the GitHub release title and the first `#` heading in its archive file.
-Do not include the version in the title: HACS adds the release tag before it,
-so a version-prefixed title appears twice. The archive filename retains the tag.
+Keep the version in the release tag and archive filename. Use the title
+to describe the change.
 Use `##` for body sections and `###` only for subsections within a section.
 Prefer `## Changes`, followed by relevant validation, compatibility, or testing
 sections. Preserve historical facts, caveats, credits, and links; do not invent
@@ -23,7 +23,7 @@ also validates live release titles and bodies on publication and edits. Manual
 runs validate the archived notes. Publication validation runs before uploading
 the integration ZIP.
 
-## HACS publication checks
+## Marketplace publication checks
 
 Keep `custom_components/oralb_live/manifest.json` aligned with the release tag.
 Run the complete pinned test suite and wait for unit tests, HACS and Hassfest
@@ -34,4 +34,4 @@ checks before publishing the tested commit. The release workflow attaches
 After publication, wait for the Release workflow to finish, download the
 published ZIP, and verify its manifest version and source against the released
 commit. Check that the release is stable/latest when that is intended. Updating
-README or protocol documentation alone does not require another HACS release.
+README or protocol documentation alone does not require another integration release.
