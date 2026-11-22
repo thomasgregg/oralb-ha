@@ -1,10 +1,6 @@
 # Oral-B Live
 
-<!-- ha-marketplace:exclude-start -->
-[![Open Oral-B Live in Home Assistant Marketplace][marketplace-badge]][marketplace-url]
-<!-- ha-marketplace:exclude-end -->
-
-[![Release][release-badge]][release-url]
+[![Marketplace listed][marketplace-badge]][marketplace-docs] [![Release][release-badge]][release-url]
 
 **Local live brushing data for Oral-B iO toothbrushes and iO Sense chargers in Home Assistant.**
 
@@ -397,8 +393,12 @@ update settings.
 
 ### Home Assistant Marketplace
 
-On Home Assistant 2026.11 or later, use the Marketplace badge at the top of
-this README or open **Settings → Marketplace** and search for **Oral-B Live**.
+<!-- ha-marketplace:exclude-start -->
+[![Open Oral-B Live in Home Assistant Marketplace][marketplace-install-button]][marketplace-install-url]
+<!-- ha-marketplace:exclude-end -->
+
+On Home Assistant 2026.11 or later, use the button above or open
+**Settings → Marketplace** and search for **Oral-B Live**.
 Open the repository, select **Install**, confirm the version, and restart
 Home Assistant.
 
@@ -754,7 +754,9 @@ credentials.
 Not affiliated with, endorsed by, or connected to Oral-B or Procter & Gamble.
 Protocol behaviour may differ across models and firmware.
 
-[marketplace-badge]: https://my.home-assistant.io/badges/marketplace_repository.svg
-[marketplace-url]: https://my.home-assistant.io/redirect/marketplace_repository/?owner=thomasgregg&repository=oralb-ha&category=integration
+[marketplace-badge]: https://img.shields.io/badge/Marketplace-listed-007F9E.svg
+[marketplace-docs]: https://www.home-assistant.io/integrations/marketplace/
+[marketplace-install-button]: https://my.home-assistant.io/badges/marketplace_repository.svg
+[marketplace-install-url]: https://my.home-assistant.io/redirect/marketplace_repository/?owner=thomasgregg&repository=oralb-ha&category=integration
 [release-badge]: https://img.shields.io/github/v/release/thomasgregg/oralb-ha
 [release-url]: https://github.com/thomasgregg/oralb-ha/releases
