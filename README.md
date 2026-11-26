@@ -121,7 +121,7 @@ shows the reported model, protocol and firmware. Optional readings remain
 
 | BLE protocol | Current support and evidence | Retained session (`FF29`) |
 |---|---|---|
-| 6 | Live values, locally reconstructed sessions and `FF05` battery readings; battery/session fixes confirmed on affected protocol-6 hardware, including firmware 107 | Different payload layout; decoding is disabled to protect valid battery and session data |
+| 6 | Live values, locally reconstructed sessions and `FF05` battery readings; earlier battery/session fixes were confirmed on firmware 107 | Observed 20- and 21-byte payloads. Field decoding remains disabled pending correlated captures. |
 | 7 | Supported decoder; v0.7.39 beta testing on an iO Series 5, firmware 36 confirmed off-charger battery refresh, dates/counts and pause/separate-session handling | Registered protocol-7/8 layout |
 | 8 | Supported decoder and detailed local captures on an iO Series 10 with iO Sense | Verified protocol-7/8 layout |
 | 9 | Existing decoder compatibility is retained; this does not establish full hardware validation of every feature | Explicitly registered with the protocol-7/8 decoder |
@@ -207,6 +207,12 @@ motor pause remains provisional for up to 20 seconds: resuming with a continuing
 brush timer keeps one logical session, while a confirmed timer reset starts a
 separate session. Menu-only wakes do not create brushing sessions. Sessions today
 uses the Home Assistant local date and resets at local midnight.
+
+In [v0.7.44b1](releases/v0.7.44b1.md), when HA misses a passive stop, it can
+end a confirmed session at the last observed brushing sample. A near-zero timer
+followed by forward progress after a gap can identify a new session even if the
+brush never reported a quiet state. For sessions observed in `selection_menu`,
+sector samples count once timer movement confirms brushing.
 
 On supported protocols, the brush retains one authoritative summary containing
 exact duration, mode,
@@ -321,7 +327,7 @@ The **Last session** attributes can include:
 - duration and brushing mode;
 - the result display face captured from an ending advertisement or FF0A;
 - source and session identifier;
-- configured target and sectors covered;
+- configured target and sector count, based on observed sectors for a locally reconstructed session;
 - high/low-pressure event counts and durations;
 - average and maximum pressure in millinewtons;
 - battery percentage at the end of the session.
@@ -334,8 +340,9 @@ event counts and ending battery without creating a second session. The
 captured display face remains attached to that session because `FF29` does not
 contain it. Direct connections also make a few short FF0A reads immediately
 after the session because optional notifications can be missed; the connection
-is retained throughout. Raw `standard` is the lowest result face and is stored
-like every `special_*` verdict; only `off` means that no result was exposed. If
+is retained throughout. In [v0.7.44b1](releases/v0.7.44b1.md), a quiet-state
+advertisement can replace a provisional face seen just before the stop for the
+same session. Raw `standard` is the lowest valid result face. If
 the handle supplies only `off` or no usable face, `display_face` remains `null`
 rather than inheriting an older session's face. Without a matched charger, a
 quiet post-session connection reads battery first and attempts the transient
@@ -355,9 +362,10 @@ integration reloads so an older replay does not count as another brushing.
 
 `FF29` is selected through an exact protocol-version decoder registry. The
 verified protocol-7/8 layout remains in use there, with protocol 9 retaining
-its existing compatibility. Protocol 6 exposes a different payload, so
-Oral-B Live preserves its locally reconstructed session instead of
-interpreting that payload as a newer-format result.
+its existing compatibility. Protocol 6 uses the local session summary while
+its retained layout is being mapped. In [v0.7.44b1](releases/v0.7.44b1.md), an
+incomplete `FF29`/`FF22` capture can retry during a later quiet connection
+window. Fresh `FF05` battery data updates independently.
 
 ### iO Sense Charger device
 
@@ -706,6 +714,11 @@ pressure totals and ending battery can refine that record on the next managed
 connection without creating a duplicate. Protocol 6 keeps the locally observed
 summary instead. Recovery may wait for a usable brush clock; fresh battery reads
 do not need to wait for that recovery.
+
+For a protocol-6 report on v0.7.44b1, collect an `FF29`/`FF22` baseline before
+brushing and another pair after one known session. Use a quiet connection window
+such as charging. The [protocol-6 capture guide](docs/protocol.md#protocol-6-captures)
+explains the debug flags and the measurements to record from the handle.
 
 ### Smiley or Last session display face is missing
 
