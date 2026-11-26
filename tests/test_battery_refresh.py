@@ -34,6 +34,10 @@ sensor = importlib.import_module("oralb_live.sensor")
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
 WALL_START = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+PROTOCOL6_FF29 = bytes.fromhex(
+    "13 19 3b 32 00 04 78 80 78 00 00 00 bd 04 04 04 00 01 01 02 53"
+)
+PROTOCOL6_FF22 = bytes.fromhex("02 56 3c 32")
 
 
 class _ModuleProxy:
@@ -127,6 +131,7 @@ def _service_info(
     observed_at: float,
     *,
     face: int = 0,
+    sector: int = 1,
     protocol: int = 7,
     connectable: bool = True,
 ) -> BluetoothServiceInfoBleak:
@@ -134,7 +139,7 @@ def _service_info(
     # multi-minute session so a mistaken fixture encoding cannot go unnoticed.
     payload = bytes(
         [protocol, 0x31, 36, state, 0x72, seconds // 60, seconds % 60,
-         0, 1 | (face << 3), 0, 4]
+         0, sector | (face << 3), 0, 4]
     )
     manufacturer_data = {const.ORALB_MANUFACTURER_ID: payload}
     try:
@@ -389,6 +394,97 @@ class BatteryRefreshTests(unittest.IsolatedAsyncioTestCase):
         await self._feed(115)
         self.assertEqual(self.connections, [])
         self.assertIsNone(self.c.data["last_session_start"])
+
+    async def test_menu_wake_during_pause_grace_needs_movement_for_a_new_generation(self):
+        await self._stop_session(protocol=6)
+        await self._advance(5)
+        await self._feed(8, 120, protocol=6)
+        await self._advance(16)
+        self.assertEqual(self.c.data["sessions_today"], 1)
+        self.assertEqual(self.c._session_generation, 1)
+        self.assertFalse(self.c._session_confirmed)
+
+    async def test_short_menu_session_uses_confirmed_sectors_and_the_quiet_face(self):
+        self.c.async_start()
+        await self._feed(8, 122, sector=4, protocol=6)
+        await self._advance(1)
+        await self._feed(8, 0, sector=3, protocol=6)
+        await self._advance(1)
+        await self._feed(8, 1, protocol=6)
+        await self._advance(32)
+        await self._feed(8, 33, face=1, protocol=6)
+        await self._advance(1)
+        await self._feed(9, 34, face=6, protocol=6)
+        await self._advance(20)
+        self.assertEqual(self.c.data["last_session_duration"], 34)
+        self.assertEqual(self.c.data["last_session_sectors"], 1)
+        self.assertEqual(self.c.data["last_session_display_face"], "special_6")
+        self.assertEqual(
+            self.c.data["last_session_display_face_source"], const.DATA_SOURCE_ADVERTISEMENT
+        )
+
+    async def test_pre_stop_advertisement_can_supply_the_only_face(self):
+        self.c.async_start()
+        await self._feed(3)
+        await self._advance(20)
+        await self._feed(3, 20, face=1)
+        await self._advance(1)
+        await self._feed(9, 21, face=0)
+        await self._advance(20)
+        self.assertEqual(self.c.data["last_session_display_face"], "standard")
+
+    async def test_unavailable_brush_finishes_confirmed_session_at_last_sample(self):
+        self.c.async_start()
+        await self._feed(8, 0, protocol=6)
+        await self._advance(20)
+        await self._feed(8, 20, face=1, protocol=6)
+        await self._advance(15 * 60)
+        info = self.manager.async_last_service_info(ADDRESS, connectable=False)
+        self.c._async_unavailable(info)
+        self.c._async_unavailable(info)
+        self.assertEqual(self.c.data["sessions_today"], 1)
+        self.assertEqual(self.c.data["last_session_duration"], 20)
+        self.assertIsNone(self.c.data["last_session_display_face"])
+        await self._feed(8, 0, protocol=6)
+        await self._advance(10)
+        await self._feed(8, 10, protocol=6)
+        await self._feed(9, 10, protocol=6)
+        await self._advance(20)
+        self.assertEqual(self.c.data["sessions_today"], 2)
+        self.assertEqual(self.c.data["last_session_duration"], 10)
+
+    async def test_coherent_passive_reset_recovers_missed_stop_without_unavailable(self):
+        self.c.async_start()
+        await self._feed(8, 0, protocol=6)
+        await self._advance(20)
+        await self._feed(8, 20, protocol=6)
+        await self._advance(30)
+        await self._feed(8, 0, sector=4, protocol=6)
+        self.assertEqual(self.c._session_generation, 1)
+        await self._advance(1)
+        await self._feed(8, 1, protocol=6)
+        self.assertEqual(self.c.data["sessions_today"], 1)
+        self.assertEqual(self.c.data["last_session_duration"], 20)
+        self.assertEqual(self.c._session_generation, 2)
+        await self._advance(9)
+        await self._feed(9, 10, protocol=6)
+        await self._advance(20)
+        self.assertEqual(self.c.data["sessions_today"], 2)
+        self.assertEqual(self.c.data["last_session_duration"], 10)
+        self.assertEqual(self.c.data["last_session_sectors"], 1)
+
+    async def test_lone_passive_timer_drop_does_not_split_a_session(self):
+        self.c.async_start()
+        await self._feed(3, 20, protocol=6)
+        await self._advance(30)
+        await self._feed(8, 0, sector=4, protocol=6)
+        await self._advance(1)
+        await self._feed(3, 51, protocol=6)
+        await self._feed(9, 51, protocol=6)
+        await self._advance(20)
+        self.assertEqual(self.c.data["sessions_today"], 1)
+        self.assertEqual(self.c.data["last_session_duration"], 51)
+        self.assertEqual(self.c.data["last_session_sectors"], 1)
 
     async def test_known_charger_prevents_direct_maintenance(self) -> None:
         self.c.charger.address = "11:22:33:44:55:66"
@@ -688,6 +784,71 @@ class BatteryRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c.data["sessions_today"], 1)
         self.assertEqual(self.c.data["last_session_duration"], 120)
         self.assertEqual(self.c.data["last_session_source"], const.DATA_SOURCE_ADVERTISEMENT)
+
+    async def test_protocol_6_record_without_clock_retries_on_next_quiet_window(self):
+        await self._stop_session(protocol=6)
+        self.status = bytes.fromhex("3f 00 00 00")
+        self.responses[const.CHAR_SESSION_DATA] = PROTOCOL6_FF29
+        with self.assertLogs(coordinator.__name__, level="DEBUG") as first_read:
+            await self._advance(59)
+            await self._feed(9, 120, protocol=6)
+            await self._advance(1)
+        self._assert_published_battery(63)
+        self.assertEqual(self.c.data["sessions_today"], 1)
+        self.assertEqual(self.c._processed_session_generation, 0)
+        self.assertIn("changed=None", "\n".join(first_read.output))
+        self.assertIn("FF22=None FF05=3f 00 00 00 complete_pair=False", "\n".join(first_read.output))
+
+        self.responses[const.CHAR_RTC] = PROTOCOL6_FF22
+        with self.assertLogs(coordinator.__name__, level="DEBUG") as retry:
+            await self._advance(59)
+            await self._feed(4, 120, protocol=6)
+            await self._advance(1)
+        self.assertEqual(self.c._processed_session_generation, 1)
+        self.assertEqual(self.c.data["sessions_today"], 1)
+        self.assertEqual(self.c.data["last_session_duration"], 120)
+        self.assertEqual(self.c.data["battery"], 63)
+        self.assertIn("changed=False", "\n".join(retry.output))
+        self.assertIn("FF22=02 56 3c 32 FF05=3f 00 00 00 complete_pair=True", "\n".join(retry.output))
+
+    async def test_protocol_6_placeholders_do_not_set_a_capture_baseline(self):
+        self.c.data["protocol_version"] = 6
+        for record, rtc in (
+            (b"", PROTOCOL6_FF22),
+            (PROTOCOL6_FF29[:19], PROTOCOL6_FF22),
+            (bytes(21), PROTOCOL6_FF22),
+        ):
+            with self.subTest(record=record):
+                self.assertEqual(
+                    await self.c._async_apply_session_record(record, rtc), "missing"
+                )
+        with self.assertLogs(coordinator.__name__, level="DEBUG") as logs:
+            self.assertEqual(
+                await self.c._async_apply_session_record(PROTOCOL6_FF29, PROTOCOL6_FF22),
+                "unsupported",
+            )
+        self.assertIn("changed=None", "\n".join(logs.output))
+
+    async def test_protocol_6_short_and_zero_clocks_leave_recovery_pending(self):
+        self.c.data["protocol_version"] = 6
+        for rtc in (b"", b"\x01\x02\x03", b"\x00\x00\x00\x00"):
+            with self.subTest(rtc=rtc):
+                self.assertEqual(
+                    await self.c._async_apply_session_record(PROTOCOL6_FF29, rtc), "missing"
+                )
+
+    async def test_retry_logs_timeout_stage_and_stale_quiet_window(self):
+        await self._stop_session(protocol=6)
+        self.connection_error = TimeoutError()
+        with self.assertLogs(coordinator.__name__, level="DEBUG") as logs:
+            await self._advance(59)
+            await self._feed(9, 120, protocol=6)
+            await self._advance(61)
+        messages = "\n".join(logs.output)
+        self.assertIn("brief sync failed during connection and service discovery: TimeoutError()", messages)
+        self.assertIn("brief sync deferred: overall advertisement age", messages)
+        self.assertEqual(len(self.connections), 2)
+        self.assertEqual(self.c.data["sessions_today"], 1)
 
     async def test_pause_resume_preserves_start_count_duration_and_final_face(self) -> None:
         await self._stop_session(9)

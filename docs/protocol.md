@@ -754,10 +754,19 @@ The verified protocol-7/8 payload is 21 bytes, little-endian:
 | `20` | battery at session end | percent |
 
 The decoder registry assigns this layout to protocols 7 and 8 and retains the
-integration's prior protocol-9 compatibility. A protocol-6 capture returned a
-different 20-byte payload and is not decoded as this structure. Other
-unregistered protocol versions also fail closed instead of being assumed
-compatible with the newest known layout.
+integration's prior protocol-9 compatibility. Protocol-6 captures include 20- and
+21-byte payloads. The same 21-byte payload has been read after different sessions,
+so field decoding remains disabled pending correlated captures. Unregistered
+protocol versions keep the locally reconstructed session.
+
+For a protocol-6 capture, enable integration debug logging and record a baseline
+`FF29` and `FF22` pair before brushing. After the next session, keep the brush in a
+quiet, connectable state long enough for the retained-record read. The debug line
+includes the raw pair, read timestamps, same-connection `FF05` when available, and
+the last locally reconstructed session. `changed=None` means there is no usable
+comparison yet, including on the first read after a reload. `complete_pair=True`
+means a non-placeholder record and clock were read. Match the changed bytes to
+observations from the handle before using them to infer any field.
 
 The brush clock can drift. The wall-clock start is calculated relative to an
 `FF22` value read in the same connection:
@@ -779,16 +788,21 @@ when authoritative timer samples continue forward; a coherent reset near zero
 starts a new logical session. Sectors, pressure summaries and the original
 start are retained across merged fragments, while an interim display face is
 discarded. Charger-mode extrapolated ticks are display-only and never decide
-this boundary.
+this boundary. If the passive stop is missed, a confirmed session can end at its
+last observed sample after advertisements go unavailable or a new timer starts
+advancing following a gap. For menu-only advertisements, sector samples count
+after the brush timer confirms movement.
 
 `FF29` belongs to the brush and retains its latest summary. It is not a dump
 of a charger queue and does not contain per-second pressure distribution or
 per-zone pressure time. It also has no display-face field, so Oral-B Live keeps
 a transient result delivered by the ending advertisement, direct `FF0A`
 notification/read or charger-forwarded `FF0A` with the matching Home Assistant
-session record. Association is bounded to the completed session: `off` is not a
-verdict, `standard` is the lowest valid verdict, a later display change cannot
-overwrite a captured result, and an unavailable result remains `null`.
+session record. `off` leaves the result unset and `standard` is the lowest valid
+verdict. A face from an active advertisement immediately before the stop can
+supply a provisional result. A valid face from the quiet state for that same
+session can replace it within the capture window. A later menu wake cannot
+replace a confirmed result.
 
 ### Availability after a session
 
