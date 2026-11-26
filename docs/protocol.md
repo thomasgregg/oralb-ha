@@ -754,10 +754,38 @@ The verified protocol-7/8 payload is 21 bytes, little-endian:
 | `20` | battery at session end | percent |
 
 The decoder registry assigns this layout to protocols 7 and 8 and retains the
-integration's prior protocol-9 compatibility. A protocol-6 capture returned a
-different 20-byte payload and is not decoded as this structure. Other
-unregistered protocol versions also fail closed instead of being assumed
-compatible with the newest known layout.
+integration's prior protocol-9 compatibility. Protocol-6 captures include 20- and
+21-byte payloads. The same 21-byte payload has been read after different sessions,
+so field decoding remains disabled pending correlated captures. Unregistered
+protocol versions keep the locally reconstructed session.
+
+### Protocol-6 captures
+
+Starting with [v0.7.44b1](../releases/v0.7.44b1.md), direct-sync debug lines show
+raw `FF29` and `FF22` with read timestamps, same-connection `FF05` when available,
+and the last locally reconstructed session. An incomplete record/clock pair
+remains eligible for a bounded retry. Fresh `FF05` is applied independently.
+Attempts still require recent, connectable observations in idle, charging or
+one of the two summary states. `selection_menu` can be used while brushing and
+therefore does not authorize a quiet read.
+
+| Debug flag | Meaning |
+| --- | --- |
+| `changed=None` | No usable comparison. This includes the first usable FF29 after setup or reload, and an unusable current FF29. |
+| `changed=False` | The usable FF29 bytes match the prior usable FF29 from this coordinator. |
+| `changed=True` | The usable FF29 bytes differ from that prior read. |
+| `complete_pair=True` | A non-placeholder record and clock were read. A complete pair can still return an older session. |
+
+Enable Oral-B Live debug logging and get an `FF29`/`FF22` baseline before
+brushing. Complete one full session in a different mode and note the start time,
+duration, mode, verdict, sectors shown on the handle and battery before/after.
+If you have a regular charger, leave the brush on it for about two minutes
+following the session to give HA a quiet connection window after the cooldown.
+Compare the baseline, the changed bytes and the handle observations before
+inferring any field. If the read fails, capture the debug log from the stop
+through the next two minutes.
+
+### Session reconciliation
 
 The brush clock can drift. The wall-clock start is calculated relative to an
 `FF22` value read in the same connection:
@@ -779,16 +807,22 @@ when authoritative timer samples continue forward; a coherent reset near zero
 starts a new logical session. Sectors, pressure summaries and the original
 start are retained across merged fragments, while an interim display face is
 discarded. Charger-mode extrapolated ticks are display-only and never decide
-this boundary.
+this boundary. In v0.7.44b1, if the passive stop is missed, a confirmed session
+can end at its last observed sample after advertisements go unavailable beyond
+the pause grace. If availability never changes, a near-zero timer followed by
+forward progress after a gap can identify the next session. For menu-only
+advertisements, sector samples count after the brush timer confirms movement.
 
 `FF29` belongs to the brush and retains its latest summary. It is not a dump
 of a charger queue and does not contain per-second pressure distribution or
 per-zone pressure time. It also has no display-face field, so Oral-B Live keeps
 a transient result delivered by the ending advertisement, direct `FF0A`
 notification/read or charger-forwarded `FF0A` with the matching Home Assistant
-session record. Association is bounded to the completed session: `off` is not a
-verdict, `standard` is the lowest valid verdict, a later display change cannot
-overwrite a captured result, and an unavailable result remains `null`.
+session record. `off` leaves the result unset and `standard` is the lowest valid
+verdict. A face from an active advertisement immediately before the stop can
+supply a provisional result. A valid face from the quiet state for that same
+session can replace it within the capture window. A later menu wake cannot
+replace a confirmed result.
 
 ### Availability after a session
 

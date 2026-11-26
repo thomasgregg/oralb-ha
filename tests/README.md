@@ -87,6 +87,17 @@ remains required. Broader FF29 identity, RTC and asynchronous generation races
 are separate session-recovery work; the battery fix must not bring record
 application forward merely to make a battery test pass.
 
+## Issue 38: passive sessions and protocol-6 captures
+
+The tests in `test_battery_refresh.py` also exercise missed passive stops,
+a lone stale timer sample versus a coherent new timer, and a menu wake during
+pause grace. They reproduce a short session with pre-run sectors and a face
+that changes at the quiet-state transition. Capture tests verify that an absent
+clock or a placeholder record keeps the retry pending, FF05 still publishes,
+and debug logs distinguish an incomplete pair, a timed-out stage and a stale
+quiet window. These tests simulate Bluetooth transport. The protocol-6 field
+layout still requires correlated reads from a physical brush.
+
 ## Issue 49: disconnected client cleanup
 
 `test_disconnect_cleanup.py` began with eight cases for brush and iO Sense

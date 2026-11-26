@@ -423,7 +423,9 @@ class PassiveSessionDurationTests(unittest.TestCase):
             "ff 02 02 00 00 01 03 02 04 05 07 07 06 01 00 00 00 00 00 00"
         )
 
-        result = asyncio.run(c._async_apply_session_record(record, None))
+        result = asyncio.run(
+            c._async_apply_session_record(record, bytes.fromhex("02 56 3c 32"))
+        )
 
         self.assertEqual(result, "unsupported")
         self.assertEqual(c.data["battery"], 91)
