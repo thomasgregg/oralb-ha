@@ -327,6 +327,13 @@ CHARGER_BATTERY_EVERY_TICKS = 30
 CHARGER_IDLE_DISCONNECT_SECONDS = 3.0
 CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS = 5.0
 CHARGER_IDLE_PROBE_INTERVAL_SECONDS = 5 * 60.0
+# Home Assistant dispatches only changed advertisements, so an iO Sense that
+# could not be identified yet is retried on a timer: shortly when it was only
+# skipped while another charger was being identified, with exponential backoff
+# when it was unreachable or did not report its paired brush.
+CHARGER_DISCOVERY_RETRY_BUSY_SECONDS = 2.0
+CHARGER_DISCOVERY_RETRY_BASE_SECONDS = 15.0
+CHARGER_DISCOVERY_RETRY_MAX_SECONDS = 5 * 60.0
 CHARGER_SNAPSHOT_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SESSION_SYNC_INTERVAL_SECONDS = 60.0
 # Read values with the shortest useful window before optional retained session

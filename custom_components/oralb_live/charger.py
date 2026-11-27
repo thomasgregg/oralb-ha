@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,9 @@ from .const import (
     CHARGER_BRIDGE_INTERVAL_SECONDS,
     CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS,
     CHARGER_BRUSH_STATUS_EVERY_TICKS,
+    CHARGER_DISCOVERY_RETRY_BASE_SECONDS,
+    CHARGER_DISCOVERY_RETRY_BUSY_SECONDS,
+    CHARGER_DISCOVERY_RETRY_MAX_SECONDS,
     CHARGER_IDLE_DISCONNECT_SECONDS,
     CHARGER_IDLE_PROBE_INTERVAL_SECONDS,
     CHARGER_POST_SESSION_READS,
@@ -150,6 +154,10 @@ class IOSenseBridge:
         self._pending_command: ChargerCommand | None = None
         self._pending_short_uuid: str | None = None
         self._candidate_addresses: set[str] = set()
+        # Unidentified chargers to try again, keyed to the loop time when due.
+        self._retry_due: dict[str, float] = {}
+        self._discovery_retry: asyncio.TimerHandle | None = None
+        self._discovery_failures = 0
         self._session_running = False
         self._session_confirmed = False
         self._provisional_timer_baseline: int | None = None
@@ -178,6 +186,7 @@ class IOSenseBridge:
 
     async def async_stop(self) -> None:
         self._stopping = True
+        self._cancel_discovery_retry()
         if self._unsub_bluetooth:
             self._unsub_bluetooth()
             self._unsub_bluetooth = None
@@ -240,7 +249,11 @@ class IOSenseBridge:
             if service_info.address in self._candidate_addresses:
                 return
             if self._connect_task and not self._connect_task.done():
+                self._retry_candidate(
+                    service_info.address, CHARGER_DISCOVERY_RETRY_BUSY_SECONDS
+                )
                 return
+            self._retry_due.pop(service_info.address, None)
             self._candidate_addresses.add(service_info.address)
             self._schedule_connect(service_info.address)
         else:
@@ -265,6 +278,69 @@ class IOSenseBridge:
         self._end_session(schedule_disconnect=False)
         self._push()
         self.parent._push()
+
+    @callback
+    def _retry_candidate(self, address: str, delay: float) -> None:
+        """Try an unidentified charger again without waiting for a new advert."""
+        self._candidate_addresses.discard(address)
+        if self._stopping or self.address is not None:
+            return
+        due = self.hass.loop.time() + delay
+        self._retry_due[address] = min(due, self._retry_due.get(address, due))
+        self._schedule_discovery_retry()
+
+    def _candidate_failed(self, address: str) -> None:
+        """Back off before identifying an unreachable or silent charger again."""
+        delay = min(
+            CHARGER_DISCOVERY_RETRY_MAX_SECONDS,
+            CHARGER_DISCOVERY_RETRY_BASE_SECONDS * 2 ** min(self._discovery_failures, 8),
+        )
+        self._discovery_failures += 1
+        # Jitter keeps the bridges of several brushes from retrying in step.
+        self._retry_candidate(address, delay * random.uniform(0.8, 1.2))
+
+    @callback
+    def _schedule_discovery_retry(self) -> None:
+        """Arm the timer for the earliest pending charger retry."""
+        if self._stopping or self.address is not None or not self._retry_due:
+            self._cancel_discovery_retry()
+            return
+        due = min(self._retry_due.values())
+        if self._discovery_retry is not None:
+            if self._discovery_retry.when() <= due:
+                return
+            self._discovery_retry.cancel()
+        self._discovery_retry = self.hass.loop.call_at(due, self._async_discovery_retry)
+
+    @callback
+    def _cancel_discovery_retry(self) -> None:
+        if self._discovery_retry is not None:
+            self._discovery_retry.cancel()
+            self._discovery_retry = None
+
+    @callback
+    def _async_discovery_retry(self) -> None:
+        self._discovery_retry = None
+        if self._stopping or self.address is not None:
+            return
+        now = self.hass.loop.time()
+        self._retry_due = {
+            address: due
+            for address, due in self._retry_due.items()
+            if address not in self._candidate_addresses
+        }
+        if self._connect_task and not self._connect_task.done():
+            busy_until = now + CHARGER_DISCOVERY_RETRY_BUSY_SECONDS
+            self._retry_due = {
+                address: max(due, busy_until) for address, due in self._retry_due.items()
+            }
+        elif due_now := [a for a, due in self._retry_due.items() if due <= now + 0.001]:
+            address = min(due_now, key=self._retry_due.__getitem__)
+            del self._retry_due[address]
+            _LOGGER.debug("Retrying iO Sense %s identification", address)
+            self._candidate_addresses.add(address)
+            self._schedule_connect(address)
+        self._schedule_discovery_retry()
 
     def _schedule_connect(self, address: str) -> None:
         if self._stopping:
@@ -293,7 +369,7 @@ class IOSenseBridge:
             )
             if ble_device is None:
                 _LOGGER.debug("iO Sense %s has no connectable path", address)
-                self._candidate_addresses.discard(address)
+                self._candidate_failed(address)
                 return
             try:
                 client = await establish_connection(
@@ -305,11 +381,11 @@ class IOSenseBridge:
                 )
             except (BleakError, TimeoutError) as err:
                 _LOGGER.debug("iO Sense %s connection failed: %s", address, err)
-                self._candidate_addresses.discard(address)
+                self._candidate_failed(address)
                 return
 
             if self._stopping or not client.is_connected:
-                self._candidate_addresses.discard(address)
+                self._candidate_failed(address)
                 self._client_cleanup.start(client)
                 await self._client_cleanup.wait()
                 return
@@ -320,7 +396,7 @@ class IOSenseBridge:
                 await client.start_notify(IOSENSE_READ_UUID, self._on_read)
                 await client.start_notify(IOSENSE_STATUS_UUID, self._on_status)
                 if self._stopping or self._client is not client or not client.is_connected:
-                    self._candidate_addresses.discard(address)
+                    self._candidate_failed(address)
                     if self._client is client:
                         await self._async_disconnect()
                     return
@@ -332,7 +408,15 @@ class IOSenseBridge:
                         else {}
                     )
                     paired_mac = identity_value.get("brush_mac")
-                    if normalize_mac(paired_mac or "") != normalize_mac(
+                    if not paired_mac:
+                        # No reply is not a foreign charger: keep it eligible.
+                        _LOGGER.debug(
+                            "iO Sense %s did not report its paired brush", address
+                        )
+                        self._candidate_failed(address)
+                        await self._async_disconnect()
+                        return
+                    if normalize_mac(paired_mac) != normalize_mac(
                         self.parent.address
                     ):
                         _LOGGER.debug(
@@ -364,6 +448,9 @@ class IOSenseBridge:
                         )
                     self.address = address
                     self.data["address"] = address
+                    self._retry_due.clear()
+                    self._discovery_failures = 0
+                    self._cancel_discovery_retry()
                     self._unsub_unavailable = bluetooth.async_track_unavailable(
                         self.hass,
                         self._async_unavailable,
@@ -401,7 +488,7 @@ class IOSenseBridge:
             except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
                 _LOGGER.debug("iO Sense setup/read failed: %s", err)
                 if self.address is None:
-                    self._candidate_addresses.discard(address)
+                    self._candidate_failed(address)
                 await self._async_disconnect()
             finally:
                 self._push()

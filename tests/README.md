@@ -31,6 +31,19 @@ The tests feed advertisements through Home Assistant's Bluetooth manager.
 They cover cached setup, passive and mixed scanner sources, session tracking,
 live GATT priority, and charger reachability. Bluetooth transport is simulated.
 
+## Issue 58: iO Sense discovery retries
+
+Run the 5 regression cases with:
+
+```bash
+.venv-test/bin/python -m pytest tests/test_charger_discovery_retry.py -q
+```
+
+The tests drive `IOSenseBridge` over a simulated radio. A charger skipped while
+another one is identified, a failed paired-brush request and a failed
+connection must be retried and matched without a new advertisement. A charger
+paired with another brush must not be retried, and no retry may run after stop.
+
 ## Charger transaction deadlines
 
 `test_charger_request_deadlines.py` covers the v0.7.40 fix with 19 cases,
