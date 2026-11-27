@@ -197,6 +197,15 @@ normal or high pressure readings. While the direct brush or charger bridge
 supplies live brushing data, advertisements can still refresh identity and
 signal strength.
 
+In [v0.7.44](releases/v0.7.44.md), charger/app-compatible mode queues
+nearby chargers for identification after a Home Assistant restart. It
+retries missed identity replies and temporary proxy failures even when
+the charger repeats an unchanged advertisement. A charger is verified
+against its paired brush before it can supply sensor data. When an active
+charger link drops or stops returning usable data, the integration makes
+up to three reconnect attempts while the charger remains reachable.
+[Issue #58](https://github.com/thomasgregg/oralb-ha/issues/58)
+
 The toothbrush is a sleepy Bluetooth device and can stop advertising while it
 is docked or otherwise inactive. Oral-B Live keeps the last valid toothbrush
 values available in that situation and marks them as assumed until a fresh
@@ -417,7 +426,8 @@ Oral-B Live.
 
 To update an existing installation, open **Settings → Updates**, install the
 Oral-B Live update, and restart Home Assistant. The current stable release,
-[v0.7.43](releases/v0.7.43.md), includes the passive-scanner fix.
+[v0.7.44](releases/v0.7.44.md), includes the iO Sense discovery and reconnect
+fixes, missed passive-stop recovery, and improved protocol-6 captures.
 
 On Home Assistant versions earlier than 2026.11, use HACS to install or update
 **Oral-B Live**, then restart Home Assistant. Marketplace migration is automatic
@@ -651,15 +661,18 @@ its paired and charging state.
    `a0f03e00-5047-4d53-8208-4f72616c2d42`. Note the receiving scanner and RSSI.
 4. If the charger appears, open **Settings → Devices & services →
    Integrations**, find **Oral-B Live**, select **Reload** from its three-dot
-   menu, wake the brush again and wait approximately one minute.
+   menu and check again after approximately one minute. Starting with v0.7.44,
+   the charger identification queue can retry an unchanged advertisement.
+   Wake the brush if the charger itself is absent from the scanner history.
 5. Open **Developer tools → States**, select the main toothbrush state entity
    and inspect its `charger_address` attribute.
 
 If the address populates only with the proxy nearby, improve permanent proxy
-placement or antenna coverage. If a nearby connectable proxy clearly receives
-the charger but the address remains `null`, collect the Advertisement Monitor
-scanner/RSSI details and an iO Sense diagnostic report for an integration
-issue.
+placement or antenna coverage. Starting with v0.7.44, repeated failures can
+increase the retry delay to five minutes for that charger. If the address is
+still `null` after that interval while a connectable proxy can see the charger,
+collect the Advertisement Monitor scanner/RSSI details and an iO Sense
+diagnostic report.
 
 ### iO Sense diagnostic probe
 
@@ -715,7 +728,7 @@ connection without creating a duplicate. Protocol 6 keeps the locally observed
 summary instead. Recovery may wait for a usable brush clock; fresh battery reads
 do not need to wait for that recovery.
 
-For a protocol-6 report on v0.7.44b1, collect an `FF29`/`FF22` baseline before
+For a protocol-6 report on v0.7.44 or later, collect an `FF29`/`FF22` baseline before
 brushing and another pair after one known session. Use a quiet connection window
 such as charging. The [protocol-6 capture guide](docs/protocol.md#protocol-6-captures)
 explains the debug flags and the measurements to record from the handle.

@@ -17,7 +17,9 @@ CI runs the complete suite once against the minimum supported Home Assistant
 and Python versions. This keeps the compatibility guarantee without duplicating
 the same test run against a second dependency environment on every change.
 
-For v0.7.43, all 509 cases pass on Home Assistant 2024.4.4 and 2026.8.3.
+For v0.7.44, the complete suite passes on Home Assistant 2024.4.4
+with Python 3.12 and Home Assistant 2026.8.3 with Python 3.14. Tests
+cover the transport with simulated Bluetooth devices and proxy slots.
 
 ## Issue 53: passive Bluetooth scanner updates
 
@@ -41,6 +43,52 @@ reads, cancellation, response cleanup and late unrelated responses. The
 ```bash
 .venv-test/bin/python -m pytest tests/test_charger_request_deadlines.py -q
 ```
+
+## Issue 58 and BLE connection ownership
+
+```bash
+.venv-test/bin/python -m pytest tests/test_charger_discovery_retry.py tests/test_connection_ownership.py -q
+```
+
+The restart regression replays two cached charger advertisements through
+Home Assistant's Bluetooth manager, shares a simulated proxy slot, and
+uses 850 ms charger responses. The charger frames stay unchanged and the
+handle advertises only selection menu. Both bridges identify their charger,
+and timer, pacer, pressure and battery update through the correct charger.
+
+Other cases cover transient Bluetooth failures, independent retry timing and
+the hard cap, a disappearing route, serialization with eager tasks, foreign
+and placeholder identities, re-pairing during and after discovery, and
+shutdown. The three-charger contention matrix covers every replay order, one
+or two shared proxy slots, and 850 ms or 1.4-second replies. One route recovers
+without a new advertisement.
+
+The ownership tests cover old callbacks, queued requests, idle release and
+diagnostic retention, contradictory native status, loss during live reads,
+late startup samples across brushing sessions, source handoffs, deferred
+session recovery and the valid later-clock case. The tests run the production
+state machines over virtual deadlines and simulated BLE transport.
+
+Connected-route tests expire Home Assistant's scanner history during a
+working link and exercise re-verification on an identical returning frame.
+Discovery also checks a returning previously foreign charger, an identity
+read interrupted by route loss and a stale timeout after the same address
+returns. Request tests reject early, unrelated and duplicate replies while
+accepting a valid notification during the delimiter write itself. An empty
+status frame leaves the request open for a valid status byte.
+Slow-reconnect cases check that continuing timers count once, a reset counts
+as a new session, and normal battery reads still run after timer recovery.
+They include 1.4-second responses and a lost first timer reply.
+Live transport cases cover short and persistent silence, failed passthrough
+with or without native status, and silent initial probes and reconnects.
+Recovery checks that the displayed timer does not inflate the saved duration
+or prevent a genuine continuation from counting once.
+
+Setup-deadline cases stall each charger notification subscription and check
+both the next queued charger and the failing candidate's retry. Direct-mode
+cases cover mandatory and optional subscription timeouts and a stalled first
+startup read. A slow, responsive charger can still finish both subscriptions
+under their individual deadlines.
 
 ## Issue 39: battery refresh regression coverage
 

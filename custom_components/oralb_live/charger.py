@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -25,7 +28,10 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .charger_protocol import (
     CHARGER_SNAPSHOT_COMMANDS,
+    IOSENSE_BRUSH_READ,
     IOSENSE_COMMAND_UUID,
+    IOSENSE_GET,
+    IOSENSE_POST,
     IOSENSE_PROTOCOL_END,
     IOSENSE_READ_UUID,
     IOSENSE_SERVICE_UUID,
@@ -42,15 +48,22 @@ from .charger_protocol import (
     normalize_mac,
     resolve_charger_session_running,
 )
-from .client_cleanup import ClientCleanup
+from .client_cleanup import ClientCleanup, is_current_client
 from .const import (
+    BLE_NOTIFY_TIMEOUT_SECONDS,
     CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS,
+    CHARGER_ACTIVE_RECONNECT_ATTEMPTS,
     CHARGER_BATTERY_EVERY_TICKS,
     CHARGER_BRIDGE_INTERVAL_SECONDS,
     CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS,
     CHARGER_BRUSH_STATUS_EVERY_TICKS,
+    CHARGER_CONTINUATION_TIMER_ATTEMPTS,
+    CHARGER_DISCOVERY_RETRY_BASE_SECONDS,
+    CHARGER_DISCOVERY_RETRY_BUSY_SECONDS,
+    CHARGER_DISCOVERY_RETRY_MAX_SECONDS,
     CHARGER_IDLE_DISCONNECT_SECONDS,
     CHARGER_IDLE_PROBE_INTERVAL_SECONDS,
+    CHARGER_LIVE_RESPONSE_TIMEOUT_SECONDS,
     CHARGER_POST_SESSION_READS,
     CHARGER_SESSION_SYNC_INTERVAL_SECONDS,
     CHARGER_SNAPSHOT_INTERVAL_SECONDS,
@@ -93,6 +106,58 @@ _CHARGER_DATA_KEYS: dict[ChargerCommand, str] = {
 }
 
 
+_CHARGER_DEFAULTS: dict[str, Any] = {
+    "state": "unavailable",
+    "address": None,
+    "mac": None,
+    "rssi": None,
+    "firmware": None,
+    "hardware_version": None,
+    "body_color": None,
+    "server_mode": None,
+    "device_id": None,
+    "wifi_status": None,
+    "wifi_rssi": None,
+    "internet_type": None,
+    "cloud_status": None,
+    "timezone": None,
+    "uptime": None,
+    "clock_brightness": None,
+    "clock_mode": None,
+    "clock_text": None,
+    "date_show_mode": None,
+    "ring_color": None,
+    "night_light_mode": None,
+    "auto_update": None,
+    "touchpad_status": None,
+    "brush_connection_policy": None,
+    "brush_status": None,
+    "session_status": None,
+    "brush_paired": None,
+    "brush_connected": False,
+    "brush_charging": False,
+    "internet_connected": None,
+    "cloud_connected": None,
+    "bridge_connected": False,
+    "last_response_latency_ms": None,
+}
+
+
+@dataclass
+class _ChargerCandidate:
+    advertisement: BluetoothServiceInfoBleak
+    bits: int
+    retry_at: float | None
+    failures: int = 0
+    pairing_revision: int = 0
+    unsub_unavailable: Callable[[], None] | None = None
+
+    def stop_tracking(self) -> None:
+        if self.unsub_unavailable is not None:
+            self.unsub_unavailable()
+            self.unsub_unavailable = None
+
+
 class IOSenseBridge:
     """Use the charger as the brush's BLE owner and local read bridge."""
 
@@ -101,42 +166,9 @@ class IOSenseBridge:
         self.hass = parent.hass
         self.address: str | None = None
         self.name = "iO Sense Charger"
-        self.data: dict[str, Any] = {
-            "state": "unavailable",
-            "address": None,
-            "mac": None,
-            "rssi": None,
-            "firmware": None,
-            "hardware_version": None,
-            "body_color": None,
-            "server_mode": None,
-            "device_id": None,
-            "wifi_status": None,
-            "wifi_rssi": None,
-            "internet_type": None,
-            "cloud_status": None,
-            "timezone": None,
-            "uptime": None,
-            "clock_brightness": None,
-            "clock_mode": None,
-            "clock_text": None,
-            "date_show_mode": None,
-            "ring_color": None,
-            "night_light_mode": None,
-            "auto_update": None,
-            "touchpad_status": None,
-            "brush_connection_policy": None,
-            "brush_status": None,
-            "session_status": None,
-            "brush_paired": None,
-            "brush_connected": False,
-            "brush_charging": False,
-            "internet_connected": None,
-            "cloud_connected": None,
-            "bridge_connected": False,
-            "last_response_latency_ms": None,
-        }
+        self.data = _CHARGER_DEFAULTS.copy()
         self.available = False
+        self._advertisement_available = False
         self._client: BleakClientWithServiceCache | None = None
         self._unsub_bluetooth: callback | None = None
         self._unsub_unavailable: callback | None = None
@@ -149,9 +181,16 @@ class IOSenseBridge:
         self._pending_future: asyncio.Future | None = None
         self._pending_command: ChargerCommand | None = None
         self._pending_short_uuid: str | None = None
-        self._candidate_addresses: set[str] = set()
+        self._pending_response_armed = False
+        self._last_live_response_monotonic = 0.0
+        self._candidates: dict[str, _ChargerCandidate] = {}
+        self._retry_timer: asyncio.TimerHandle | None = None
+        self._active_retries_remaining = 0
+        self._stream_generation = 0
         self._session_running = False
         self._session_confirmed = False
+        self._connection_brush_status: str | None = None
+        self._connection_session_status: str | None = None
         self._provisional_timer_baseline: int | None = None
         self._snapshot_complete = False
         self._last_probe_monotonic = 0.0
@@ -159,7 +198,6 @@ class IOSenseBridge:
         self._last_session_sync_monotonic = 0.0
         self._last_connection_bits: int | None = None
         self._stopping = False
-        self._discovery_announced = False
 
     @property
     def session_running(self) -> bool:
@@ -178,35 +216,99 @@ class IOSenseBridge:
 
     async def async_stop(self) -> None:
         self._stopping = True
+        self._cancel_retry_timer()
+        for candidate in self._candidates.values():
+            candidate.stop_tracking()
+        self._candidates.clear()
         if self._unsub_bluetooth:
             self._unsub_bluetooth()
             self._unsub_bluetooth = None
         if self._unsub_unavailable:
             self._unsub_unavailable()
             self._unsub_unavailable = None
-        for task in (self._connect_task, self._live_task, self._disconnect_task):
-            if task:
-                task.cancel()
-        if self._connect_task:
-            await asyncio.gather(self._connect_task, return_exceptions=True)
+        tasks = [
+            task
+            for task in (self._connect_task, self._live_task, self._disconnect_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self._async_disconnect()
 
     @callback
     def _async_advertisement(
         self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange
     ) -> None:
+        if self._stopping:
+            return
         payload = service_info.manufacturer_data.get(ORALB_MANUFACTURER_ID)
         if payload is None:
             return
         decoded = decode_charger_advertisement(payload)
         if decoded.get("device_type") != "stargate":
             return
-        if self.address is not None and service_info.address != self.address:
+
+        address = service_info.address
+        bits = int(decoded["connection_bits"])
+        now = time.monotonic()
+        candidate = self._candidates.get(address)
+        paired_changed = candidate is not None and bool((candidate.bits ^ bits) & 0x40)
+        if candidate is None:
+            delay = CHARGER_DISCOVERY_RETRY_BUSY_SECONDS if self._connecting() else 0
+            candidate = self._candidates[address] = _ChargerCandidate(
+                service_info, bits, now + delay
+            )
+        else:
+            candidate.advertisement = service_info
+            candidate.bits = bits
+            if paired_changed:
+                candidate.pairing_revision += 1
+                candidate.failures = 0
+                candidate.retry_at = now if bits & 0x40 else None
+
+        if self.address == address:
+            returning = (
+                not self._advertisement_available and not self._owns_client(self._client)
+            )
+            if returning and not paired_changed:
+                candidate.failures = 0
+                candidate.retry_at = now
+            if paired_changed or returning:
+                self._invalidate_association()
+        if self.address != address and candidate.unsub_unavailable is None:
+            self._track_candidate(address, candidate)
+        if self.address is None:
+            self._try_discovery()
+            return
+        if self.address != address:
             return
 
         previous_bits = self._last_connection_bits
-        current_bits = int(decoded["connection_bits"])
-        self._last_connection_bits = current_bits
+        self._publish_advertisement(service_info, decoded)
+        brush_active = bool(bits & 0x08) and not bool(bits & 0x10)
+        state_changed = previous_bits is None or bool((previous_bits ^ bits) & 0x18)
+        if self._active_retries_remaining:
+            if brush_active or not state_changed:
+                return
+            self._active_retries_remaining = 0
+            self._cancel_retry_timer()
+        probe_interval = (
+            CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS
+            if brush_active
+            else CHARGER_IDLE_PROBE_INTERVAL_SECONDS
+        )
+        if state_changed or now - self._last_probe_monotonic >= probe_interval:
+            self._schedule_connect(address)
+
+    def _publish_advertisement(
+        self, service_info: BluetoothServiceInfoBleak, decoded: dict[str, Any]
+    ) -> None:
+        """Publish only the advertisement of a verified charger."""
+        was_available = self.available
+        self._last_connection_bits = int(decoded["connection_bits"])
+        self._advertisement_available = True
         self.available = True
         self.data.update(
             {
@@ -235,66 +337,196 @@ class IOSenseBridge:
                 "connected" if decoded.get("cloud_connected") else "not_connected"
             )
         self._push()
-
-        if self.address is None:
-            if service_info.address in self._candidate_addresses:
-                return
-            if self._connect_task and not self._connect_task.done():
-                return
-            self._candidate_addresses.add(service_info.address)
-            self._schedule_connect(service_info.address)
-        else:
-            now = time.monotonic()
-            brush_connected = bool(decoded.get("brush_connected"))
-            brush_charging = bool(decoded.get("brush_charging"))
-            state_changed = previous_bits is None or bool(
-                (previous_bits ^ current_bits) & 0x18
-            )
-            probe_interval = (
-                CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS
-                if brush_connected and not brush_charging
-                else CHARGER_IDLE_PROBE_INTERVAL_SECONDS
-            )
-            if state_changed or now - self._last_probe_monotonic >= probe_interval:
-                self._schedule_connect(self.address)
+        if not was_available:
+            self.parent._push()
 
     @callback
     def _async_unavailable(self, _service_info: BluetoothServiceInfoBleak) -> None:
-        self.available = False
-        self.data["state"] = "unavailable"
-        self._end_session(schedule_disconnect=False)
-        self._push()
-        self.parent._push()
-
-    def _schedule_connect(self, address: str) -> None:
         if self._stopping:
             return
-        if self._connect_task and not self._connect_task.done():
+        self._advertisement_available = False
+        # Scanner history can expire while the verified GATT link still works.
+        if self._owns_client(self._client):
+            return
+        self._active_retries_remaining = 0
+        self._cancel_retry_timer()
+        self._detach_client()
+
+    def _invalidate_association(self) -> None:
+        self.address = None
+        self._advertisement_available = False
+        self._active_retries_remaining = 0
+        self._cancel_retry_timer()
+        if self._unsub_unavailable:
+            self._unsub_unavailable()
+            self._unsub_unavailable = None
+        self._detach_client()
+        self._last_connection_bits = None
+        self._last_snapshot_monotonic = 0.0
+        self._last_session_sync_monotonic = 0.0
+        self._snapshot_complete = False
+        self.data.update(_CHARGER_DEFAULTS)
+        self.parent._charger_unmatched()
+        self._push()
+
+    def _connecting(self) -> bool:
+        return self._connect_task is not None and not self._connect_task.done()
+
+    def _cancel_retry_timer(self) -> None:
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
+
+    def _track_candidate(self, address: str, candidate: _ChargerCandidate) -> None:
+        @callback
+        def unavailable(_service_info: BluetoothServiceInfoBleak) -> None:
+            if self._candidates.get(address) is candidate:
+                self._forget_candidate(address)
+                self._try_discovery()
+
+        candidate.unsub_unavailable = bluetooth.async_track_unavailable(
+            self.hass, unavailable, address, connectable=True
+        )
+
+    def _forget_candidate(self, address: str) -> None:
+        self._candidates.pop(address).stop_tracking()
+
+    @callback
+    def _discovery_wakeup(self) -> None:
+        self._retry_timer = None
+        if self._stopping or self.address is not None:
+            return
+        # HA retains unchanged advertisements. A forgotten address can
+        # enter discovery again when it next advertises.
+        for address, candidate in tuple(self._candidates.items()):
+            if candidate.retry_at is not None and bluetooth.async_last_service_info(
+                self.hass, address, connectable=False
+            ) is None:
+                self._forget_candidate(address)
+        self._try_discovery()
+
+    def _try_discovery(self) -> None:
+        if self._stopping or self.address is not None:
+            return
+        self._cancel_retry_timer()
+        pending = [
+            (candidate.retry_at, address)
+            for address, candidate in self._candidates.items()
+            if candidate.retry_at is not None
+        ]
+        if not pending:
+            return
+        due, address = min(pending, key=lambda entry: entry[0])
+        now = time.monotonic()
+        busy = self._connecting()
+        if due <= now + 0.001 and not busy:
+            self._candidates[address].retry_at = None
+            self._schedule_connect(address)
+            return
+        delay = (
+            CHARGER_DISCOVERY_RETRY_BUSY_SECONDS
+            if busy and due <= now + 0.001
+            else max(0.0, due - now)
+        )
+        self._retry_timer = self.hass.loop.call_later(delay, self._discovery_wakeup)
+
+    def _candidate_is_current(
+        self, address: str, candidate: _ChargerCandidate | None, revision: int
+    ) -> bool:
+        return self._candidates.get(address) is candidate and (
+            candidate is None or candidate.pairing_revision == revision
+        )
+
+    def _discovery_failed(
+        self, address: str, candidate: _ChargerCandidate | None, revision: int
+    ) -> None:
+        if self._stopping or self.address is not None:
+            return
+        if candidate is None or not self._candidate_is_current(address, candidate, revision):
+            return
+        delay = min(
+            CHARGER_DISCOVERY_RETRY_MAX_SECONDS,
+            CHARGER_DISCOVERY_RETRY_BASE_SECONDS
+            * 2 ** candidate.failures
+            * random.uniform(0.8, 1.2),
+        )
+        candidate.failures = min(candidate.failures + 1, 8)
+        candidate.retry_at = time.monotonic() + delay
+
+    def _schedule_active_reconnect(self) -> None:
+        if (
+            self._stopping
+            or not self.address
+            or not self.available
+            or not self._active_retries_remaining
+            or self._retry_timer is not None
+            or self._owns_client(self._client)
+        ):
+            return
+        self._retry_timer = self.hass.loop.call_later(
+            CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS, self._retry_active_connection
+        )
+
+    @callback
+    def _retry_active_connection(self) -> None:
+        self._retry_timer = None
+        if (
+            self._stopping or not self.address or not self.available
+            or self._owns_client(self._client)
+        ):
+            return
+        if not self._connecting() and self._active_retries_remaining:
+            self._schedule_connect(self.address)
+        else:
+            self._schedule_active_reconnect()
+
+    def _schedule_connect(self, address: str) -> None:
+        if self._stopping or self._connecting():
             return
         self._connect_task = self.hass.async_create_task(self._async_connect(address))
+        self._connect_task.add_done_callback(self._connection_finished)
+
+    def _connection_finished(self, task: asyncio.Task) -> None:
+        if task is not self._connect_task or self._stopping:
+            return
+        if self.address is None:
+            self._try_discovery()
+        else:
+            self._schedule_active_reconnect()
+
+    def _owns_client(self, client: BleakClientWithServiceCache | None) -> bool:
+        return not self._stopping and is_current_client(client, self._client)
 
     async def _async_connect(self, address: str) -> None:
         async with self._connect_lock:
-            if self._stopping:
+            if self._stopping or self.address not in (None, address):
                 return
             if self._client and self._client.is_connected:
                 if self.address == address:
                     self._ensure_live_task()
                 return
             if self._client is not None:
-                stale, self._client = self._client, None
-                self._client_cleanup.start(stale)
+                self._detach_client()
             await self._client_cleanup.wait()
-            if self._stopping:
+            if self._stopping or self.address not in (None, address):
                 return
+            candidate = self._candidates.get(address)
+            revision = candidate.pairing_revision if candidate else 0
+            if candidate is not None and revision and not candidate.bits & 0x40:
+                return
+            recovering = self._active_retries_remaining > 0
+            if recovering:
+                self._active_retries_remaining -= 1
             self._last_probe_monotonic = time.monotonic()
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, address, connectable=True
             )
             if ble_device is None:
                 _LOGGER.debug("iO Sense %s has no connectable path", address)
-                self._candidate_addresses.discard(address)
+                self._discovery_failed(address, candidate, revision)
                 return
+
+            client = None
             try:
                 client = await establish_connection(
                     BleakClientWithServiceCache,
@@ -303,83 +535,49 @@ class IOSenseBridge:
                     disconnected_callback=self._on_disconnect,
                     max_attempts=3,
                 )
-            except (BleakError, TimeoutError) as err:
-                _LOGGER.debug("iO Sense %s connection failed: %s", address, err)
-                self._candidate_addresses.discard(address)
-                return
-
-            if self._stopping or not client.is_connected:
-                self._candidate_addresses.discard(address)
-                self._client_cleanup.start(client)
-                await self._client_cleanup.wait()
-                return
-            self._client = client
-            self.data["bridge_connected"] = True
-            self.data["state"] = "connected"
-            try:
-                await client.start_notify(IOSENSE_READ_UUID, self._on_read)
-                await client.start_notify(IOSENSE_STATUS_UUID, self._on_status)
-                if self._stopping or self._client is not client or not client.is_connected:
-                    self._candidate_addresses.discard(address)
-                    if self._client is client:
-                        await self._async_disconnect()
+                if self._stopping or not client.is_connected:
+                    self._discovery_failed(address, candidate, revision)
+                    self._client_cleanup.start(client)
+                    await self._client_cleanup.wait()
                     return
-                if self.address is None:
-                    identity = await self._async_get(ChargerCommand.BRUSH_DATA)
-                    identity_value = (
-                        identity.value
-                        if identity and isinstance(identity.value, dict)
-                        else {}
-                    )
-                    paired_mac = identity_value.get("brush_mac")
-                    if normalize_mac(paired_mac or "") != normalize_mac(
-                        self.parent.address
-                    ):
-                        _LOGGER.debug(
-                            "iO Sense %s belongs to brush %s, not %s",
-                            address,
-                            paired_mac,
-                            self.parent.address,
-                        )
-                        await self._async_disconnect()
-                        return
-                    if all(
-                        identity_value.get(key) is not None
-                        for key in (
-                            "model_id",
-                            "protocol_version",
-                            "firmware_revision",
-                        )
-                    ):
-                        self.parent._apply_device_identity(
-                            identity_value["model_id"],
-                            identity_value["protocol_version"],
-                            identity_value["firmware_revision"],
-                            second_controller_version=identity_value.get(
-                                "second_controller_version"
-                            ),
-                            media_content_version=identity_value.get(
-                                "media_content_version"
-                            ),
-                        )
-                    self.address = address
-                    self.data["address"] = address
-                    self._unsub_unavailable = bluetooth.async_track_unavailable(
-                        self.hass,
-                        self._async_unavailable,
-                        address,
-                        connectable=True,
-                    )
-                    self.parent._charger_discovered(self)
-                    if not self._discovery_announced:
-                        self._discovery_announced = True
-                        async_dispatcher_send(
-                            self.hass,
-                            f"{SIGNAL_CHARGER_DISCOVERED}_{self.parent.address}",
-                        )
+                self._client = client
 
-                if self.data.get("brush_connected"):
-                    await self._async_refresh_session_state()
+                def receive_read(char: BleakGATTCharacteristic, payload: bytearray) -> None:
+                    if self._owns_client(client):
+                        self._on_read(char, payload)
+
+                def receive_status(char: BleakGATTCharacteristic, payload: bytearray) -> None:
+                    if self._owns_client(client):
+                        self._on_status(char, payload)
+
+                for uuid, receive in (
+                    (IOSENSE_READ_UUID, receive_read),
+                    (IOSENSE_STATUS_UUID, receive_status),
+                ):
+                    async with asyncio.timeout(BLE_NOTIFY_TIMEOUT_SECONDS):
+                        await client.start_notify(uuid, receive)
+                    if not self._owns_client(client):
+                        self._discovery_failed(address, candidate, revision)
+                        return
+
+                if self.address is None and not await self._async_identify(
+                    address, client, candidate, revision
+                ):
+                    return
+                self.data["bridge_connected"] = True
+                self.data["state"] = "connected"
+                if self.data.get("brush_connected") or recovering:
+                    status_received = await self._async_refresh_session_state()
+                    if not self._owns_client(client):
+                        return
+                    if not status_received:
+                        brush_active = (
+                            self.data["brush_connected"] and not self.data["brush_charging"]
+                        )
+                        if brush_active and not recovering and self._advertisement_available:
+                            self._active_retries_remaining = CHARGER_ACTIVE_RECONNECT_ATTEMPTS
+                        if recovering or self._active_retries_remaining:
+                            return
                 snapshot_due = (
                     not self._snapshot_complete
                     or time.monotonic() - self._last_snapshot_monotonic
@@ -387,45 +585,116 @@ class IOSenseBridge:
                 )
                 if not self._session_running and snapshot_due:
                     await self._async_snapshot()
+                if not self._owns_client(client):
+                    return
                 if self._session_running:
+                    self._active_retries_remaining = 0
+                    self._cancel_retry_timer()
                     self._ensure_live_task()
-                else:
-                    if self.data.get("brush_connected"):
-                        await self._async_post_session_sync()
-                    await self._async_disconnect()
+                elif self.data.get("brush_connected"):
+                    await self._async_post_session_sync()
             except asyncio.CancelledError:
-                if self.address is None:
-                    self._candidate_addresses.discard(address)
-                await self._async_disconnect()
+                if client is not None and client is self._client:
+                    await self._async_disconnect()
                 raise
-            except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
-                _LOGGER.debug("iO Sense setup/read failed: %s", err)
-                if self.address is None:
-                    self._candidate_addresses.discard(address)
-                await self._async_disconnect()
+            except (BleakError, TimeoutError) as err:
+                _LOGGER.debug("iO Sense %s connection/setup failed: %s", address, err)
+                self._discovery_failed(address, candidate, revision)
+                if client is not None and client is self._client:
+                    await self._async_disconnect()
             finally:
+                if client is not None and client is self._client and (
+                    not self._owns_client(client) or not self._session_running
+                ):
+                    await self._async_disconnect()
                 self._push()
 
+    async def _async_identify(
+        self,
+        address: str,
+        client: BleakClientWithServiceCache,
+        candidate: _ChargerCandidate | None,
+        revision: int,
+    ) -> bool:
+        if not self._candidate_is_current(address, candidate, revision):
+            return False
+        identity = await self._async_get(ChargerCommand.BRUSH_DATA)
+        if not self._candidate_is_current(address, candidate, revision):
+            return False
+        if not self._owns_client(client):
+            self._discovery_failed(address, candidate, revision)
+            return False
+        value = identity.value if identity and isinstance(identity.value, dict) else {}
+        paired_mac = value.get("brush_mac")
+        normalized = normalize_mac(paired_mac) if isinstance(paired_mac, str) else None
+        if normalized in (None, "000000000000", "FFFFFFFFFFFF"):
+            _LOGGER.debug("iO Sense %s did not report a usable paired brush", address)
+            self._discovery_failed(address, candidate, revision)
+            return False
+        if normalized != normalize_mac(self.parent.address):
+            if candidate is not None:
+                candidate.retry_at = None
+            _LOGGER.debug(
+                "iO Sense %s belongs to brush %s, not %s",
+                address, paired_mac, self.parent.address,
+            )
+            return False
+
+        if all(
+            value.get(key) is not None
+            for key in ("model_id", "protocol_version", "firmware_revision")
+        ):
+            self.parent._apply_device_identity(
+                value["model_id"],
+                value["protocol_version"],
+                value["firmware_revision"],
+                second_controller_version=value.get("second_controller_version"),
+                media_content_version=value.get("media_content_version"),
+            )
+        self.address = address
+        self.data["address"] = address
+        self._cancel_retry_timer()
+        if candidate is not None:
+            candidate.stop_tracking()
+            candidate.failures = 0
+            info = candidate.advertisement
+            self._publish_advertisement(
+                info,
+                decode_charger_advertisement(info.manufacturer_data[ORALB_MANUFACTURER_ID]),
+            )
+        self._unsub_unavailable = bluetooth.async_track_unavailable(
+            self.hass, self._async_unavailable, address, connectable=True
+        )
+        self.parent._charger_discovered(self)
+        async_dispatcher_send(
+            self.hass,
+            f"{SIGNAL_CHARGER_DISCOVERED}_{self.parent.address}",
+        )
+        return True
+
     async def _async_snapshot(self) -> None:
+        client = self._client
         successful = 0
         for command in CHARGER_SNAPSHOT_COMMANDS:
-            if self._stopping or self._session_running:
+            if not self._owns_client(client) or self._session_running:
                 return
-            packet = await self._async_get(command)
-            if packet is None:
-                continue
-            successful += 1
-        self._snapshot_complete = successful > len(CHARGER_SNAPSHOT_COMMANDS) // 2
-        if successful:
-            self._last_snapshot_monotonic = time.monotonic()
+            if await self._async_get(command) is not None:
+                successful += 1
+        if self._owns_client(client):
+            self._snapshot_complete = successful > len(CHARGER_SNAPSHOT_COMMANDS) // 2
+            if successful:
+                self._last_snapshot_monotonic = time.monotonic()
 
-    async def _async_refresh_session_state(self) -> None:
+    async def _async_refresh_session_state(self) -> bool:
         """Read the two short charger values that gate live forwarding."""
-        await self._async_get(ChargerCommand.SESSION_STATUS)
-        # Always refresh BRUSH_STATUS as well. It is the reliable authority on
-        # tested firmware and also clears a stale pre_run/run value after a
-        # connection interruption.
-        await self._async_get(ChargerCommand.BRUSH_STATUS)
+        client = self._client
+        # Read the authoritative brush status before the fallback. The charger
+        # may still report an earlier session as active when the brush is idle.
+        brush_status = await self._async_get(ChargerCommand.BRUSH_STATUS)
+        session_status = None
+        if self._owns_client(client):
+            session_status = await self._async_get(ChargerCommand.SESSION_STATUS)
+        return brush_status is not None or session_status is not None
 
     async def _async_post_session_sync(self, *, force: bool = False) -> None:
         """Collect retained brush data while the charger still owns the slot."""
@@ -434,83 +703,93 @@ class IOSenseBridge:
             < CHARGER_SESSION_SYNC_INTERVAL_SECONDS
         ):
             return
+        client = self._client
+        generation = self._stream_generation
         successful = 0
         for short_uuid in CHARGER_POST_SESSION_READS:
-            if self._stopping or self._session_running:
+            if (
+                not self._owns_client(client)
+                or self._session_running
+                or generation != self._stream_generation
+            ):
                 return
-            if value := await self._async_passthrough(short_uuid):
+            value = await self._async_passthrough(short_uuid)
+            if (
+                value
+                and self._owns_client(client)
+                and generation == self._stream_generation
+            ):
                 await self.parent._async_apply_charger_passthrough(short_uuid, value)
                 successful += 1
-        if successful:
+        if (
+            successful
+            and self._owns_client(client)
+            and generation == self._stream_generation
+        ):
             self._last_session_sync_monotonic = time.monotonic()
 
     async def _async_get(self, command: ChargerCommand) -> ChargerPacket | None:
+        response = await self._async_request(
+            command, ((IOSENSE_COMMAND_UUID, build_charger_get(command)),)
+        )
+        return response if isinstance(response, ChargerPacket) else None
+
+    async def _async_passthrough(self, short_uuid: str) -> bytes | None:
+        record = await self._async_request(
+            ChargerCommand.BRUSH_PASSTHROUGH,
+            (
+                (IOSENSE_COMMAND_UUID, bytes((IOSENSE_POST, ChargerCommand.BRUSH_PASSTHROUGH))),
+                (IOSENSE_WRITE_UUID, build_passthrough_read(short_uuid)),
+            ),
+            short_uuid=short_uuid.upper(),
+        )
+        return record["data"] if isinstance(record, dict) and record["success"] else None
+
+    async def _async_request(
+        self,
+        command: ChargerCommand,
+        writes: tuple[tuple[str, bytes], ...],
+        *,
+        short_uuid: str | None = None,
+    ) -> ChargerPacket | dict[str, Any] | None:
         client = self._client
-        if client is None or not client.is_connected:
+        if client is None or not self._owns_client(client):
             return None
         async with self._request_lock:
+            if not self._owns_client(client):
+                return None
             loop = asyncio.get_running_loop()
             future = loop.create_future()
             self._pending_future = future
             self._pending_command = command
-            self._pending_short_uuid = None
-            started = loop.time()
-            try:
-                # Bound writes and response together; a stalled write must not
-                # retain the lock and block queued post-session reads.
-                async with asyncio.timeout(CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS):
-                    await client.write_gatt_char(
-                        IOSENSE_COMMAND_UUID, build_charger_get(command), response=True
-                    )
-                    await client.write_gatt_char(
-                        IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
-                    )
-                    packet = await future
-                self.data["last_response_latency_ms"] = round(
-                    (loop.time() - started) * 1000, 1
-                )
-                return packet
-            except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
-                _LOGGER.debug("iO Sense GET %s failed: %s", command.name, err)
-                return None
-            finally:
-                self._clear_pending(future)
-
-    async def _async_passthrough(self, short_uuid: str) -> bytes | None:
-        client = self._client
-        if client is None or not client.is_connected:
-            return None
-        async with self._request_lock:
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            self._pending_future = future
-            self._pending_command = ChargerCommand.BRUSH_PASSTHROUGH
             self._pending_short_uuid = short_uuid
             started = loop.time()
             try:
-                # Bound writes and response together; a stalled write must not
-                # retain the lock and block queued post-session reads.
+                # The same deadline covers all writes and the response.
                 async with asyncio.timeout(CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS):
-                    await client.write_gatt_char(
-                        IOSENSE_COMMAND_UUID,
-                        bytes((0xC1, ChargerCommand.BRUSH_PASSTHROUGH)),
-                        response=True,
-                    )
-                    await client.write_gatt_char(
-                        IOSENSE_WRITE_UUID,
-                        build_passthrough_read(short_uuid),
-                        response=True,
-                    )
+                    for uuid, frame in writes:
+                        if not self._owns_client(client):
+                            return None
+                        await client.write_gatt_char(uuid, frame, response=True)
+                    if not self._owns_client(client):
+                        return None
+                    # The reply can arrive before the delimiter write returns.
+                    self._pending_response_armed = True
                     await client.write_gatt_char(
                         IOSENSE_COMMAND_UUID, IOSENSE_PROTOCOL_END, response=True
                     )
-                    record = await future
+                    if not self._owns_client(client):
+                        return None
+                    response = await future
+                if not self._owns_client(client):
+                    return None
                 self.data["last_response_latency_ms"] = round(
                     (loop.time() - started) * 1000, 1
                 )
-                return record["data"] if record.get("success") else None
-            except (BleakError, TimeoutError, asyncio.TimeoutError) as err:
-                _LOGGER.debug("iO Sense passthrough %s failed: %s", short_uuid, err)
+                return response
+            except (BleakError, TimeoutError) as err:
+                label = f"passthrough {short_uuid}" if short_uuid else f"GET {command.name}"
+                _LOGGER.debug("iO Sense %s failed: %s", label, err)
                 return None
             finally:
                 self._clear_pending(future)
@@ -520,23 +799,40 @@ class IOSenseBridge:
             self._pending_future = None
             self._pending_command = None
             self._pending_short_uuid = None
+            self._pending_response_armed = False
         if not future.done():
             future.cancel()
 
     def _on_read(self, _char: BleakGATTCharacteristic, payload: bytearray) -> None:
-        packet = decode_charger_read(payload)
-        self._apply_native_packet(packet)
         future = self._pending_future
-        if future is not None and not future.done():
-            if packet.command == ChargerCommand.BRUSH_PASSTHROUGH:
-                if self._pending_command != ChargerCommand.BRUSH_PASSTHROUGH:
-                    return
-                for record in packet.value if isinstance(packet.value, list) else []:
-                    if record.get("short_uuid") == self._pending_short_uuid:
-                        future.set_result(record)
-                        break
-            elif packet.command == self._pending_command:
-                future.set_result(packet)
+        if not self._pending_response_armed or future is None or future.done():
+            return
+        packet = decode_charger_read(payload)
+        if packet.command is None or packet.command != self._pending_command:
+            return
+        response: ChargerPacket | dict[str, Any] = packet
+        if packet.command == ChargerCommand.BRUSH_PASSTHROUGH:
+            if packet.operation != IOSENSE_POST:
+                return
+            for record in packet.value:
+                if (
+                    record.get("short_uuid") == self._pending_short_uuid
+                    and record.get("operation") == IOSENSE_BRUSH_READ
+                ):
+                    response = record
+                    break
+            else:
+                return
+        elif packet.operation != IOSENSE_GET or (
+            not packet.payload
+            and packet.command in {ChargerCommand.BRUSH_STATUS, ChargerCommand.SESSION_STATUS}
+        ):
+            return
+        if isinstance(response, ChargerPacket) or (response["success"] and response["data"]):
+            self._last_live_response_monotonic = time.monotonic()
+        future.set_result(response)
+        if self.address is not None and packet.operation == IOSENSE_GET:
+            self._apply_native_packet(packet)
         self._push()
 
     def _on_status(self, _char: BleakGATTCharacteristic, payload: bytearray) -> None:
@@ -548,6 +844,7 @@ class IOSenseBridge:
         if packet.command in _CHARGER_DATA_KEYS:
             self.data[_CHARGER_DATA_KEYS[packet.command]] = packet.value
         if packet.command == ChargerCommand.BRUSH_STATUS:
+            self._connection_brush_status = packet.value
             if packet.value == "not_connected":
                 self.data["brush_connected"] = False
                 self.data["brush_charging"] = False
@@ -557,13 +854,18 @@ class IOSenseBridge:
             elif packet.value in {"pre_run", "run", "idle"}:
                 self.data["brush_connected"] = True
                 self.data["brush_charging"] = False
+        elif packet.command == ChargerCommand.SESSION_STATUS:
+            self._connection_session_status = packet.value
         if packet.command in {
             ChargerCommand.SESSION_STATUS,
             ChargerCommand.BRUSH_STATUS,
         }:
+            if packet.value in {"not_connected", "idle", "charging", "run", "pre_run"}:
+                self._active_retries_remaining = 0
+                self._cancel_retry_timer()
             running = resolve_charger_session_running(
-                self.data.get("session_status"),
-                self.data.get("brush_status"),
+                self._connection_session_status,
+                self._connection_brush_status,
                 self._session_running,
             )
             if running:
@@ -574,10 +876,11 @@ class IOSenseBridge:
     def _start_session(self) -> None:
         """Start or recover a charger-managed brush stream."""
         confirmed = charger_session_confirmed(
-            self.data.get("session_status"), self.data.get("brush_status")
+            self._connection_session_status, self._connection_brush_status
         )
         self._cancel_disconnect()
         if not self._session_running:
+            self._stream_generation += 1
             self._session_running = True
             self._session_confirmed = False
             self._provisional_timer_baseline = None
@@ -627,6 +930,7 @@ class IOSenseBridge:
         self._session_running = False
         self._session_confirmed = False
         self._provisional_timer_baseline = None
+        self._cancel_live_task()
         if confirmed:
             self.parent._charger_session_ended()
         if schedule_disconnect:
@@ -639,97 +943,116 @@ class IOSenseBridge:
             return
         self._live_task = self.hass.async_create_task(self._async_live_loop())
 
+    def _cancel_live_task(self) -> None:
+        task, self._live_task = self._live_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
     async def _async_live_loop(self) -> None:
+        client = self._client
+        generation = self._stream_generation
+
+        def owns_stream() -> bool:
+            return (
+                self._owns_client(client)
+                and self._session_running
+                and generation == self._stream_generation
+            )
+
         tick = 0
         mode_observed = False
+        continuation_reads = 0
+        stream_started = time.monotonic()
         try:
-            while (
-                not self._stopping
-                and self._session_running
-                and self._client
-                and self._client.is_connected
-            ):
+            while owns_stream():
                 started = time.monotonic()
+                reading_continuation = False
                 if not self._session_confirmed:
-                    # pre_run is also emitted while the handle is only in its
-                    # settings/menu flow.  Probe authoritative state/timer
-                    # values without exposing pressure or a synthetic session.
+                    # pre_run is also emitted in the handle settings menu.
                     if tick > 0 and tick % CHARGER_BRUSH_STATUS_EVERY_TICKS == 0:
                         await self._async_get(ChargerCommand.BRUSH_STATUS)
-                        if not self._session_running:
-                            break
                     else:
-                        provisional_action = "FF04" if tick % 2 == 0 else "FF08"
-                        if provisional := await self._async_passthrough(
-                            provisional_action
+                        action = "FF04" if tick % 2 == 0 else "FF08"
+                        value = await self._async_passthrough(action)
+                        if value and owns_stream() and self._observe_provisional_passthrough(
+                            action, value
                         ):
-                            if self._observe_provisional_passthrough(
-                                provisional_action, provisional
-                            ):
-                                await self.parent._async_apply_charger_passthrough(
-                                    provisional_action, provisional
-                                )
-                    self._push()
-                    tick += 1
-                    remaining = CHARGER_BRIDGE_INTERVAL_SECONDS - (
-                        time.monotonic() - started
-                    )
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                    continue
-
-                if pressure := await self._async_passthrough("FF0B"):
-                    await self.parent._async_apply_charger_passthrough("FF0B", pressure)
-
-                # Keep the proven two-read live schedule. The charger
-                # serialises requests, so adding a third field here can make
-                # the one-second pressure read miss its cycle. Slowly changing
-                # values occupy one auxiliary slot at startup; timer and pacer
-                # anchors alternate afterwards.
-                auxiliary_action = charger_live_auxiliary(
-                    tick,
-                    mode_observed=mode_observed,
-                    brush_status_every_ticks=CHARGER_BRUSH_STATUS_EVERY_TICKS,
-                    battery_every_ticks=CHARGER_BATTERY_EVERY_TICKS,
-                )
-                if auxiliary_action == "BRUSH_STATUS":
-                    # BRUSH_STATUS proved more reliable than SESSION_STATUS on
-                    # the tested firmware. It occupies the auxiliary slot so
-                    # pressure remains the first of only two serial requests.
-                    await self._async_get(ChargerCommand.BRUSH_STATUS)
-                    if not self._session_running:
-                        break
+                            await self.parent._async_apply_charger_passthrough(action, value)
                 else:
-                    if auxiliary := await self._async_passthrough(auxiliary_action):
-                        await self.parent._async_apply_charger_passthrough(
-                            auxiliary_action, auxiliary
-                        )
-                        if auxiliary_action == "FF07":
-                            mode_observed = True
+                    pressure = await self._async_passthrough("FF0B")
+                    if not owns_stream():
+                        return
+                    if pressure:
+                        await self.parent._async_apply_charger_passthrough("FF0B", pressure)
+                    if not owns_stream():
+                        return
 
-                self.parent._advance_charger_timer()
-                self.parent.data["data_source"] = DATA_SOURCE_CHARGER
-                self.parent.data["live"] = True
-                self.parent._push()
+                    # On a slow reconnect, waiting through the entire startup
+                    # cadence can outlast the pause grace. Give the tracker
+                    # two early raw timer samples and room for one lost reply.
+                    # Keep two reads per tick and resume the normal startup
+                    # sequence once the timer evidence resolves the boundary.
+                    reading_continuation = (
+                        continuation_reads < CHARGER_CONTINUATION_TIMER_ATTEMPTS
+                        and self.parent.charger_continuation_pending
+                    )
+                    if reading_continuation:
+                        action = "FF08"
+                        continuation_reads += 1
+                    else:
+                        action = charger_live_auxiliary(
+                            tick,
+                            mode_observed=mode_observed,
+                            brush_status_every_ticks=CHARGER_BRUSH_STATUS_EVERY_TICKS,
+                            battery_every_ticks=CHARGER_BATTERY_EVERY_TICKS,
+                        )
+                    if action == "BRUSH_STATUS":
+                        await self._async_get(ChargerCommand.BRUSH_STATUS)
+                    else:
+                        value = await self._async_passthrough(action)
+                        if value and owns_stream():
+                            await self.parent._async_apply_charger_passthrough(action, value)
+                            if action == "FF07":
+                                mode_observed = True
+                    if not owns_stream():
+                        return
+                    self.parent._advance_charger_timer()
+                    self.parent.data["data_source"] = DATA_SOURCE_CHARGER
+                    self.parent.data["live"] = True
+                    self.parent._push()
+                if not owns_stream():
+                    return
+                last_response = max(stream_started, self._last_live_response_monotonic)
+                if time.monotonic() - last_response >= CHARGER_LIVE_RESPONSE_TIMEOUT_SECONDS:
+                    _LOGGER.debug("iO Sense %s stopped replying during live reads", self.address)
+                    self._handle_client_disconnect(client)
+                    return
                 self._push()
-                tick += 1
-                remaining = CHARGER_BRIDGE_INTERVAL_SECONDS - (
-                    time.monotonic() - started
-                )
+                if not reading_continuation:
+                    tick += 1
+                remaining = CHARGER_BRIDGE_INTERVAL_SECONDS - (time.monotonic() - started)
                 if remaining > 0:
                     await asyncio.sleep(remaining)
         except asyncio.CancelledError:
             pass
         finally:
-            self.parent.data["live"] = False
-            self.parent._push()
+            if client is self._client and generation == self._stream_generation:
+                self.parent.data["live"] = False
+                self.parent._push()
 
     def _schedule_disconnect(self) -> None:
         if self._disconnect_task and not self._disconnect_task.done():
             return
 
+        client = self._client
+        generation = self._stream_generation
+
         async def _release() -> None:
-            if not self._session_running:
+            if (
+                self._owns_client(client)
+                and not self._session_running
+                and generation == self._stream_generation
+            ):
                 # At active_idle the private charger-to-brush connection can
                 # still exist for only a brief window. Read FF05 first (via
                 # CHARGER_POST_SESSION_READS) before waiting to disconnect;
@@ -737,15 +1060,19 @@ class IOSenseBridge:
                 # value on chargers that release the brush quickly.
                 await self._async_post_session_sync(force=True)
             await asyncio.sleep(CHARGER_IDLE_DISCONNECT_SECONDS)
-            if not self._session_running:
+            if (
+                self._owns_client(client)
+                and not self._session_running
+                and generation == self._stream_generation
+            ):
                 await self._async_disconnect()
 
         self._disconnect_task = self.hass.async_create_task(_release())
 
     def _cancel_disconnect(self) -> None:
-        if self._disconnect_task and not self._disconnect_task.done():
-            self._disconnect_task.cancel()
-        self._disconnect_task = None
+        task, self._disconnect_task = self._disconnect_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     def _on_disconnect(self, client: BleakClientWithServiceCache) -> None:
         self.hass.loop.call_soon_threadsafe(self._handle_client_disconnect, client)
@@ -754,27 +1081,40 @@ class IOSenseBridge:
     def _handle_client_disconnect(self, client: BleakClientWithServiceCache) -> None:
         if client is not self._client:
             return
-        self._client_cleanup.start(client)
-        self._client = None
-        self.data["bridge_connected"] = False
-        self.data["state"] = "available" if self.available else "unavailable"
-        self._handle_transport_disconnect()
+        was_running = self._session_running
+        self._detach_client()
+        if was_running and not self._stopping and self.address and self.available:
+            self._active_retries_remaining = CHARGER_ACTIVE_RECONNECT_ATTEMPTS
+            self._schedule_active_reconnect()
 
-    @callback
-    def _handle_transport_disconnect(self) -> None:
-        """Clear session ownership when the charger transport disappears."""
+    def _detach_client(self) -> None:
+        """Invalidate connection-owned work before releasing its BLE resources."""
+        client, self._client = self._client, None
+        self.available = self._advertisement_available
+        self._cancel_disconnect()
         self._end_session(schedule_disconnect=False)
+        self._cancel_live_task()
+        if (future := self._pending_future) is not None:
+            if not future.done():
+                future.set_result(None)
+            self._clear_pending(future)
+        self._last_live_response_monotonic = 0.0
+        self.data.update(
+            bridge_connected=False,
+            state="available" if self.available else "unavailable",
+        )
+        # Keep the last sampled diagnostic values visible. Only the current
+        # connection's samples can decide whether brushing is active.
+        self._connection_brush_status = None
+        self._connection_session_status = None
         self.parent.data["live"] = False
+        if client is not None:
+            self._client_cleanup.start(client)
         self._push()
         self.parent._push()
 
     async def _async_disconnect(self) -> None:
-        client, self._client = self._client, None
-        self.data["bridge_connected"] = False
-        self.data["state"] = "available" if self.available else "unavailable"
-        self._handle_transport_disconnect()
-        if client is not None:
-            self._client_cleanup.start(client)
+        self._detach_client()
         await self._client_cleanup.wait()
 
     def _push(self) -> None:

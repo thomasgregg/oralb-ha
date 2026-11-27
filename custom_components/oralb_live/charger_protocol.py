@@ -12,6 +12,9 @@ IOSENSE_READ_UUID = "a0f03c01-5047-4d53-8208-4f72616c2d42"
 IOSENSE_WRITE_UUID = "a0f03c02-5047-4d53-8208-4f72616c2d42"
 IOSENSE_STATUS_UUID = "a0f03c03-5047-4d53-8208-4f72616c2d42"
 IOSENSE_PROTOCOL_END = b"\xe0"
+IOSENSE_GET = 0xC0
+IOSENSE_POST = 0xC1
+IOSENSE_BRUSH_READ = 0x01
 
 
 class ChargerCommand(IntEnum):
@@ -366,7 +369,7 @@ def build_charger_get(command: ChargerCommand) -> bytes:
     """Build a read-only charger GET header."""
     if command == ChargerCommand.BRUSH_PASSTHROUGH:
         raise ValueError("passthrough uses a POST header")
-    return bytes((0xC0, command))
+    return bytes((IOSENSE_GET, command))
 
 
 def build_passthrough_read(short_uuid: str) -> bytes:
@@ -378,4 +381,4 @@ def build_passthrough_read(short_uuid: str) -> bytes:
         high, low = bytes.fromhex(normalized)
     except ValueError as exc:
         raise ValueError("short UUID must contain four hexadecimal characters") from exc
-    return bytes((low, high, 0x01, 0x00))
+    return bytes((low, high, IOSENSE_BRUSH_READ, 0x00))

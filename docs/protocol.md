@@ -467,6 +467,62 @@ pressure distribution, zone times, score or session list. Oral-B Live uses the
 brush MAC to associate a charger with the correct toothbrush config entry and
 ignores chargers paired to other brushes.
 
+### Charger discovery and connection ownership
+
+Home Assistant can replay several cached iO Sense advertisements at entry
+setup and suppress later broadcasts with the same payload. Oral-B Live
+identifies one candidate at a time per bridge and retries skipped candidates
+after a two-second delay. Failures such as missing proxy routes, GATT errors,
+and missing or placeholder brush MACs use a per-address delay that starts at
+15 seconds, doubles, applies ±20% jitter and is capped at five minutes.
+Ordinary advertisement changes preserve the delay. Candidates that disappear
+from Home Assistant's Bluetooth history wait for a new advertisement. If a
+candidate loses its connectable route during identification, a reply or
+failure from that attempt cannot affect a returning candidate.
+
+A valid foreign brush MAC excludes that candidate until an observed pairing
+change, a return after its connectable route disappears, or an integration
+reload. On either change in discovery the bridge rechecks the identity
+before applying charger state or forwarding brush values. The
+integration publishes the verified charger's own advertisement and preserves
+the charger entities associated with the brush's config entry. A live link
+lost during brushing has a separate recovery policy of up to three attempts
+with a five-second interval between attempts while the charger is reachable.
+An advertisement that changes only unrelated fields leaves this recovery
+pending.
+
+Scanner history can expire while a verified GATT connection still carries
+live data. That connection keeps its session and availability. If the link
+also goes away, the charger is verified again when it returns, including
+when the returning advertisement has the same payload.
+
+The brush and charger bind notifications, timed release and response
+handling to the client that started the work. Charger session decisions use
+native status from the current connection. The initial probe reads
+`BRUSH_STATUS` first so a stale active `SESSION_STATUS` cannot override a
+fresh idle brush status. Charger status sensors keep their last sampled
+values through an intentional idle disconnect.
+
+During live polling, the bridge releases a connection after about 15 seconds
+without a native reply or a successful brush read. This allows a complete
+status-poll cycle of timeouts. Failed passthrough replies alone cannot keep
+the stream live. If a route is still available, the bridge uses the existing
+active retry budget. During active recovery, a connection must answer at
+least one status probe before the bridge proceeds to its optional diagnostics
+snapshot.
+
+Each notification subscription has a five-second deadline. If a charger
+subscription times out, the bridge cleans up its client and retries that
+candidate through the normal queue. Direct mode reconnects after a mandatory
+subscription timeout and continues setup when an optional subscription fails.
+Direct characteristic reads share a three-second deadline, including startup,
+quiet maintenance and display-face capture.
+
+A direct startup read yields to a newer valid notification. Startup display
+face, pressure and timer reads also belong to the brushing session in which
+they started. A brief direct read completing after the charger takes over
+cannot replace the charger's current values.
+
 ## Read-only brush passthrough (`0x37`)
 
 A characteristic read is framed as three writes:
@@ -493,17 +549,23 @@ The returned value is:
 ```
 
 The tested firmware rejects a request containing several records but accepts
-the same records as sequential commands. The implementation therefore sends
-exactly one outstanding request and matches each response by short UUID.
+the same records as sequential commands. The implementation sends one
+outstanding request on the current link. Native read replies must match the
+command and GET operation. Passthrough replies must match the outer operation,
+the read operation in the record and the short UUID. The bridge starts
+accepting replies when it sends the `E0` delimiter. Only the first matching
+reply completes the request or updates native charger state. Status replies
+must contain their status byte.
 
 Each production native GET or brush passthrough transaction has one 1.5-second
 deadline after acquiring the shared request lock. The deadline covers every
 Bluetooth write and the response wait together. A timeout or cancellation
 clears the pending response state and releases the lock, allowing queued
 post-session reads to continue. Time waiting to acquire the lock is outside
-that transaction budget. Cancellation cannot retract commands already sent,
-and identical late responses remain indistinguishable because the protocol
-has no transaction IDs. Standard failure/latency diagnostics remain available;
+that transaction budget. Cancellation cannot retract commands already sent.
+An identical late response that arrives after the next command's delimiter
+remains indistinguishable because the protocol has no transaction IDs.
+Standard failure/latency diagnostics remain available;
 the temporary detailed timing and raw-payload traces from v0.7.40 betas were
 removed in the stable release.
 
@@ -787,15 +849,18 @@ through the next two minutes.
 
 ### Session reconciliation
 
-The brush clock can drift. The wall-clock start is calculated relative to an
-`FF22` value read in the same connection:
+The brush clock can drift. The wall-clock start is calculated relative to a
+compatible `FF22` sample from the same brush:
 
 ```text
 wall_start = wall_time_at_rtc_read - (brush_rtc - session_timestamp)
 ```
 
-The wall timestamp is stored with the RTC sample, so a retained record and RTC
-that arrive in separate charger requests still form an accurate pair.
+The wall timestamp is stored with the RTC sample. A later charger request can
+supply the clock for a pending record from the same verified association and
+session generation. A pairing change discards the pending pair. Deferred
+recovery carries the original generation so a late record cannot close a
+newer session's recovery request.
 
 The live stream constructs the local HA session. Once its logical stop is
 finalized, a later `FF29` record is matched to it and refines it without
@@ -807,8 +872,11 @@ when authoritative timer samples continue forward; a coherent reset near zero
 starts a new logical session. Sectors, pressure summaries and the original
 start are retained across merged fragments, while an interim display face is
 discarded. Charger-mode extrapolated ticks are display-only and never decide
-this boundary. In v0.7.44b1, if the passive stop is missed, a confirmed session
-can end at its last observed sample after advertisements go unavailable beyond
+this boundary or add time to the stored duration. A charger stream returning
+during pause grace gives the native timer up to three early attempts to provide two advancing samples, then
+continues its normal startup reads. This preserves the two-read cadence and
+allows a lost reply on a slow link. In v0.7.44b1, if the passive stop is missed,
+a confirmed session can end at its last observed sample after advertisements go unavailable beyond
 the pause grace. If availability never changes, a near-zero timer followed by
 forward progress after a gap can identify the next session. For menu-only
 advertisements, sector samples count after the brush timer confirms movement.

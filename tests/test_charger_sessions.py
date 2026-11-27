@@ -104,7 +104,7 @@ class ChargerProvisionalSessionTests(unittest.TestCase):
 
     def test_transport_disconnect_ends_confirmed_session(self) -> None:
         self._native(charger_protocol.ChargerCommand.BRUSH_STATUS, "run")
-        self.bridge._handle_transport_disconnect()
+        self.bridge._detach_client()
 
         self.assertFalse(self.bridge._session_running)
         self.parent._charger_session_ended.assert_called_once_with()
