@@ -887,7 +887,10 @@ class BatteryRefreshTests(unittest.IsolatedAsyncioTestCase):
         self._assert_published_battery(23)
         self.assertTrue(self.client.is_connected)
         self.assertTrue(self.c.data["live"])
-        self.client.start_notify.assert_any_await(const.CHAR_STATE, self.c._on_notify)
+        self.assertIn(
+            const.CHAR_STATE,
+            [call.args[0] for call in self.client.start_notify.await_args_list],
+        )
 
     async def test_unload_cancels_waits_and_preserves_a_stopped_session(self) -> None:
         await self._stop_session(9)

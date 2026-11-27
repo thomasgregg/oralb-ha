@@ -452,6 +452,7 @@ def test_initial_read_missing_face_does_not_repeat_in_post_session_capture():
             h.client.services = services(face=False)
             h.client.is_connected = True
             h.responses[const.CHAR_SMILEY] = missing_face()
+            h.c._client = h.client
             await h.c._async_initial_reads(h.client)
             assert len(face_reads(h)) == 1
             await stop_session(h, "direct")

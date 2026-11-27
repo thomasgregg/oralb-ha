@@ -321,12 +321,21 @@ CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS = 1.5
 # Recheck the charger's BRUSH_STATUS in one auxiliary slot. It proved more
 # reliable than SESSION_STATUS and provides an authoritative stop signal.
 CHARGER_BRUSH_STATUS_EVERY_TICKS = 5
+# Allow a full status-poll cycle even if both requests in every tick time out.
+CHARGER_LIVE_RESPONSE_TIMEOUT_SECONDS = (
+    CHARGER_BRUSH_STATUS_EVERY_TICKS * CHARGER_BRIDGE_REQUEST_TIMEOUT_SECONDS * 2
+)
 # Battery changes slowly, so collect it as an occasional auxiliary read. The
 # locally advanced timer keeps moving while this current-value sample is read.
 CHARGER_BATTERY_EVERY_TICKS = 30
 CHARGER_IDLE_DISCONNECT_SECONDS = 3.0
 CHARGER_ACTIVE_PROBE_INTERVAL_SECONDS = 5.0
 CHARGER_IDLE_PROBE_INTERVAL_SECONDS = 5 * 60.0
+CHARGER_DISCOVERY_RETRY_BUSY_SECONDS = 2.0
+CHARGER_DISCOVERY_RETRY_BASE_SECONDS = 15.0
+CHARGER_DISCOVERY_RETRY_MAX_SECONDS = 5 * 60.0
+CHARGER_ACTIVE_RECONNECT_ATTEMPTS = 3
+CHARGER_CONTINUATION_TIMER_ATTEMPTS = 3  # Two samples plus one retry.
 CHARGER_SNAPSHOT_INTERVAL_SECONDS = 5 * 60.0
 CHARGER_SESSION_SYNC_INTERVAL_SECONDS = 60.0
 # Read values with the shortest useful window before optional retained session
@@ -348,7 +357,8 @@ CHARGER_POST_SESSION_READS = (
     "FF22",
 )
 
-# --- Connection management (live mode) ---------------------------------------
+# --- BLE connection management ---------------------------------------------
+BLE_NOTIFY_TIMEOUT_SECONDS = 5.0
 CONNECT_RETRIES = 3
 # Backstop retry interval while we hold no connection. The brush stops
 # advertising while ANY client holds its single slot, so advertisements

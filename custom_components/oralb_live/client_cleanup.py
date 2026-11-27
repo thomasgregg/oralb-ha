@@ -11,6 +11,14 @@ from homeassistant.core import HomeAssistant
 _LOGGER = logging.getLogger(__name__)
 
 
+def is_current_client(
+    client: BleakClientWithServiceCache | None,
+    current: BleakClientWithServiceCache | None,
+) -> bool:
+    """Check ownership before using a client captured by asynchronous work."""
+    return client is not None and client is current and client.is_connected
+
+
 class ClientCleanup:
     """Serialize reuse behind cleanup, even when the caller is cancelled.
 

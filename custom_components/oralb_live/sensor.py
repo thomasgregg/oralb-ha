@@ -444,13 +444,13 @@ async def async_setup_entry(
     @callback
     def _async_add_charger() -> None:
         nonlocal charger_added
-        if charger_added or not coordinator.charger or not coordinator.charger.address:
+        if not coordinator.charger or not coordinator.charger.address:
             return
-        charger_added = True
+        # Charger entities follow the brush config entry. A physical charger
+        # can move to another brush, so its current MAC is a state attribute.
         charger_device = device_registry.async_get_or_create(
             config_entry_id=entry.entry_id,
             identifiers={(DOMAIN, f"{coordinator.address}-iosense")},
-            connections={(CONNECTION_BLUETOOTH, coordinator.charger.address)},
             name=coordinator.charger.name,
             manufacturer="Oral-B",
             model="iO Sense",
@@ -465,6 +465,9 @@ async def async_setup_entry(
             charger_device.id,
             via_device_id=brush_device.id,
         )
+        if charger_added:
+            return
+        charger_added = True
         async_add_entities(
             IOSenseSensor(coordinator, description) for description in CHARGER_SENSORS
         )
@@ -820,7 +823,6 @@ class IOSenseSensor(SensorEntity):
         self._attr_unique_id = f"{coordinator.address}-iosense-{description.key}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{coordinator.address}-iosense")},
-            connections={(CONNECTION_BLUETOOTH, self.charger.address)},
             name=self.charger.name,
             manufacturer="Oral-B",
             model="iO Sense",
